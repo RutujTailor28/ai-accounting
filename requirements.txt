@@ -1,0 +1,33 @@
+# FastAPI and Server
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+python-multipart>=0.0.12
+
+# Document Processing
+PyPDF2>=3.0.0
+openpyxl>=3.1.0
+xlrd>=2.0.1
+python-docx>=1.1.0
+pandas>=2.2.3
+
+# AI and Embeddings
+langchain>=0.2.0
+langchain-community>=0.2.0
+langchain-text-splitters>=0.2.0
+chromadb>=0.5.15
+ollama>=0.3.0
+langchain-ollama>=0.2.0
+langchain-openai>=0.1.0
+
+# Utilities
+pydantic>=2.9.0
+pydantic-settings>=2.5.0
+python-dotenv>=1.0.1
+supabase>=2.9.0
+
+# AWS S3 Storage
+boto3>=1.35.0
+
+# Pydantic and Settings
+pydantic>=2.9.0
+pydantic-settings>=2.5.0
