@@ -11,6 +11,10 @@ from app.ai.rag.retriever import vector_store
 import os
 import shutil
 
+from app.core.supabase import supabase, supabase_admin
+from app.schemas.folder import FileResponse
+from typing import List
+
 router = APIRouter()
 
 # Initialize services
@@ -18,8 +22,34 @@ document_parser = DocumentParser()
 text_chunker = TextChunker()
 embedding_service = EmbeddingService()
 
+@router.get("/all", response_model=List[FileResponse])
+async def list_all_files(user=Depends(get_current_user)):
+    """List all files for the authenticated user's company."""
+    try:
+        # Get company_id from profile
+        profile_res = supabase.table("profiles").select("company_id").eq("id", user.id).single().execute()
+        if not profile_res.data or not profile_res.data.get("company_id"):
+            raise HTTPException(status_code=400, detail="User profile or company assignment missing")
+        
+        company_id = profile_res.data["company_id"]
 
-from app.core.supabase import supabase, supabase_admin
+        result = supabase.table("files") \
+            .select("*") \
+            .eq("company_id", company_id) \
+            .is_("deleted_at", "null") \
+            .order("created_at", desc=True) \
+            .execute()
+        
+        files = result.data or []
+        for f in files:
+            if f.get("s3_key"):
+                # Use standard 1 hour expiry for listing
+                f["s3_url"] = s3_storage.generate_presigned_url(f["s3_key"], expires_in=3600)
+        
+        return files
+    except Exception as e:
+        print(f"[ERROR] Error listing all files: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/upload", response_model=UploadResponse)
 async def upload_document(
@@ -123,10 +153,14 @@ async def upload_document(
             "s3_url": s3_url,
             "file_type": file.filename.split('.')[-1].lower() if '.' in file.filename else 'unknown',
             "company_id": company_id,
-            "uploaded_by": user.id if hasattr(user, 'id') else None
+            "created_by": user.id if hasattr(user, 'id') else None
         }
         
         file_db_res = supabase.table("files").insert(file_record).execute()
+        if not file_db_res.data:
+            print(f"[ERROR] Failed to save file record: {file_db_res}")
+            raise HTTPException(status_code=500, detail="Failed to save file metadata to database")
+            
         print(f"[INFO] DONE: File record saved to database.")
 
         # Step 4: Parse document
@@ -233,7 +267,7 @@ async def get_document_url(
         
         profile_res = supabase.table("profiles") \
             .select("company_id") \
-            .eq("id", file_data.get("uploaded_by")) \
+            .eq("id", file_data.get("created_by")) \
             .single() \
             .execute()
             
@@ -297,35 +331,24 @@ async def delete_document(
         s3_key = file_data.get("s3_key")
         doc_name = file_data.get("name")
         
-        # 1. Delete from S3
-        if s3_key:
-            print(f"[INFO] Deleting from S3: {s3_key}")
-            s3_storage.delete_file(s3_key)
-            
-        # 2. Delete from Vector Store
-        if company_id and doc_name:
-            print(f"[INFO] Deleting from Vector Store: {doc_name} for company {company_id}")
-            vector_store.delete_document(company_id=company_id, document_name=doc_name)
+        # 1. Update Database (files table) to set deleted_at
+        print(f"[INFO] Step 1: Soft-deleting record from Database: {file_id}")
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).isoformat()
         
-        # 3. Delete from Database
-        print(f"[INFO] Step 3: Deleting record from Database: {file_id}")
-        # Use supabase_admin to bypass RLS if no DELETE policy is set for admin key
-        db_result = supabase_admin.table("files").delete().eq("id", file_id).execute()
+        db_result = supabase_admin.table("files") \
+            .update({"deleted_at": now}) \
+            .eq("id", file_id) \
+            .execute()
         
-        # Check if any rows were actually deleted
-        if hasattr(db_result, 'data') and not db_result.data:
-            print(f"[WARNING] No rows deleted from database for file_id: {file_id} even with Admin. Checking existence...")
-            check = supabase_admin.table("files").select("id").eq("id", file_id).execute()
-            print(f"[INFO] Record exist check: {check.data}")
-        else:
-            print(f"[INFO] DONE: File record deleted from database.")
+        # NOTE: For "Soft Delete", we keep S3 and Vector Store data 
+        # but filter it out in queries. Hard delete from S3/Vector 
+        # could be moved to a separate cleanup job if desired.
 
         return {
-            "message": "File deletion process completed",
+            "message": "File soft-deleted successfully",
             "details": {
-                "s3": "Deleted" if s3_key else "Skipped (No Key)",
-                "vector_db": "Deleted",
-                "database": "Deleted" if db_result.data else "Failed to delete (Row not found or RLS)"
+                "database": "Updated deleted_at"
             }
         }
         

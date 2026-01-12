@@ -4,7 +4,7 @@ from uuid import UUID
 from app.schemas.folder import FolderCreate, FolderResponse, FileResponse
 from app.api.deps import get_current_user
 from app.core.supabase import supabase
-from app.core.supabase import supabase
+from app.integrations.storage.s3_storage import s3_storage
 
 router = APIRouter()
 
@@ -57,6 +57,7 @@ async def list_folders(user=Depends(get_current_user)):
         result = supabase.table("folders") \
             .select("*") \
             .eq("company_id", company_id) \
+            .is_("deleted_at", "null") \
             .order("name") \
             .execute()
         
@@ -76,7 +77,36 @@ async def list_folder_files(folder_id: UUID, user=Depends(get_current_user)):
             .order("created_at", desc=True) \
             .execute()
         
-        return result.data or []
+        files = result.data or []
+        for f in files:
+            if f.get("s3_key"):
+                f["s3_url"] = s3_storage.generate_presigned_url(f["s3_key"], expires_in=3600)
+        
+        return files
     except Exception as e:
         print(f"[ERROR] Error listing folder files: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.delete("/{folder_id}")
+async def delete_folder(folder_id: UUID, user=Depends(get_current_user)):
+    """Soft delete a folder."""
+    try:
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).isoformat()
+        
+        result = supabase.table("folders") \
+            .update({"deleted_at": now}) \
+            .eq("id", str(folder_id)) \
+            .execute()
+        
+        print(f"[INFO] Update result data: {result.data}")
+        if not result.data:
+            print(f"[ERROR] Soft delete failed - No rows updated. access denied or id found.")
+            # Verify if folder exists even (maybe RLS issue)
+        else:
+            print(f"[INFO] Folder {folder_id} soft-deleted at {now}")
+            
+        return {"message": "Folder soft-deleted successfully"}
+    except Exception as e:
+        print(f"[ERROR] Error deleting folder: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))

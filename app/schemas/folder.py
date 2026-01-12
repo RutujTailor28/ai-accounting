@@ -11,8 +11,10 @@ class FolderBase(CamelModel):
     parent_id: Optional[UUID] = None
 
 
-class FolderCreate(FolderBase):
-    pass
+class FolderCreate(CamelModel):
+    """Schema for creating a folder - company_id is derived from auth token"""
+    name: str
+    parent_id: Optional[UUID] = None
 
 
 class FolderResponse(FolderBase):
@@ -35,7 +37,7 @@ class FileBase(CamelModel):
 
 class FileResponse(FileBase):
     id: UUID
-    uploaded_by: UUID
+    created_by: UUID
     created_at: datetime
 
     class Config:

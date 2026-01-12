@@ -25,23 +25,56 @@ async def login(credentials: UserLogin):
             
         print(f"[DEBUG] Login successful for {response.user.email}")
 
-        # Fetch profile for company_id
+        # Try to get company_id from user_metadata first (preferred method)
         company_id = None
-        try:
-            profile_res = supabase.table("profiles") \
-                .select("company_id") \
-                .eq("id", response.user.id) \
-                .execute()
-            
-            if profile_res.data and len(profile_res.data) > 0:
-                company_id = profile_res.data[0].get("company_id")
-        except Exception as profile_e:
-            print(f"[WARNING] Profile fetch failed: {str(profile_e)}")
+        if hasattr(response.user, 'user_metadata') and response.user.user_metadata:
+            company_id = response.user.user_metadata.get("company_id")
+            if company_id:
+                print(f"[INFO] Found company_id in user_metadata: {company_id}")
+        
+        # Fallback: Check profiles table if not in user_metadata
+        if not company_id:
+            try:
+                profile_res = supabase.table("profiles") \
+                    .select("company_id") \
+                    .eq("id", response.user.id) \
+                    .execute()
+                
+                if profile_res.data and len(profile_res.data) > 0:
+                    company_id = profile_res.data[0].get("company_id")
+                    print(f"[INFO] Found company_id in profiles table: {company_id}")
+                else:
+                    # Neither source has company_id - create profile with default
+                    print(f"[INFO] No company_id found. Creating default profile...")
+                    default_company_id = f"company-{response.user.id[:8]}"
+                    
+                    # Import admin client for bypassing RLS
+                    from app.core.supabase import supabase_admin
+                    
+                    # Create profile using admin client to bypass RLS
+                    new_profile = supabase_admin.table("profiles").insert({
+                        "id": response.user.id,
+                        "email": response.user.email,
+                        "company_id": default_company_id,
+                        "first_name": response.user.email.split("@")[0],
+                        "last_name": ""
+                    }).execute()
+                    
+                    if new_profile.data:
+                        company_id = default_company_id
+                        print(f"[INFO] Created profile with company_id: {company_id}")
+                    else:
+                        print(f"[ERROR] Profile creation failed: {new_profile}")
+                    
+            except Exception as profile_e:
+                print(f"[WARNING] Profile fetch/create failed: {str(profile_e)}")
+                import traceback
+                traceback.print_exc()
 
         if not company_id:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="User profile not found or company_id not assigned. Please contact your administrator."
+                detail="User profile could not be created. Please contact your administrator."
             )
 
         # Ensure we return valid strings, not None for required fields

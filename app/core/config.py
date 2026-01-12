@@ -11,7 +11,8 @@ class Settings(BaseSettings):
     
     # OpenRouter Configuration (LLM)
     openrouter_api_key: str = ""
-    openrouter_model: str = "meta-llama/llama-3.1-8b-instruct:free"
+    openrouter_model: str = "meta-llama/llama-3.3-70b-instruct:free"
+    openrouter_model_accounting: str = "meta-llama/llama-3.3-70b-instruct:free"
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     
     # Optional: Direct OpenAI key for alternative embeddings

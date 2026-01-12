@@ -70,7 +70,7 @@ class VectorStore:
         
         Args:
             query_embedding: Query embedding vector
-            companyId: Company ID to filter results
+            company_id: Company ID to filter results
             n_results: Number of results to return
             
         Returns:
@@ -88,6 +88,40 @@ class VectorStore:
             return results
         except Exception as e:
             print(f"[ERROR] Error querying vector store: {str(e)}")
+            raise
+
+    def workspace_query(
+        self,
+        query_embedding: List[float],
+        company_id: str,
+        document_names: List[str],
+        n_results: int = 20
+    ) -> Dict[str, Any]:
+        """
+        Query the vector store, strictly limited to a specified set of documents.
+        """
+        try:
+            if not document_names:
+                return {"documents": [[]], "metadatas": [[]], "distances": [[]]}
+
+            # Chroma $in operator for lists
+            where_filter = {
+                "$and": [
+                    {"company_id": company_id},
+                    {"document_name": {"$in": document_names}}
+                ]
+            }
+
+            results = self.collection.query(
+                query_embeddings=[query_embedding],
+                n_results=n_results,
+                where=where_filter
+            )
+            
+            print(f"[INFO] Workspace Query returned {len(results['documents'][0])} results for {len(document_names)} docs")
+            return results
+        except Exception as e:
+            print(f"[ERROR] Error in workspace_query: {str(e)}")
             raise
     
     def get_collection_count(self, company_id: str = None) -> int:
