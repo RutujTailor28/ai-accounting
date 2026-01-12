@@ -1,15 +1,15 @@
 from typing import List, Optional
 import requests
 from langchain_ollama import OllamaEmbeddings
-from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.embeddings.fastembed import FastEmbedEmbeddings
 from app.core.config import settings
 
 
 class EmbeddingService:
-    """Service for generating embeddings with Ollama (Local) and HuggingFace (Fallback)."""
+    """Service for generating embeddings with Ollama (Local) and FastEmbed (Fallback)."""
     
     def __init__(self):
-        """Initialize embedding service, trying Ollama first then HuggingFace."""
+        """Initialize embedding service, trying Ollama first then FastEmbed."""
         self.use_fallback = False
         
         # Try to connect to Ollama
@@ -26,15 +26,16 @@ class EmbeddingService:
             else:
                 raise ConnectionError(f"Ollama returned status {response.status_code}")
         except Exception as e:
-            print(f"[WARNING] Could not connect to Ollama: {e}. Falling back to HuggingFace embeddings.")
+            print(f"[WARNING] Could not connect to Ollama: {e}. Falling back to FastEmbed embeddings.")
             self.use_fallback = True
             try:
-                self.embeddings = HuggingFaceEmbeddings(
-                    model_name=settings.huggingface_model
+                # FastEmbed is lightweight and doesn't require torch
+                self.embeddings = FastEmbedEmbeddings(
+                    model_name="BAAI/bge-small-en-v1.5"
                 )
-                print(f"[INFO] EmbeddingService initialized with HuggingFace model={settings.huggingface_model} (FREE/LOCAL)")
+                print(f"[INFO] EmbeddingService initialized with FastEmbed (BGE-Small) - FREE/CPU-Optimized")
             except Exception as hf_e:
-                print(f"[ERROR] Failed to initialize HuggingFace embeddings: {hf_e}")
+                print(f"[ERROR] Failed to initialize FastEmbed embeddings: {hf_e}")
                 raise hf_e
     
     def generate_embedding(self, text: str) -> List[float]:
@@ -43,15 +44,13 @@ class EmbeddingService:
         """
         try:
             embedding = self.embeddings.embed_query(text)
-            # print(f"[DEBUG] Generated embedding of dimension {len(embedding)}")
             return embedding
         except Exception as e:
             print(f"[ERROR] Error generating embedding: {str(e)}")
-            # If Ollama fails mid-way, we might want to retry with fallback if not already using it
             if not self.use_fallback:
-                 print("[INFO] Mid-execution Ollama failure. Re-initializing with HuggingFace...")
+                 print("[INFO] Mid-execution Ollama failure. Re-initializing with FastEmbed...")
                  self.use_fallback = True
-                 self.embeddings = HuggingFaceEmbeddings(model_name=settings.huggingface_model)
+                 self.embeddings = FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5")
                  return self.embeddings.embed_query(text)
             raise
     
@@ -66,8 +65,8 @@ class EmbeddingService:
         except Exception as e:
             print(f"[ERROR] Error generating embeddings: {str(e)}")
             if not self.use_fallback:
-                 print("[INFO] Mid-execution Ollama failure. Re-initializing with HuggingFace...")
+                 print("[INFO] Mid-execution Ollama failure. Re-initializing with FastEmbed...")
                  self.use_fallback = True
-                 self.embeddings = HuggingFaceEmbeddings(model_name=settings.huggingface_model)
+                 self.embeddings = FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5")
                  return self.embeddings.embed_documents(texts)
             raise

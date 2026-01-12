@@ -2,6 +2,7 @@
 fastapi>=0.115.0
 uvicorn[standard]>=0.30.0
 python-multipart>=0.0.12
+requests>=2.32.0
 
 # Document Processing
 PyPDF2>=3.0.0
@@ -18,8 +19,7 @@ chromadb>=0.5.15
 ollama>=0.3.0
 langchain-ollama>=0.2.0
 langchain-openai>=0.1.0
-sentence-transformers>=3.0.0
-langchain-huggingface>=0.0.3
+fastembed>=0.3.4
 
 # Utilities
 pydantic>=2.9.0
@@ -29,7 +29,3 @@ supabase>=2.9.0
 
 # AWS S3 Storage
 boto3>=1.35.0
-
-# Pydantic and Settings
-pydantic>=2.9.0
-pydantic-settings>=2.5.0
