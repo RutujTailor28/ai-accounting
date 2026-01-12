@@ -8,6 +8,7 @@ class Settings(BaseSettings):
     # Ollama Configuration (Local Embeddings)
     ollama_base_url: str = "http://localhost:11434"
     embedding_model: str = "nomic-embed-text"
+    huggingface_model: str = "all-MiniLM-L6-v2"
     
     # OpenRouter Configuration (LLM)
     openrouter_api_key: str = ""

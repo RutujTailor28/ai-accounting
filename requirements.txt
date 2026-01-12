@@ -18,6 +18,8 @@ chromadb>=0.5.15
 ollama>=0.3.0
 langchain-ollama>=0.2.0
 langchain-openai>=0.1.0
+sentence-transformers>=3.0.0
+langchain-huggingface>=0.0.3
 
 # Utilities
 pydantic>=2.9.0
