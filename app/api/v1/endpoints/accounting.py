@@ -6,14 +6,13 @@ import json
 from app.schemas.chat import ChatQueryRequest, ChatMessageResponse
 from app.api.deps import get_current_user
 from app.core.supabase import supabase
-from app.services.embedding_service import EmbeddingService
+from app.services.deps import embedding_service
 from app.ai.rag.retriever import vector_store
 from app.services.accounting_service import AccountingService
 
 router = APIRouter()
 
 # Initialize services
-embedding_service = EmbeddingService()
 accounting_service = AccountingService()
 
 @router.post("/query")

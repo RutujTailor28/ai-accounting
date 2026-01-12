@@ -1,17 +1,12 @@
 from fastapi import APIRouter, HTTPException, Depends
 from fastapi.responses import StreamingResponse
 from app.schemas.document import QueryRequest, QueryResponse
-from app.services.embedding_service import EmbeddingService
 from app.ai.rag.retriever import vector_store
-from app.services.ai_service import LLMService
+from app.services.deps import embedding_service, llm_service
 from app.api.deps import get_current_user
 import json
 
 router = APIRouter()
-
-# Initialize services
-embedding_service = EmbeddingService()
-llm_service = LLMService()
 
 @router.post("/query/stream")
 async def stream_query_documents(request: QueryRequest, user=Depends(get_current_user)):

@@ -6,7 +6,7 @@ from app.api.deps import get_current_user
 from app.integrations.ocr.pdf_parser import DocumentParser
 from app.integrations.storage.s3_storage import s3_storage
 from app.services.text_chunker import TextChunker
-from app.services.embedding_service import EmbeddingService
+from app.services.deps import embedding_service
 from app.ai.rag.retriever import vector_store
 import os
 import shutil
@@ -20,7 +20,6 @@ router = APIRouter()
 # Initialize services
 document_parser = DocumentParser()
 text_chunker = TextChunker()
-embedding_service = EmbeddingService()
 
 @router.get("/all", response_model=List[FileResponse])
 async def list_all_files(user=Depends(get_current_user)):
