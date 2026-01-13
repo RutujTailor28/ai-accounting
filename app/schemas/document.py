@@ -19,6 +19,12 @@ class QueryRequest(CamelModel):
     """Request model for querying the RAG system."""
     question: str = Field(..., description="Question to ask the system")
     company_id: str = Field(..., description="Unique identifier for the company")
+    file_types: Optional[List[str]] = Field(None, description="Filter by file extensions (e.g. ['pdf', 'docx'])")
+    folder_ids: Optional[List[str]] = Field(None, description="Filter by folder IDs")
+    uploaded_by: Optional[List[str]] = Field(None, description="Filter by user IDs")
+    start_date: Optional[str] = Field(None, description="Start date for filtering documents (ISO format)")
+    end_date: Optional[str] = Field(None, description="End date for filtering documents (ISO format)")
+    tags: Optional[List[str]] = Field(None, description="Filter by tags")
 
 class QueryResponse(CamelModel):
     """Response model for query results."""

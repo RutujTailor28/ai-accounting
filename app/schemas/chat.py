@@ -9,6 +9,12 @@ class ChatQueryRequest(CamelModel):
     workspace_id: UUID
     session_id: UUID
     question: str
+    file_types: Optional[List[str]] = Field(None, description="Filter by file extensions (e.g. ['pdf', 'docx'])")
+    folder_ids: Optional[List[str]] = Field(None, description="Filter by folder IDs")
+    uploaded_by: Optional[List[str]] = Field(None, description="Filter by user IDs")
+    start_date: Optional[str] = Field(None, description="Start date for filtering documents (ISO format)")
+    end_date: Optional[str] = Field(None, description="End date for filtering documents (ISO format)")
+    tags: Optional[List[str]] = Field(None, description="Filter by tags")
 
 
 class ChatMessageResponse(CamelModel):

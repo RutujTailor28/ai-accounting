@@ -28,6 +28,25 @@ async def create_folder(folder_data: FolderCreate, user=Depends(get_current_user
             "created_by": user.id
         }
 
+        # Step 1: Check if folder already exists
+        existing = supabase.table("folders") \
+            .select("*") \
+            .eq("name", folder_data.name) \
+            .eq("company_id", company_id) \
+            .is_("deleted_at", "null")
+        
+        if folder_data.parent_id:
+            existing = existing.eq("parent_id", str(folder_data.parent_id))
+        else:
+            existing = existing.is_("parent_id", "null")
+            
+        existing_res = existing.execute()
+        
+        if existing_res.data:
+            print(f"[INFO] Folder already exists: {folder_data.name}. Returning existing record.")
+            return existing_res.data[0]
+
+        # Step 2: Insert new folder
         result = supabase.table("folders").insert(data).execute()
         
         if not result.data:

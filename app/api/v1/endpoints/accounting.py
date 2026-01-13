@@ -50,11 +50,23 @@ async def accounting_query(request: ChatQueryRequest, user=Depends(get_current_u
         # Step 2: Retrieve ALL Chunks (High Context for Reports)
         # For accounting reports, we often need the full story, so we pull more results than usual
         query_embedding = embedding_service.generate_embedding(request.question)
+        
+        # Prepare filters
+        query_filters = {
+            "file_types": request.file_types,
+            "folder_ids": request.folder_ids,
+            "uploaded_by": request.uploaded_by,
+            "start_date": request.start_date,
+            "end_date": request.end_date,
+            "tags": request.tags
+        }
+
         results = vector_store.workspace_query(
             query_embedding=query_embedding,
             company_id=company_id,
             document_names=doc_names,
-            n_results=30 # Higher context for synthesis
+            n_results=30, # Higher context for synthesis
+            **query_filters
         )
         
         chunks = results.get('documents', [[]])[0]

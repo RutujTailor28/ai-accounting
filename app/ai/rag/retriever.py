@@ -22,6 +22,52 @@ class VectorStore:
         
         print(f"[INFO] VectorStore initialized with persist_directory={settings.chroma_persist_directory}")
     
+    def _build_where_filter(
+        self, 
+        company_id: str, 
+        file_types: List[str] = None, 
+        folder_ids: List[str] = None, 
+        uploaded_by: List[str] = None,
+        start_date: str = None, 
+        end_date: str = None,
+        tags: List[str] = None,
+        document_names: List[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Build ChromaDB 'where' filter from multiple parameters.
+        """
+        filters = [{"company_id": company_id}]
+
+        if file_types:
+            # Normalize to lowercase to match stored metadata
+            normalized_types = [ft.lower() for ft in file_types]
+            filters.append({"file_type": {"$in": normalized_types}})
+        
+        if folder_ids:
+            filters.append({"folder_id": {"$in": folder_ids}})
+            
+        if uploaded_by:
+            filters.append({"created_by": {"$in": uploaded_by}})
+            
+        if document_names:
+            filters.append({"document_name": {"$in": document_names}})
+
+        # Date filters removed from DB query to allow AI-based filtering
+        # The date range will be injected into the LLM prompt instead.
+            
+        if tags:
+            # Normalize tags to lowercase
+            normalized_tags = [t.lower() for t in tags]
+            filters.append({"tags": {"$in": normalized_tags}})
+
+        if len(filters) == 1:
+            res = filters[0]
+        else:
+            res = {"$and": filters}
+            
+        print(f"[DEBUG] Built where_filter: {res}")
+        return res
+
     def add_documents(
         self,
         texts: List[str],
@@ -63,24 +109,19 @@ class VectorStore:
         self,
         query_embedding: List[float],
         company_id: str,
-        n_results: int = 5
+        n_results: int = 5,
+        **filters
     ) -> Dict[str, Any]:
         """
-        Query the vector store for relevant documents.
-        
-        Args:
-            query_embedding: Query embedding vector
-            company_id: Company ID to filter results
-            n_results: Number of results to return
-            
-        Returns:
-            Dictionary containing documents, metadatas, and distances
+        Query the vector store for relevant documents with optional filters.
         """
         try:
+            where_filter = self._build_where_filter(company_id=company_id, **filters)
+            
             results = self.collection.query(
                 query_embeddings=[query_embedding],
                 n_results=n_results,
-                where={"company_id": company_id}
+                where=where_filter
             )
             
             print(f"[INFO] Query returned {len(results['documents'][0])} results for company_id={company_id}")
@@ -95,22 +136,18 @@ class VectorStore:
         query_embedding: List[float],
         company_id: str,
         document_names: List[str],
-        n_results: int = 20
+        n_results: int = 20,
+        **filters
     ) -> Dict[str, Any]:
         """
-        Query the vector store, strictly limited to a specified set of documents.
+        Query the vector store, strictly limited to a specified set of documents and optional filters.
         """
         try:
-            if not document_names:
-                return {"documents": [[]], "metadatas": [[]], "distances": [[]]}
-
-            # Chroma $in operator for lists
-            where_filter = {
-                "$and": [
-                    {"company_id": company_id},
-                    {"document_name": {"$in": document_names}}
-                ]
-            }
+            where_filter = self._build_where_filter(
+                company_id=company_id, 
+                document_names=document_names, 
+                **filters
+            )
 
             results = self.collection.query(
                 query_embeddings=[query_embedding],

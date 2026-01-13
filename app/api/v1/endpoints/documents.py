@@ -170,6 +170,47 @@ async def upload_document(
             raise HTTPException(status_code=400, detail="No text could be extracted from the document")
         print(f"[INFO] DONE: Document parsed successfully ({len(text)} characters).")
         
+        # Step 5a: Extract Date from Content
+        import re
+        from datetime import datetime
+        
+        content_date_ts = None
+        # Regex for YYYY-MM-DD, DD-MM-YYYY, DD/MM/YYYY, etc.
+        date_patterns = [
+            r'\b(\d{4})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])\b', # YYYY-MM-DD
+            r'\b(0[1-9]|[12]\d|3[01])-(0[1-9]|1[0-2])-(\d{4})\b', # DD-MM-YYYY
+            r'\b(0[1-9]|[12]\d|3[01])/(0[1-9]|1[0-2])/(\d{4})\b'  # DD/MM/YYYY
+        ]
+        
+        for pattern in date_patterns:
+            match = re.search(pattern, text)
+            if match:
+                try:
+                    date_str = match.group(0)
+                    # Simple parsing fallback
+                    if '-' in date_str:
+                        parts = date_str.split('-')
+                    else:
+                        parts = date_str.split('/')
+                        
+                    # Determine format by length of first part
+                    if len(parts[0]) == 4: # YYYY-MM-DD
+                        dt = datetime(int(parts[0]), int(parts[1]), int(parts[2]))
+                    else: # DD-MM-YYYY
+                        dt = datetime(int(parts[2]), int(parts[1]), int(parts[0]))
+                        
+                    content_date_ts = dt.timestamp()
+                    print(f"[INFO] Extracted content date: {date_str} -> {content_date_ts}")
+                    break
+                except Exception as e:
+                    print(f"[WARNING] Date parse failed for {date_str}: {e}")
+                    
+        # Fallback to upload time if no date found
+        if not content_date_ts:
+            from datetime import timezone
+            content_date_ts = datetime.now(timezone.utc).timestamp()
+            print("[INFO] No date found in content. Using current time.")
+
         # Step 5: Chunk text
         print(f"[INFO] Step 5: Chunking text...")
         chunks = text_chunker.chunk_text(text)
@@ -183,11 +224,19 @@ async def upload_document(
         print(f"[INFO] DONE: Generated embeddings for {len(embeddings)} chunks.")
         
         # Step 7: Prepare metadata for Vector Store
+        from datetime import datetime, timezone
+        now_ts = datetime.now(timezone.utc).timestamp()
+        
         metadatas = [
             {
                 "company_id": company_id,
                 "folder_name": folder_name,
+                "folder_id": target_folder_id,
                 "document_name": file.filename,
+                "file_type": file.filename.split('.')[-1].lower() if '.' in file.filename else 'unknown',
+                "created_by": user.id if hasattr(user, 'id') else None,
+                "created_at": now_ts,
+                "content_date": content_date_ts,
                 "chunk_index": i
             }
             for i in range(len(chunks))
