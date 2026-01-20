@@ -129,10 +129,10 @@ async def list_all_files(user=Depends(get_current_user)):
 
 @router.post("/upload", response_model=UploadResponse)
 async def upload_document(
+    background_tasks: BackgroundTasks,
     folder_name: str = Form(..., alias="folderName"),
     parent_id: Optional[str] = Form(None, alias="parentId"),
     file: UploadFile = File(...),
-    background_tasks: BackgroundTasks = None,
     user=Depends(get_current_user)
 ):
     """
