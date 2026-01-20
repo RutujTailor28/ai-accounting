@@ -70,33 +70,59 @@ async def _process_document_background(
         if not content_date_ts:
             content_date_ts = datetime.now(timezone.utc).timestamp()
 
-        # Chunk, Embed, and Store
+        # Chunk, Embed, and Store in smaller batches to prevent OOM
         chunks = text_chunker.chunk_text(text)
-        if not chunks: return
+        if not chunks: 
+            print(f"[BG-TASK] No chunks created for {filename}")
+            return
         
-        embeddings = embedding_service.generate_embeddings(chunks)
-        
+        total_chunks = len(chunks)
+        batch_size = 50  # Process in small batches
+        print(f"[BG-TASK] Processing {total_chunks} chunks in batches of {batch_size}...")
+
+        import gc
+        from datetime import datetime, timezone
         now_ts = datetime.now(timezone.utc).timestamp()
-        metadatas = [
-            {
-                "company_id": company_id,
-                "folder_name": folder_name,
-                "folder_id": target_folder_id,
-                "document_name": filename,
-                "file_type": filename.split('.')[-1].lower() if '.' in filename else 'unknown',
-                "created_by": user_id,
-                "created_at": now_ts,
-                "content_date": content_date_ts,
-                "chunk_index": i
-            }
-            for i in range(len(chunks))
-        ]
-        
-        vector_store.add_documents(texts=chunks, embeddings=embeddings, metadatas=metadatas)
-        print(f"[BG-TASK] DONE: Successfully processed {filename} ({len(chunks)} chunks).")
+
+        for i in range(0, total_chunks, batch_size):
+            batch_chunks = chunks[i:i + batch_size]
+            batch_embeddings = embedding_service.generate_embeddings(batch_chunks)
+            
+            batch_metadatas = [
+                {
+                    "company_id": company_id,
+                    "folder_name": folder_name,
+                    "folder_id": target_folder_id,
+                    "document_name": filename,
+                    "file_type": filename.split('.')[-1].lower() if '.' in filename else 'unknown',
+                    "created_by": user_id,
+                    "created_at": now_ts,
+                    "content_date": content_date_ts,
+                    "chunk_index": i + j
+                }
+                for j in range(len(batch_chunks))
+            ]
+            
+            vector_store.add_documents(
+                texts=batch_chunks, 
+                embeddings=batch_embeddings, 
+                metadatas=batch_metadatas
+            )
+            
+            print(f"[BG-TASK] Processed batch {i//batch_size + 1}/{(total_chunks-1)//batch_size + 1} ({len(batch_chunks)} chunks)")
+            
+            # Explicit garbage collection to free memory between batches
+            batch_embeddings = None
+            batch_chunks = None
+            batch_metadatas = None
+            gc.collect()
+
+        print(f"[BG-TASK] DONE: Successfully processed {filename} ({total_chunks} chunks in total).")
         
     except Exception as e:
         print(f"[BG-TASK][ERROR] Critical failure for {filename}: {str(e)}")
+        import traceback
+        traceback.print_exc()
 
 @router.get("/all", response_model=List[FileResponse])
 async def list_all_files(user=Depends(get_current_user)):
