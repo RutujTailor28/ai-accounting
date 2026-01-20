@@ -10,7 +10,7 @@ class UploadResponse(CamelModel):
     """Response model for document upload."""
     message: str
     document_name: str
-    chunks_created: int
+    chunks_created: Optional[int] = 0
     company_id: str
     s3_key: Optional[str] = Field(None, description="S3 object key (path) where file is stored")
     s3_url: Optional[str] = Field(None, description="Presigned URL to access the file (expires in 1 hour)")

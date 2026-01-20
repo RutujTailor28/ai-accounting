@@ -1,5 +1,5 @@
 from fastapi import APIRouter, HTTPException, Depends, status
-from app.schemas.auth import UserLogin, LoginResponse, ForgotPasswordRequest, ResetPasswordRequest
+from app.schemas.auth import UserLogin, LoginResponse, ForgotPasswordRequest, ResetPasswordRequest, TokenRefreshRequest
 from app.core.supabase import supabase
 from app.api.deps import get_current_user
 
@@ -80,6 +80,7 @@ async def login(credentials: UserLogin):
         # Ensure we return valid strings, not None for required fields
         return LoginResponse(
             access_token=str(response.session.access_token),
+            refresh_token=str(response.session.refresh_token),
             user_id=str(response.user.id),
             email=str(response.user.email),
             company_id=str(company_id)
@@ -143,4 +144,45 @@ async def reset_password(data: ResetPasswordRequest, user=Depends(get_current_us
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Failed to reset password: {str(e)}"
+        )
+
+@router.post("/refresh", response_model=LoginResponse)
+async def refresh_token(data: TokenRefreshRequest):
+    """
+    Refresh JWT token using a refresh token.
+    """
+    try:
+        response = supabase.auth.refresh_session(data.refresh_token)
+        
+        if not response.session:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid or expired refresh token"
+            )
+
+        # Get company_id from user_metadata or profiles
+        company_id = None
+        if hasattr(response.user, 'user_metadata') and response.user.user_metadata:
+            company_id = response.user.user_metadata.get("company_id")
+        
+        if not company_id:
+            profile_res = supabase.table("profiles") \
+                .select("company_id") \
+                .eq("id", response.user.id) \
+                .execute()
+            if profile_res.data:
+                company_id = profile_res.data[0].get("company_id")
+
+        return LoginResponse(
+            access_token=str(response.session.access_token),
+            refresh_token=str(response.session.refresh_token),
+            user_id=str(response.user.id),
+            email=str(response.user.email),
+            company_id=str(company_id) or ""
+        )
+    except Exception as e:
+        print(f"[ERROR] token refresh failed: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Token refresh failed: {str(e)}"
         )

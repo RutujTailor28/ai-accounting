@@ -37,9 +37,10 @@ class AccountingService:
         1. Extract EVERY transaction found.
         2. **DOUBLE ENTRY PRINCIPLE**: Every transaction must have at least TWO entries (Debit & Credit).
            - **Bank Account**: One side is ALWAYS "Bank Account".
-             - If statement says DEBIT -> Books: Credit "Bank Account" (Money Out).
-             - If statement says CREDIT -> Books: Debit "Bank Account" (Money In).
-           - **Counter Account**: Classify the other side based on narration (e.g., "Fuel Expense", "Sales", "Capital").
+             - If statement says DEBIT (Money Out) -> Books: Credit "Bank Account" and Debit an **EXPENSE** or **ASSET** account. (NEVER Debit "Sales" for Money Out unless it is a refund).
+             - If statement says CREDIT (Money In) -> Books: Debit "Bank Account" and Credit an **INCOME** or **LIABILITY** account.
+           - **Counter Account**: Classify the other side based on narration. 
+             - *Examples:* "Fuel Expense", "Office Rent", "Sales Income", "Capital", "Loan from Bank".
         
         REQUIRED JSON FORMAT:
         {{
@@ -94,7 +95,7 @@ class AccountingService:
         # PHASE 1: BATCH EXTRACTION (Map Step)
         # ---------------------------------------------------------
         total_chunks = len(context_chunks)
-        BATCH_SIZE = 50 # Increased for speed (less overhead)
+        BATCH_SIZE = 20 # Reduced for better accuracy. (50 was too large)
         
         all_transactions = []
         
@@ -135,9 +136,30 @@ class AccountingService:
             yield "[WARNING] No transactions could be extracted from the documents. Please check the file quality."
             return
 
-        print(f"[INFO] Total extracted transactions: {len(all_transactions)}")
-        print(f"[INFO] Total extracted transactions: {len(all_transactions)}")
-        yield {"status": f"Verifying Double-Entry Integrity for {len(all_transactions)} transactions..."}
+        print(f"[INFO] Total extracted transactions (pre-dedup): {len(all_transactions)}")
+        
+        # --- DEDUPLICATION LOGIC (Fixes Chunk Overlap Duplicates) ---
+        unique_transactions = []
+        seen_hashes = set()
+        
+        for t in all_transactions:
+            # Create a stable signature for each transaction
+            date = str(t.get('date', '')).strip()
+            narration = str(t.get('narration', '')).strip()
+            # Sort entries for stable hashing
+            raw_entries = t.get('entries', [])
+            sorted_entries = sorted(raw_entries, key=lambda x: (str(x.get('account')), str(x.get('amount'))))
+            entries_sig = "|".join([f"{e.get('account')}:{e.get('amount')}" for e in sorted_entries])
+            
+            tx_hash = f"{date}#{narration}#{entries_sig}"
+            
+            if tx_hash not in seen_hashes:
+                seen_hashes.add(tx_hash)
+                unique_transactions.append(t)
+        
+        all_transactions = unique_transactions
+        print(f"[INFO] Total unique transactions (post-dedup): {len(all_transactions)}")
+        yield {"status": f"Verifying Double-Entry Integrity for {len(all_transactions)} unique transactions..."}
 
         # ---------------------------------------------------------
         # PHASE 2: FINANCIAL PROCESSING (Python Core)
@@ -320,12 +342,13 @@ class AccountingService:
         # So we just provide the classification hints.
         
         control_data = f"""
-        **SYSTEM PRE-CALCULATED HINTS (Use for Verification):**
-        - Estimated Total Income: {calc_income:,.2f}
-        - Estimated Total Expenses: {calc_expense:,.2f}
-        - Estimated Net Profit: {calc_net_profit:,.2f}
-        - Estimated Total Assets: {calc_assets:,.2f}
-        *(Note: These are based on initial tagging. Rely on your accounting logic if tags are wrong, but ENSURE it tallies.)*
+        **SYSTEM PRE-CALCULATED HINTS (DO NOT CONTRADICT THESE):**
+        - Python Calculated Total Income: ₹ {calc_income:,.2f}
+        - Python Calculated Total Expenses: ₹ {calc_expense:,.2f}
+        - **MANDATORY NET PROFIT TO TRANSFER:** ₹ {calc_net_profit:,.2f}
+        - Target Balance Sheet Side Total: ₹ {calc_assets:,.2f}
+        
+        *INSTRUCTIONS: You MUST use the Net Profit of ₹ {calc_net_profit:,.2f} in your Capital calculation. If your classification leads to a different tally, prioritize the double-entry integrity so that Assets = Liabilities + Equity + Net Profit.*
         """
 
         # 2. GENERATE P&L AND BALANCE SHEET (LLM)
@@ -463,6 +486,14 @@ Include ONLY:
 • Less: Net Loss
 • Less: Drawings (explicit drawings only)
 
+────────────────────────────────────
+BALANCE SHEET (AGGREGATION IS MANDATORY)
+────────────────────────────────────
+1. **DO NOT list individual party names** (e.g., "Mr. Rahul", "ABC Corp") in the final Balance Sheet.
+2. SUM all (Dr) balances of parties/individuals and show as a single line item: **Sundry Debtors**.
+3. SUM all (Cr) balances of parties/individuals and show as a single line item: **Sundry Creditors**.
+4. This keeps the Balance Sheet professional and audit-safe.
+
 IMPORTANT:
 • Transfers to individuals are NOT capital unless explicitly stated
 • ATM withdrawal, cash deposit, cheque deposit are CASH/BANK movements, not liabilities
@@ -521,13 +552,10 @@ INSTRUCTIONS
      LIABILITIES SIDE:
        Capital (show calculation: Capital + Profit – Drawings)
        Long-Term Liabilities
-       Current Liabilities
+       Current Liabilities (including **Sundry Creditors**)
      ASSETS SIDE:
        Non-Current Assets
-       Current Assets
-     ASSETS SIDE:
-       Non-Current Assets
-       Current Assets
+       Current Assets (including **Sundry Debtors** and Bank/Cash)
    - Ensure the Balance Sheet tallies exactly.
    - **CRITICAL:** Do NOT omit any Asset or Liability ledger from the Trial Balance.
 

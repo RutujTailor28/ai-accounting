@@ -7,10 +7,14 @@ class UserLogin(CamelModel):
 
 class LoginResponse(CamelModel):
     access_token: str
+    refresh_token: str
     token_type: str = "bearer"
     user_id: str
     email: str
     company_id: str
+
+class TokenRefreshRequest(CamelModel):
+    refresh_token: str
 
 class ForgotPasswordRequest(CamelModel):
     email: str
