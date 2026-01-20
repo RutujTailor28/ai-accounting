@@ -20,6 +20,19 @@ class VectorStore:
             metadata={"description": "RAG system for accounting documents"}
         )
         
+        # --- DIMENSION SAFETY CHECK ---
+        # If collection exists and has data, check if dimension matches
+        try:
+            sample = self.collection.get(limit=1, include=["embeddings"])
+            if sample and sample["embeddings"] and len(sample["embeddings"]) > 0:
+                existing_dim = len(sample["embeddings"][0])
+                print(f"[DEBUG] Collection dimension check: {existing_dim}")
+                # We don't know the exact target dim here since it's lazy-loaded, 
+                # but we can rely on Chroma to error out on the FIRST add.
+                # However, a better way is to handle the InvalidArgumentError in add_documents.
+        except Exception as e:
+            print(f"[DEBUG] Dimension check failed (likely empty collection): {e}")
+
         print(f"[INFO] VectorStore initialized with persist_directory={settings.chroma_persist_directory}")
     
     def _build_where_filter(
@@ -102,6 +115,21 @@ class VectorStore:
             )
             print(f"[INFO] Added {len(texts)} documents to vector store for company_id={metadatas[0]['company_id']}")
         except Exception as e:
+            error_msg = str(e)
+            if "dimension" in error_msg or "expecting embedding with dimension" in error_msg:
+                print(f"[WARNING] EMBDEDDING DIMENSION MISMATCH DETECTED: {error_msg}")
+                print(f"[ACTION] Resetting collection to match new model dimension...")
+                self.reset_collection()
+                # Retry once after reset
+                self.collection.add(
+                    documents=texts,
+                    embeddings=embeddings,
+                    metadatas=metadatas,
+                    ids=ids
+                )
+                print(f"[INFO] Successfully recovered and added documents after collection reset.")
+                return
+
             print(f"[ERROR] Error adding documents to vector store: {str(e)}")
             raise
     

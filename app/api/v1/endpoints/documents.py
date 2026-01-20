@@ -14,6 +14,9 @@ import shutil
 from app.core.supabase import supabase, supabase_admin
 from app.schemas.folder import FileResponse
 from typing import List
+from datetime import datetime, timezone
+import re
+import gc
 
 router = APIRouter()
 
@@ -45,8 +48,6 @@ async def _process_document_background(
             return
 
         # Extract Date from Content
-        import re
-        from datetime import datetime, timezone
         content_date_ts = None
         date_patterns = [
             r'\b(\d{4})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])\b',
@@ -80,8 +81,7 @@ async def _process_document_background(
         batch_size = 50  # Process in small batches
         print(f"[BG-TASK] Processing {total_chunks} chunks in batches of {batch_size}...")
 
-        import gc
-        from datetime import datetime, timezone
+        # Move these to top level eventually, but keeping for now as requested
         now_ts = datetime.now(timezone.utc).timestamp()
 
         for i in range(0, total_chunks, batch_size):
