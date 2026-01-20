@@ -1,4 +1,4 @@
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends, BackgroundTasks
 from typing import BinaryIO, Optional
 import io
 from app.schemas.document import UploadResponse
@@ -20,6 +20,83 @@ router = APIRouter()
 # Initialize services
 document_parser = DocumentParser()
 text_chunker = TextChunker()
+
+async def _process_document_background(
+    file_content: bytes,
+    filename: str,
+    company_id: str,
+    folder_name: str,
+    target_folder_id: str,
+    user_id: str,
+    s3_key: str
+):
+    """
+    Background worker to parse, chunk, and embed a document.
+    Ensures the UI doesn't time out during heavy processing.
+    """
+    try:
+        print(f"[BG-TASK] Starting background processing for: {filename}")
+        file_obj = io.BytesIO(file_content)
+        
+        # Parse document
+        text = document_parser.parse(file_obj, filename)
+        if not text or not text.strip():
+            print(f"[BG-TASK][ERROR] No text extracted from {filename}")
+            return
+
+        # Extract Date from Content
+        import re
+        from datetime import datetime, timezone
+        content_date_ts = None
+        date_patterns = [
+            r'\b(\d{4})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])\b',
+            r'\b(0[1-9]|[12]\d|3[01])-(0[1-9]|1[0-2])-(\d{4})\b',
+            r'\b(0[1-9]|[12]\d|3[01])/(0[1-9]|1[0-2])/(\d{4})\b'
+        ]
+        
+        for pattern in date_patterns:
+            match = re.search(pattern, text)
+            if match:
+                try:
+                    date_str = match.group(0)
+                    if '-' in date_str: parts = date_str.split('-')
+                    else: parts = date_str.split('/')
+                    if len(parts[0]) == 4: dt = datetime(int(parts[0]), int(parts[1]), int(parts[2]))
+                    else: dt = datetime(int(parts[2]), int(parts[1]), int(parts[0]))
+                    content_date_ts = dt.timestamp()
+                    break
+                except: continue
+                    
+        if not content_date_ts:
+            content_date_ts = datetime.now(timezone.utc).timestamp()
+
+        # Chunk, Embed, and Store
+        chunks = text_chunker.chunk_text(text)
+        if not chunks: return
+        
+        embeddings = embedding_service.generate_embeddings(chunks)
+        
+        now_ts = datetime.now(timezone.utc).timestamp()
+        metadatas = [
+            {
+                "company_id": company_id,
+                "folder_name": folder_name,
+                "folder_id": target_folder_id,
+                "document_name": filename,
+                "file_type": filename.split('.')[-1].lower() if '.' in filename else 'unknown',
+                "created_by": user_id,
+                "created_at": now_ts,
+                "content_date": content_date_ts,
+                "chunk_index": i
+            }
+            for i in range(len(chunks))
+        ]
+        
+        vector_store.add_documents(texts=chunks, embeddings=embeddings, metadatas=metadatas)
+        print(f"[BG-TASK] DONE: Successfully processed {filename} ({len(chunks)} chunks).")
+        
+    except Exception as e:
+        print(f"[BG-TASK][ERROR] Critical failure for {filename}: {str(e)}")
 
 @router.get("/all", response_model=List[FileResponse])
 async def list_all_files(user=Depends(get_current_user)):
@@ -55,6 +132,7 @@ async def upload_document(
     folder_name: str = Form(..., alias="folderName"),
     parent_id: Optional[str] = Form(None, alias="parentId"),
     file: UploadFile = File(...),
+    background_tasks: BackgroundTasks = None,
     user=Depends(get_current_user)
 ):
     """
@@ -162,102 +240,22 @@ async def upload_document(
             
         print(f"[INFO] DONE: File record saved to database.")
 
-        # Step 4: Parse document
-        print(f"[INFO] Step 4: Parsing document...")
-        text = document_parser.parse(file_obj, file.filename)
-        
-        if not text or not text.strip():
-            raise HTTPException(status_code=400, detail="No text could be extracted from the document")
-        print(f"[INFO] DONE: Document parsed successfully ({len(text)} characters).")
-        
-        # Step 5a: Extract Date from Content
-        import re
-        from datetime import datetime
-        
-        content_date_ts = None
-        # Regex for YYYY-MM-DD, DD-MM-YYYY, DD/MM/YYYY, etc.
-        date_patterns = [
-            r'\b(\d{4})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])\b', # YYYY-MM-DD
-            r'\b(0[1-9]|[12]\d|3[01])-(0[1-9]|1[0-2])-(\d{4})\b', # DD-MM-YYYY
-            r'\b(0[1-9]|[12]\d|3[01])/(0[1-9]|1[0-2])/(\d{4})\b'  # DD/MM/YYYY
-        ]
-        
-        for pattern in date_patterns:
-            match = re.search(pattern, text)
-            if match:
-                try:
-                    date_str = match.group(0)
-                    # Simple parsing fallback
-                    if '-' in date_str:
-                        parts = date_str.split('-')
-                    else:
-                        parts = date_str.split('/')
-                        
-                    # Determine format by length of first part
-                    if len(parts[0]) == 4: # YYYY-MM-DD
-                        dt = datetime(int(parts[0]), int(parts[1]), int(parts[2]))
-                    else: # DD-MM-YYYY
-                        dt = datetime(int(parts[2]), int(parts[1]), int(parts[0]))
-                        
-                    content_date_ts = dt.timestamp()
-                    print(f"[INFO] Extracted content date: {date_str} -> {content_date_ts}")
-                    break
-                except Exception as e:
-                    print(f"[WARNING] Date parse failed for {date_str}: {e}")
-                    
-        # Fallback to upload time if no date found
-        if not content_date_ts:
-            from datetime import timezone
-            content_date_ts = datetime.now(timezone.utc).timestamp()
-            print("[INFO] No date found in content. Using current time.")
-
-        # Step 5: Chunk text
-        print(f"[INFO] Step 5: Chunking text...")
-        chunks = text_chunker.chunk_text(text)
-        
-        if not chunks:
-            raise HTTPException(status_code=400, detail="Failed to create text chunks")
-        print(f"[INFO] DONE: Text split into {len(chunks)} chunks.")
-        
-        print(f"[INFO] Step 6: Generating embeddings...")
-        embeddings = embedding_service.generate_embeddings(chunks)
-        print(f"[INFO] DONE: Generated embeddings for {len(embeddings)} chunks.")
-        
-        # Step 7: Prepare metadata for Vector Store
-        from datetime import datetime, timezone
-        now_ts = datetime.now(timezone.utc).timestamp()
-        
-        metadatas = [
-            {
-                "company_id": company_id,
-                "folder_name": folder_name,
-                "folder_id": target_folder_id,
-                "document_name": file.filename,
-                "file_type": file.filename.split('.')[-1].lower() if '.' in file.filename else 'unknown',
-                "created_by": user.id if hasattr(user, 'id') else None,
-                "created_at": now_ts,
-                "content_date": content_date_ts,
-                "chunk_index": i
-            }
-            for i in range(len(chunks))
-        ]
-        
-        
-        # Step 8: Store in vector database
-        print(f"[INFO] Step 8: Storing in vector database...")
-        vector_store.add_documents(
-            texts=chunks,
-            embeddings=embeddings,
-            metadatas=metadatas
+        # Schedule background processing to prevent 502 timeouts
+        background_tasks.add_task(
+            _process_document_background,
+            file_content=file_content,
+            filename=file.filename,
+            company_id=company_id,
+            folder_name=folder_name,
+            target_folder_id=target_folder_id,
+            user_id=user.id if hasattr(user, 'id') else None,
+            s3_key=s3_key
         )
-        print(f"[INFO] DONE: Chunks successfully stored in Vector Database.")
-        
-        print(f"[INFO] Successfully processed document: {file.filename} ({len(chunks)} chunks) for group={folder_name}")
         
         return UploadResponse(
-            message="Document uploaded and processed successfully",
+            message="Document uploaded. AI processing started in background.",
             document_name=file.filename,
-            chunks_created=len(chunks),
+            chunks_created=0, 
             company_id=company_id,
             s3_key=s3_key or "",
             s3_url=s3_url or ""
