@@ -61,24 +61,128 @@ async def accounting_query(request: ChatQueryRequest, user=Depends(get_current_u
             "tags": request.tags
         }
 
-        results = vector_store.workspace_query(
-            query_embedding=query_embedding,
-            company_id=company_id,
-            document_names=doc_names,
-            n_results=30, # Higher context for synthesis
-            **query_filters
+        # For accounting, we need to get ALL chunks from the documents, not just semantically similar ones
+        # First get count to retrieve all available chunks
+        import re
+        count_result = vector_store.collection.get(
+            where=vector_store._build_where_filter(
+                company_id=company_id,
+                document_names=doc_names,
+                **query_filters
+            ),
+            include=[]
         )
+        total_available = len(count_result['ids'])
+        print(f"[INFO] Accounting endpoint: Total available chunks for documents: {total_available}")
         
-        chunks = results.get('documents', [[]])[0]
+        # Retrieve ALL chunks for these documents (not just semantically similar ones)
+        # This ensures we get transaction data, not just headers/footers
+        if total_available > 0:
+            # Get all chunks without semantic filtering - just filter by document
+            all_results = vector_store.collection.get(
+                where=vector_store._build_where_filter(
+                    company_id=company_id,
+                    document_names=doc_names,
+                    **query_filters
+                ),
+                include=['documents', 'metadatas']
+            )
+            chunks = all_results.get('documents', [])
+            metadatas = all_results.get('metadatas', [])
+            print(f"[INFO] Accounting endpoint: Retrieved {len(chunks)} chunks (ALL chunks from documents) for accounting synthesis")
+            
+            # Filter out header/footer chunks that don't contain transaction-like patterns
+            transaction_keywords = ['UPI', 'NEFT', 'IMPS', 'RTGS', 'PAYMENT', 'RECEIVED', 'TRANSFER', 
+                                  'DEBIT', 'CREDIT', 'WITHDRAWAL', 'DEPOSIT', 'DATE', '/', 'Rs.', 'AMOUNT',
+                                  '22/', '23/', '24/', '25/', '01/', '02/', '03/', '04/', '05/',
+                                  '06/', '07/', '08/', '09/', '10/', '11/', '12/']
+            
+            filtered_chunks = []
+            filtered_metadatas = []
+            
+            for chunk, metadata in zip(chunks, metadatas):
+                chunk_upper = chunk.upper()
+                # Check if chunk contains transaction-like patterns
+                has_transaction_pattern = any(keyword in chunk_upper for keyword in transaction_keywords)
+                
+                # Check if chunk has date-like patterns (DD/MM/YY or DD/MM/YYYY)
+                has_date_pattern = bool(re.search(r'\d{1,2}[/-]\d{1,2}[/-]\d{2,4}', chunk))
+                
+                # Check if chunk has amount patterns (numbers with commas or decimals)
+                has_amount_pattern = bool(re.search(r'\d+[,\.]\d+', chunk))
+                
+                # Exclude chunks that are clearly headers/footers
+                is_header_footer = any(keyword in chunk_upper for keyword in [
+                    'CLOSING BALANCE INCLUDES', 'STATEMENT WILL BE CONSIDERED CORRECT',
+                    'ERROR IS REPORTED WITHIN', 'GSTIN NUMBER', 'GST NUMBER',
+                    'REGISTERED OFFICE', 'BRANCH CODE', 'IFSC', 'MICR', 'ACCOUNT TYPE',
+                    'STATEMENT OF ACCOUNT FROM', 'ACCOUNT BRANCH', 'PHONE NO', 'EMAIL',
+                    'CUST ID', 'ACCOUNT NO', 'A/C OPEN DATE', 'ACCOUNT STATUS'
+                ])
+                
+                # Include chunk if:
+                # 1. It has transaction patterns, OR
+                # 2. It has date AND amount patterns (likely a transaction), OR  
+                # 3. It's not a header/footer (keep if we're not sure)
+                if (has_transaction_pattern or 
+                    (has_date_pattern and has_amount_pattern) or 
+                    (not is_header_footer and len(chunk) > 50)):  # Exclude very short chunks too
+                    filtered_chunks.append(chunk)
+                    filtered_metadatas.append(metadata)
+            
+            # If we filtered too much, use original chunks (but log warning)
+            if len(filtered_chunks) < 5 and len(chunks) > 10:
+                print(f"[WARNING] Filtering removed too many chunks ({len(chunks)} -> {len(filtered_chunks)}). Using all chunks.")
+                chunks = chunks
+            elif filtered_chunks:
+                original_count = len(chunks)
+                chunks = filtered_chunks
+                removed_count = original_count - len(chunks)
+                print(f"[INFO] Accounting endpoint: After filtering, using {len(chunks)} chunks with transaction data (removed {removed_count} header/footer chunks)")
+            else:
+                print(f"[WARNING] All chunks were filtered out. Using original chunks.")
+        else:
+            # Fallback to semantic search if no chunks found
+            results = vector_store.workspace_query(
+                query_embedding=query_embedding,
+                company_id=company_id,
+                document_names=doc_names,
+                n_results=100,  # Much higher for accounting
+                **query_filters
+            )
+            chunks = results.get('documents', [[]])[0]
+            print(f"[INFO] Accounting endpoint: Retrieved {len(chunks)} chunks via semantic search (fallback)")
+        
+        if not chunks:
+            raise HTTPException(
+                status_code=400, 
+                detail="No document content found. Please ensure documents are uploaded and processed correctly."
+            )
+        
+        # Log chunk preview for debugging
+        if chunks:
+            total_length = sum(len(chunk) for chunk in chunks)
+            print(f"[INFO] Accounting endpoint: Total context length: {total_length} characters")
+            # Show first chunk that looks like it has transactions
+            for i, chunk in enumerate(chunks[:5]):
+                if any(kw in chunk.upper() for kw in ['UPI', 'NEFT', 'DEBIT', 'CREDIT', 'DATE']):
+                    print(f"[DEBUG] Accounting endpoint: Chunk {i} preview (first 300 chars): {chunk[:300]}...")
+                    break
+            else:
+                print(f"[DEBUG] Accounting endpoint: First chunk preview (200 chars): {chunks[0][:200]}...")
 
         # Step 3: Define Streaming Generator
         async def stream_generator():
             full_response = ""
             # Prepare streaming from AccountingService
             async for token in accounting_service.stream_accounting_synthesis(request.question, chunks):
-                full_response += token
-                # SSE Format: data: <payload>\n\n
-                yield f"data: {json.dumps({'token': token})}\n\n"
+                if isinstance(token, dict):
+                     # Status update (already a dict, just wrap in data)
+                     yield f"data: {json.dumps(token)}\n\n"
+                else:
+                    full_response += token
+                    # SSE Format: data: <payload>\n\n
+                    yield f"data: {json.dumps({'token': token})}\n\n"
             
             # Step 4: After stream finishes, save to history
             try:

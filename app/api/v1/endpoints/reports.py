@@ -15,6 +15,7 @@ async def stream_query_documents(request: QueryRequest, user=Depends(get_current
     """
     try:
         print(f"[INFO] Received STREAM query request: question='{request.question}', company_id={request.company_id}")
+        print(f"[INFO] Filters - file_types: {request.file_types}, folder_ids: {request.folder_ids}, uploaded_by: {request.uploaded_by}, tags: {request.tags}")
         
         # Step 1: Generate Embedding
         query_embedding = embedding_service.generate_embedding(request.question)
@@ -37,9 +38,25 @@ async def stream_query_documents(request: QueryRequest, user=Depends(get_current
         if is_exhaustive:
             total_chunks = count
             print(f"[INFO] Streaming exhaustive extraction for {total_chunks} chunks")
-            results = vector_store.query(query_embedding, company_id=request.company_id, n_results=total_chunks)
+            results = vector_store.query(
+                query_embedding, 
+                company_id=request.company_id, 
+                n_results=total_chunks,
+                file_types=request.file_types,
+                folder_ids=request.folder_ids,
+                uploaded_by=request.uploaded_by,
+                tags=request.tags
+            )
         else:
-            results = vector_store.query(query_embedding, company_id=request.company_id, n_results=10)
+            results = vector_store.query(
+                query_embedding, 
+                company_id=request.company_id, 
+                n_results=10,
+                file_types=request.file_types,
+                folder_ids=request.folder_ids,
+                uploaded_by=request.uploaded_by,
+                tags=request.tags
+            )
         
         documents = results.get('documents', [[]])[0]
         metadatas = results.get('metadatas', [[]])[0]
@@ -59,7 +76,7 @@ async def stream_query_documents(request: QueryRequest, user=Depends(get_current
                         question=request.question,
                         context_chunks=documents,
                         source_documents=source_documents,
-                        batch_size=40 # Reduced for higher precision and completeness
+                        batch_size=20 # Reduced for higher precision and completeness
                     ):
                         yield chunk + "\n"
                 else:
@@ -97,13 +114,14 @@ async def stream_query_documents(request: QueryRequest, user=Depends(get_current
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.post("/query", response_model=QueryResponse)
+@router.post("/query", response_model=QueryResponse)    
 async def query_documents(request: QueryRequest, user=Depends(get_current_user)):
     """
     Query the RAG system and generate an answer.
     """
     try:
         print(f"[INFO] Received query request: question='{request.question}', company_id={request.company_id}")
+        print(f"[INFO] Filters - file_types: {request.file_types}, folder_ids: {request.folder_ids}, uploaded_by: {request.uploaded_by}, tags: {request.tags}")
         
         # Step 1: Generate Embedding
         print(f"[INFO] Step 1: Generating query embedding...")
@@ -132,9 +150,25 @@ async def query_documents(request: QueryRequest, user=Depends(get_current_user))
             # User has paid plan: Retrieve ALL chunks to ensure we don't miss transaction data
             total_chunks = count
             print(f"[INFO] Retrieving ALL {total_chunks} chunks for exhaustive extraction (Paid Plan Enabled)")
-            results = vector_store.query(query_embedding, company_id=request.company_id, n_results=total_chunks)
+            results = vector_store.query(
+                query_embedding, 
+                company_id=request.company_id, 
+                n_results=total_chunks,
+                file_types=request.file_types,
+                folder_ids=request.folder_ids,
+                uploaded_by=request.uploaded_by,
+                tags=request.tags
+            )
         else:
-            results = vector_store.query(query_embedding, company_id=request.company_id, n_results=10)
+            results = vector_store.query(
+                query_embedding, 
+                company_id=request.company_id, 
+                n_results=10,
+                file_types=request.file_types,
+                folder_ids=request.folder_ids,
+                uploaded_by=request.uploaded_by,
+                tags=request.tags
+            )
         
         print(f"[INFO] DONE: Retrieved {len(results.get('documents', [[]])[0])} chunks from vector store.")
         

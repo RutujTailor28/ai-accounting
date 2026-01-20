@@ -256,35 +256,151 @@ class LLMService:
    - Description/narration
    - UPI IDs, reference numbers, or payee names
    - Transaction types (UPI, NEFT, cash, etc.)
+   - **BALANCE VALUES** - These are CRITICAL for determining transaction direction
+
+**PROCESSING WORKFLOW (FOLLOW THIS EXACT ORDER):**
+1. Read through the context line by line
+2. For each transaction line:
+   a. Extract: Date, Description, Amount(s), Balance
+   b. **FIND THE PREVIOUS LINE'S BALANCE** (or opening balance if first transaction)
+   c. **COMPARE**: Current Balance vs Previous Balance
+   d. **DETERMINE DIRECTION**: 
+      - If Current Balance > Previous Balance → **CREDIT**
+      - If Current Balance < Previous Balance → **DEBIT**
+   e. Extract all other fields (transaction_id, type, etc.)
+3. Continue this process for ALL matching transactions
+4. **DO NOT ASSUME** - Always verify direction using balance comparison
 
 3. **COMPLETE EXTRACTION REQUIREMENT:**
    - Extract **EVERY SINGLE RECORD** that matches the user's query from the provided context
    - Include **BOTH CREDIT AND DEBIT** transactions - do NOT filter by direction
+   - **CREDITS ARE EQUALLY IMPORTANT AS DEBITS** - Do NOT favor debits over credits
    - Do NOT summarize, truncate, or limit the number of records
    - Do NOT skip any matching transactions
    - If there are 100 matching records, return all 100
    - If there are 1000 matching records, return all 1000
    - COMPLETENESS is more important than brevity
    
-   **CRITICAL EXTRACTION LOGIC**:
-   - Bank statements usually have THREE numeric columns on every line: **"Withdrawal/Debit"**, **"Deposit/Credit"**, and **"Balance"**.
-   - In plain text, these often appear as three consecutive numbers. 
-   - **Example 1**: "22/11/24 Rent Paid 500.00 0.00 10000.00" -> 500.00 is in the first column (Withdrawal) = **DEBIT**.
-   - **Example 2**: "22/11/24 Salary 0.00 50000.00 60000.00" -> 50000.00 is in the second column (Deposit) = **CREDIT**.
-   - **Example 3**: "22/11/24 UPI-RECEIVED 100.00 10100.00" -> If only two numbers are present, check the balance delta. If the balance increased, it's a **CREDIT**.
-   - **Example 4**: "200.00 UPI-PAID" -> If only one number is present, it's almost always a **DEBIT** for UPI payments, but check the preceding balance to be sure.
+   **🚨 CRITICAL: CREDIT TRANSACTION IDENTIFICATION (HIGHEST PRIORITY) 🚨**
    
-   - **MANDATORY RULES**:
-     1. You MUST scan BOTH columns on every line.
-     2. If an amount is in the **Deposit/Credit** column (often the 2nd amount column) → **direction = "CREDIT"** (Money Incoming).
-     3. If an amount is in the **Withdrawal/Debit** column (often the 1st amount column) → **direction = "DEBIT"** (Money Outgoing).
-     4. **DO NOT IGNORE 0.00 VALUES.** They are markers for the OTHER column. If you see "0.00 500.00", the 500.00 is a CREDIT.
-     5. Look for keywords like "Deposit", "CR", "Credit", "Interest", "Amount Received", "Inward", "Received from", "Refund" to identify credits.
-     6. Look for keywords like "Withdrawal", "DR", "Debit", "Amount Paid", "Outward", "Payment to", "Transfer to" to identify debits.
-     7. **VERIFY WITH BALANCE (REQUIRED)**: If the record includes a "Balance" or "Closing Balance" column, verify if the amount made the balance go UP (Credit) or DOWN (Debit).
-     8. **SMOOSHED NUMBERS**: If numbers appear jammed together like "100.005000.00", split them: the first is the Amount, the second is the Balance.
-     9. **INVISIBLE CREDITS**: If only ONE amount is present but the word "Received", "Credit", "Interest", or "CR" appears, OR if the balance increases from the previous line, it is a **CREDIT**.
-     10. **DO NOT SKIP** any transaction because it is a credit. The user wants **ALL** records matching their query.
+   **CREDITS ARE MONEY COMING IN - THEY MUST BE EXTRACTED AND VISIBLE:**
+   - **CREDIT = Money INCOMING** (Deposits, Receipts, Salary, Interest, Refunds, Dividends, Transfers Received, etc.)
+   - **DEBIT = Money OUTGOING** (Withdrawals, Payments, Expenses, Transfers Sent, etc.)
+   
+   **BANK STATEMENT COLUMN STRUCTURE:**
+   - Bank statements typically have THREE numeric columns: **[Withdrawal/Debit] [Deposit/Credit] [Balance]**
+   - In plain text, these appear as three consecutive numbers separated by spaces
+   - **THE SECOND NUMBER IS ALMOST ALWAYS THE CREDIT COLUMN**
+   
+   **CREDIT IDENTIFICATION RULES (MANDATORY - FOLLOW THIS EXACT ORDER):**
+   
+   **STEP 1: BALANCE COMPARISON (PRIMARY & MANDATORY METHOD - USE THIS FIRST):**
+   - **FOR EVERY TRANSACTION, YOU MUST:**
+     1. Identify the balance value on the current line
+     2. Find the balance from the PREVIOUS transaction line
+     3. Compare: Current Balance vs Previous Balance
+     4. If Current Balance > Previous Balance → **CREDIT** (balance increased = money came in)
+     5. If Current Balance < Previous Balance → **DEBIT** (balance decreased = money went out)
+   
+   - **Examples:**
+     - Previous line balance: 19,773.73
+     - Current line: "22/11/24 UPI-SANJAY 350.00 20,123.73"
+     - Current balance: 20,123.73
+     - Comparison: 20,123.73 > 19,773.73 → Balance INCREASED → **CREDIT**
+     
+     - Previous line balance: 20,123.73
+     - Current line: "22/11/24 UPI-PAYMENT 500.00 19,623.73"
+     - Current balance: 19,623.73
+     - Comparison: 19,623.73 < 20,123.73 → Balance DECREASED → **DEBIT**
+   
+   - **CRITICAL**: This method works for ALL bank statement formats, even when columns are unclear
+   - **CRITICAL**: If you cannot find a previous balance, look for the opening balance or use the first transaction's balance as reference
+   
+   **STEP 2: COLUMN POSITION CHECK (SECONDARY METHOD - USE IF BALANCE COMPARISON IS UNCLEAR):**
+      - If you see: "Date Description 0.00 500.00 Balance" → The 500.00 is in the 2nd column = **CREDIT**
+      - If you see: "Date Description 500.00 0.00 Balance" → The 500.00 is in the 1st column = **DEBIT**
+      - **ALWAYS check BOTH columns - never assume the first number is the only transaction**
+   
+   **STEP 3: KEYWORD DETECTION (TERTIARY METHOD - USE AS CONFIRMATION):**
+      - **CREDIT keywords**: "Deposit", "CR", "Credit", "Interest", "Received", "Refund", "Salary", "Inward", "Credit to", "Received from", "UPI-RECEIVED", "NEFT-CREDIT", "IMPS-CREDIT", "RTGS-CREDIT", "Dividend", "Bonus", "Reversal", "Reversal of", "Refund of"
+      - **DEBIT keywords**: "Withdrawal", "DR", "Debit", "Payment", "Paid", "Outward", "Payment to", "Transfer to", "UPI-PAID", "NEFT-DEBIT", "IMPS-DEBIT", "RTGS-DEBIT"
+      - If description contains CREDIT keywords → **direction = "CREDIT"**
+      - If description contains DEBIT keywords → **direction = "DEBIT"**
+   
+   **STEP 4: ZERO VALUE MARKERS**:
+      - **DO NOT IGNORE 0.00 VALUES** - They indicate which column has the actual transaction
+      - Pattern: "0.00 500.00" → 500.00 is a **CREDIT** (first column is 0, second has value)
+      - Pattern: "500.00 0.00" → 500.00 is a **DEBIT** (first column has value, second is 0)
+   
+   **STEP 5: SINGLE AMOUNT DETECTION**:
+      - If only ONE amount appears on a line (format: "Date Description Amount Balance"):
+        - **FIRST**: Compare balance with previous line → If increased = **CREDIT**, if decreased = **DEBIT**
+        - **THEN**: Check for CREDIT keywords in description → "Received", "Credit", "Interest", "CR" → **CREDIT**
+        - **THEN**: Check for DEBIT keywords → "Paid", "Payment", "Debit", "DR" → **DEBIT**
+        - **DEFAULT**: If balance increased, it's a **CREDIT** (this is the most reliable indicator)
+   
+   **STEP 6: SMOOSHED NUMBERS**:
+      - If numbers appear together like "100.005000.00", split them
+      - First number = Transaction amount
+      - Second number = Balance
+      - Compare with previous balance to determine direction
+   
+   **CREDIT EXTRACTION EXAMPLES (REAL BANK STATEMENT FORMATS):**
+   
+   **Example 1 - Two Number Format (Amount + Balance):**
+   - Previous balance: 19,773.73
+   - Line: "22/11/24 UPI-SANJAY SINGH-PAYTMQR1LJPTAZGXV@PAYTM 350.00 20,123.73"
+   - Current balance: 20,123.73
+   - Comparison: 20,123.73 > 19,773.73 → Balance INCREASED → **CREDIT** ✅
+   
+   **Example 2 - Three Number Format (Debit + Credit + Balance):**
+   - Line: "22/11/24 Salary Credit 0.00 50000.00 60000.00"
+   - Previous balance: 10,000.00
+   - Current balance: 60,000.00
+   - Comparison: 60,000.00 > 10,000.00 → Balance INCREASED → **CREDIT** ✅
+   - Also: 50,000.00 is in 2nd column (Credit column) → Confirms **CREDIT** ✅
+   
+   **Example 3 - Single Amount with Balance:**
+   - Previous balance: 10,000.00
+   - Line: "22/11/24 UPI-RECEIVED from John 1000.00 11000.00"
+   - Current balance: 11,000.00
+   - Comparison: 11,000.00 > 10,000.00 → Balance INCREASED → **CREDIT** ✅
+   - Also: Keyword "RECEIVED" → Confirms **CREDIT** ✅
+   
+   **Example 4 - Interest Payment:**
+   - Previous balance: 10,000.00
+   - Line: "22/11/24 Interest 500.00 10500.00"
+   - Current balance: 10,500.00
+   - Comparison: 10,500.00 > 10,000.00 → Balance INCREASED → **CREDIT** ✅
+   
+   **Example 5 - Refund:**
+   - Previous balance: 10,000.00
+   - Line: "22/11/24 Refund 0.00 2000.00 12000.00"
+   - Current balance: 12,000.00
+   - Comparison: 12,000.00 > 10,000.00 → Balance INCREASED → **CREDIT** ✅
+   - Also: 2,000.00 is in 2nd column (Credit column) → Confirms **CREDIT** ✅
+   
+   **MANDATORY VALIDATION FOR EVERY TRANSACTION:**
+   - **BEFORE marking direction, you MUST:**
+     1. ✅ Find the balance on the current line
+     2. ✅ Find the balance from the previous transaction line (or opening balance)
+     3. ✅ Compare: Current Balance vs Previous Balance
+     4. ✅ If Current > Previous → Mark as **CREDIT**
+     5. ✅ If Current < Previous → Mark as **DEBIT**
+     6. ✅ If Current = Previous → Check for other indicators (rare case)
+   
+   - **AFTER extracting each transaction, verify:**
+     1. Did I compare the balance with the previous line? (REQUIRED)
+     2. Did I check BOTH amount columns if present?
+     3. Did I look for CREDIT/DEBIT keywords as confirmation?
+     4. If balance increased, did I mark it as "CREDIT"? (DO NOT mark as DEBIT if balance increased!)
+   
+   - **CRITICAL RULES:**
+     - **DO NOT SKIP CREDITS** - They are just as important as debits
+     - **BALANCE INCREASE = CREDIT** - This is the most reliable indicator
+     - **If balance increased, it CANNOT be a DEBIT** - Always mark as CREDIT
+     - **If you're unsure, default to balance comparison - if balance increased, it's a CREDIT**
+     - **Track balance sequentially** - Process transactions line by line, maintaining balance state
 
 4. **Output Format:** Return results as a STRICT valid JSON object with this structure:
    {{
@@ -301,17 +417,31 @@ class LLMService:
        }}
      ]
    }}
+   
+   **DIRECTION DETERMINATION (MANDATORY FOR EVERY TRANSACTION):**
+   - Before setting "direction", you MUST:
+     1. Identify the balance on the current transaction line
+     2. Identify the balance from the previous transaction line
+     3. Compare them:
+        - If current balance > previous balance → "direction": "CREDIT"
+        - If current balance < previous balance → "direction": "DEBIT"
+     4. If you cannot find previous balance, look for opening balance or use column position/keywords
+   
    - **CRITICAL**: If you found NO records in this specific context block, return an empty list: {{"transactions": []}}.
    - **CRITICAL**: Do NOT list "0.00" as the transaction amount. Use the actual numeric value from the other column.
+   - **CRITICAL**: Do NOT default all transactions to "DEBIT". Many transactions are CREDITS - use balance comparison to determine.
 
 5. **No Data Found:** If no matching records are found in the context, return: {{ "transactions": [], "message": "No matching records found in this context." }}
 
 **Response Guidelines:**
 - Extract EVERY SINGLE piece of valid data that matches the user's request - NO EXCEPTIONS
 - Return the COMPLETE dataset - do NOT summarize or provide a sample
+- **CREDIT TRANSACTIONS ARE MANDATORY**: Ensure you extract ALL credit transactions. If you see deposits, receipts, salary, interest, refunds, or any money coming IN, they MUST be included with `"direction": "CREDIT"`
 - **ZERO AMOUNT RULE**: If you extract a record with `amount: 0.0` or `0.00`, you have FAILED. Look at the numbers on that same line again. One of them is non-zero. Use THAT one.
+- **BALANCE-BASED VALIDATION**: Before finalizing each transaction, verify the direction by checking if the balance increased (CREDIT) or decreased (DEBIT)
 - **BANK NAME CONSISTENCY**: Do NOT change the `bank_name` based on the payee or UPI ID (like @oksbi). Use the bank name of the statement owner.
 - Keep descriptions complete including any reference numbers found at the end of the line.
+- **FINAL CHECK**: Before returning results, count how many CREDIT vs DEBIT transactions you found. If you found significantly more DEBITS than CREDITS, you may have missed some credit transactions. Re-check the data.
 
 **RESPONSE (JSON ONLY):**
 """
@@ -331,9 +461,18 @@ class LLMService:
             # Use robust JSON extraction
             parsed_json = self._extract_json(answer)
             
-            # Log transaction count
+            # Log transaction count and validate credit/debit distribution
             tx_count = len(parsed_json.get('transactions', []))
-            print(f"[INFO] Extracted {tx_count} transactions from this batch")
+            transactions = parsed_json.get('transactions', [])
+            credit_count = sum(1 for tx in transactions if str(tx.get('direction', '')).upper() == 'CREDIT')
+            debit_count = sum(1 for tx in transactions if str(tx.get('direction', '')).upper() == 'DEBIT')
+            print(f"[INFO] Extracted {tx_count} transactions from this batch: {credit_count} CREDITS, {debit_count} DEBITS")
+            
+            # Warn if no credits found but transactions exist (might indicate extraction issue)
+            if tx_count > 0 and credit_count == 0:
+                print(f"[WARNING] No CREDIT transactions found in batch with {tx_count} transactions. This may indicate credit identification issues.")
+            elif tx_count > 5 and credit_count == 0:
+                print(f"[WARNING] Large batch ({tx_count} transactions) with zero credits. Please verify credit extraction logic.")
             
             # Normalize key to 'transactions' if 'data' is present
             if "data" in parsed_json and "transactions" not in parsed_json:
@@ -356,7 +495,7 @@ class LLMService:
         question: str,
         context_chunks: List[str],
         source_documents: List[str],
-        batch_size: int = 40
+        batch_size: int = 20
     ) -> Dict[str, Any]:
         """
         Iteratively extract information from batches of chunks.
@@ -394,14 +533,11 @@ class LLMService:
 
         full_answer = ""
         all_transactions = []
-        all_sources = set()
         seen_fingerprints = set()
 
         import json
         for result in results:
             full_answer += result['answer'] + "\n---\n"
-            if result.get('sources'):
-                all_sources.update(result['sources'])
 
             try:
                 content = json.loads(result['answer'])
@@ -420,11 +556,23 @@ class LLMService:
                 if txs:
                     for t in txs:
                         # Create a fingerprint to avoid duplicates
+                        # Include direction to prevent credits and debits from being considered duplicates
                         desc = str(t.get('description', '')).strip().lower()
-                        amt = str(t.get('amount', '0')).replace(',', '')
+                        amt = str(t.get('amount', '0')).replace(',', '').replace('.', '')  # Normalize amount
                         date = str(t.get('date', ''))
-                        # Use full description for granularity to avoid missing similar legitimate transactions
-                        fp = f"{date}|{amt}|{desc}"
+                        direction = str(t.get('direction', '')).upper()
+                        tx_id = str(t.get('transaction_id', '')).strip()
+                        source_doc = str(t.get('source_document', '')).strip()
+                        bank_name = str(t.get('bank_name', '')).strip()
+                        
+                        # Use transaction_id if available for better uniqueness
+                        if tx_id:
+                            fp = f"{date}|{amt}|{direction}|{tx_id}"
+                        else:
+                            # Include direction, source_document, and bank_name to distinguish similar transactions
+                            # Use first 100 chars of description to handle very long descriptions
+                            desc_short = desc[:100] if len(desc) > 100 else desc
+                            fp = f"{date}|{amt}|{direction}|{desc_short}|{source_doc}|{bank_name}"
                         
                         if fp not in seen_fingerprints:
                             seen_fingerprints.add(fp)
@@ -433,7 +581,31 @@ class LLMService:
             except Exception as e:
                 print(f"[DEBUG] Error merging batch result: {str(e)}")
 
-        print(f"[INFO] Exhaustive extraction complete: {len(all_transactions)} total unique records")
+        # Extract source documents ONLY from transactions that made it into final results
+        all_sources = set()
+        for tx in all_transactions:
+            source_doc = str(tx.get('source_document', '')).strip()
+            if source_doc and source_doc.lower() != 'unknown':
+                all_sources.add(source_doc)
+
+        # Validate credit/debit distribution
+        credit_count = sum(1 for tx in all_transactions if str(tx.get('direction', '')).upper() == 'CREDIT')
+        debit_count = sum(1 for tx in all_transactions if str(tx.get('direction', '')).upper() == 'DEBIT')
+        print(f"[INFO] Exhaustive extraction complete: {len(all_transactions)} total unique records ({credit_count} CREDITS, {debit_count} DEBITS)")
+        print(f"[INFO] Source documents with transactions: {len(all_sources)} documents")
+        
+        # Calculate total before deduplication for comparison
+        total_before_dedup = sum(len(json.loads(r['answer']).get('transactions', [])) for r in results)
+        print(f"[INFO] Total transactions before deduplication: {total_before_dedup}, after: {len(all_transactions)}")
+        
+        # Warn if credits seem missing
+        if len(all_transactions) > 10 and credit_count == 0:
+            print(f"[WARNING] Large dataset ({len(all_transactions)} transactions) with zero credits. This may indicate credit extraction issues.")
+        elif len(all_transactions) > 0 and credit_count == 0:
+            print(f"[WARNING] No CREDIT transactions found in final results. Please verify credit identification logic.")
+        elif credit_count > 0:
+            credit_percentage = (credit_count / len(all_transactions)) * 100
+            print(f"[INFO] Credit transactions: {credit_count} ({credit_percentage:.1f}% of total)")
 
         return {
             "answer": json.dumps({"transactions": all_transactions}),
@@ -445,7 +617,7 @@ class LLMService:
         question: str,
         context_chunks: List[str],
         source_documents: List[str],
-        batch_size: int = 40
+        batch_size: int = 20
     ):
         """
         Stream extraction results as they are processed.
@@ -476,8 +648,11 @@ class LLMService:
 
         completed_count = 0
         all_transactions_count = 0
+        all_credit_count = 0
+        all_debit_count = 0
         all_sources = set()
         seen_fingerprints = set() # For streaming de-duplication
+        all_unique_transactions = []  # Store all unique transactions to extract sources at end
 
         for future in asyncio.as_completed(tasks):
             try:
@@ -511,19 +686,42 @@ class LLMService:
                         unique_txs = []
                         for t in txs:
                             # Create a fingerprint to avoid duplicates
+                            # Include direction to prevent credits and debits from being considered duplicates
                             desc = str(t.get('description', '')).strip().lower()
-                            amt = str(t.get('amount', '0')).replace(',', '')
+                            amt = str(t.get('amount', '0')).replace(',', '').replace('.', '')  # Normalize amount
                             date = str(t.get('date', ''))
-                            # Use full description for higher granularity
-                            fp = f"{date}|{amt}|{desc}"
+                            direction = str(t.get('direction', '')).upper()
+                            tx_id = str(t.get('transaction_id', '')).strip()
+                            source_doc = str(t.get('source_document', '')).strip()
+                            bank_name = str(t.get('bank_name', '')).strip()
+                            
+                            # Use transaction_id if available for better uniqueness
+                            if tx_id:
+                                fp = f"{date}|{amt}|{direction}|{tx_id}"
+                            else:
+                                # Include direction, source_document, and bank_name to distinguish similar transactions
+                                # Use first 100 chars of description to handle very long descriptions
+                                desc_short = desc[:100] if len(desc) > 100 else desc
+                                fp = f"{date}|{amt}|{direction}|{desc_short}|{source_doc}|{bank_name}"
                             
                             if fp not in seen_fingerprints:
                                 seen_fingerprints.add(fp)
                                 unique_txs.append(t)
+                                all_unique_transactions.append(t)  # Store for source extraction
+                            else:
+                                # Log when a transaction is being skipped as duplicate
+                                skipped_direction = str(t.get('direction', '')).upper()
+                                if skipped_direction == 'CREDIT':
+                                    print(f"[DEBUG] Skipping duplicate CREDIT transaction: {date}|{amt}|{desc[:50]}")
 
                         if unique_txs:
                             count = len(unique_txs)
-                            print(f"[DEBUG] Stream batch {completed_count}: Found {count} unique items")
+                            batch_credits = sum(1 for tx in unique_txs if str(tx.get('direction', '')).upper() == 'CREDIT')
+                            batch_debits = sum(1 for tx in unique_txs if str(tx.get('direction', '')).upper() == 'DEBIT')
+                            all_credit_count += batch_credits
+                            all_debit_count += batch_debits
+                            print(f"[DEBUG] Stream batch {completed_count}: Found {count} unique items ({batch_credits} CREDITS, {batch_debits} DEBITS)")
+                            print(f"[DEBUG] Stream batch {completed_count}: Yielding {count} transactions to frontend (cumulative: {all_credit_count} CREDITS, {all_debit_count} DEBITS)")
                             all_transactions_count += count
                             yield json.dumps({
                                 "type": "data",
@@ -531,9 +729,6 @@ class LLMService:
                             })
                     else:
                         print(f"[DEBUG] Stream batch {completed_count}: No new transactions found")
-
-                    if result.get('sources'):
-                        all_sources.update(result['sources'])
                         
                 except Exception as e:
                     print(f"[WARNING] Failed to parse batch result in stream: {e}")
@@ -542,9 +737,24 @@ class LLMService:
                 print(f"[ERROR] Stream batch failed: {e}")
                 yield json.dumps({"type": "error", "message": str(e)})
 
-        # Final summary
+        # Extract source documents ONLY from transactions that made it into final results
+        for tx in all_unique_transactions:
+            source_doc = str(tx.get('source_document', '')).strip()
+            if source_doc and source_doc.lower() != 'unknown':
+                all_sources.add(source_doc)
+
+        # Final summary with credit/debit breakdown
+        print(f"[INFO] Streaming extraction complete: {all_transactions_count} total ({all_credit_count} CREDITS, {all_debit_count} DEBITS)")
+        print(f"[INFO] Source documents with transactions: {len(all_sources)} documents")
+        if all_transactions_count > 10 and all_credit_count == 0:
+            print(f"[WARNING] Large dataset ({all_transactions_count} transactions) with zero credits. This may indicate credit extraction issues.")
+        elif all_credit_count > 0:
+            credit_percentage = (all_credit_count / all_transactions_count) * 100 if all_transactions_count > 0 else 0
+            print(f"[INFO] Credit transactions: {all_credit_count} ({credit_percentage:.1f}% of total)")
         yield json.dumps({
             "type": "summary",
             "total_transactions": all_transactions_count,
+            "total_credits": all_credit_count,
+            "total_debits": all_debit_count,
             "sources": list(all_sources)
         })
