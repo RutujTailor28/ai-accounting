@@ -26,6 +26,7 @@ class ChatMessageResponse(CamelModel):
     content: str
     data: Optional[Any] = None
     sources: Optional[List[str]] = Field(default_factory=list)
+    rating: Optional[int] = None
     created_at: datetime
 
     class Config:
@@ -37,3 +38,9 @@ class ChatHistoryItem(CamelModel):
     session_title: Optional[str] = None
     last_message_at: datetime
     workspace_id: UUID
+
+
+class ChatFeedbackCreate(CamelModel):
+    message_id: UUID
+    rating: int = Field(..., ge=1, le=5)
+    feedback_text: Optional[str] = None

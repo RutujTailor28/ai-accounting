@@ -24,14 +24,14 @@ class VectorStore:
         # If collection exists and has data, check if dimension matches
         try:
             sample = self.collection.get(limit=1, include=["embeddings"])
-            if sample and sample["embeddings"] and len(sample["embeddings"]) > 0:
-                existing_dim = len(sample["embeddings"][0])
-                print(f"[DEBUG] Collection dimension check: {existing_dim}")
-                # We don't know the exact target dim here since it's lazy-loaded, 
-                # but we can rely on Chroma to error out on the FIRST add.
-                # However, a better way is to handle the InvalidArgumentError in add_documents.
+            # Fix: avoid 'The truth value of an array is ambiguous' by checking None explicitly
+            if sample is not None and sample.get("embeddings") is not None:
+                embs = sample["embeddings"]
+                if len(embs) > 0:
+                    existing_dim = len(embs[0])
+                    print(f"[DEBUG] Collection dimension check: {existing_dim}")
         except Exception as e:
-            print(f"[DEBUG] Dimension check failed (likely empty collection): {e}")
+            print(f"[DEBUG] Dimension check skip: {e}")
 
         print(f"[INFO] VectorStore initialized with persist_directory={settings.chroma_persist_directory}")
     
@@ -102,9 +102,12 @@ class VectorStore:
         if not (len(texts) == len(embeddings) == len(metadatas)):
             raise ValueError("texts, embeddings, and metadatas must have the same length")
         
-        # Generate unique IDs for each chunk
-        ids = [f"{metadatas[i]['company_id']}_{metadatas[i]['document_name']}_{i}" 
-               for i in range(len(texts))]
+        # Generate unique IDs for each chunk using the chunk_index if provided in metadata
+        ids = []
+        for i in range(len(texts)):
+            # Use global chunk_index if available in metadata, fallback to index within batch
+            chunk_idx = metadatas[i].get('chunk_index', i)
+            ids.append(f"{metadatas[i]['company_id']}_{metadatas[i]['document_name']}_{chunk_idx}")
         
         try:
             self.collection.add(
@@ -201,7 +204,12 @@ class VectorStore:
         """
         try:
             if company_id:
-                results = self.collection.get(where={"company_id": company_id}, include=[])
+                # Use a high limit to get actual count, or count() if no filter
+                results = self.collection.get(
+                    where={"company_id": company_id}, 
+                    include=[], 
+                    limit=10000 # Increased from default 100
+                )
                 count = len(results['ids'])
             else:
                 count = self.collection.count()
@@ -239,15 +247,23 @@ class VectorStore:
 
     def reset_collection(self) -> bool:
         """
-        Completely clear (reset) the vector store collection.
-        This deletes all data while keeping the collection object valid.
+        Completely delete and recreate the vector store collection.
+        This is necessary to handle embedding dimension changes.
         """
         try:
-            print(f"[WARNING] RESETTING VECTOR STORE COLLECTION")
-            # Clear all documents. Chroma allows deleting by a field that is present.
-            # We use a filter that matches all documents by checking if company_id exists.
-            self.collection.delete(where={"company_id": {"$ne": "____EMPTY_RESET_FILTER____"}})
-            print(f"[INFO] DONE: Vector store collection cleared.")
+            print(f"[WARNING] RESETTING VECTOR STORE COLLECTION (DELETE & RECREATE)")
+            # Delete the actual collection from DB
+            try:
+                self.client.delete_collection(name="accounting_documents")
+            except Exception as inner_e:
+                print(f"[DEBUG] Collection deletion error (may not exist): {inner_e}")
+            
+            # Recreate it
+            self.collection = self.client.get_or_create_collection(
+                name="accounting_documents",
+                metadata={"description": "RAG system for accounting documents"}
+            )
+            print(f"[INFO] DONE: Vector store collection recreated.")
             return True
         except Exception as e:
             print(f"[ERROR] Error resetting vector store: {str(e)}")

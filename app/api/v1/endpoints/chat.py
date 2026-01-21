@@ -2,9 +2,9 @@ from fastapi import APIRouter, HTTPException, Depends
 from typing import List, Dict, Any
 from uuid import UUID
 import json
-from app.schemas.chat import ChatQueryRequest, ChatMessageResponse, ChatHistoryItem
+from app.schemas.chat import ChatQueryRequest, ChatMessageResponse, ChatHistoryItem, ChatFeedbackCreate
 from app.api.deps import get_current_user
-from app.core.supabase import supabase
+from app.core.supabase import supabase, supabase_admin
 from app.services.embedding_service import EmbeddingService
 from app.ai.rag.retriever import vector_store
 from app.services.ai_service import LLMService
@@ -176,13 +176,20 @@ async def get_chat_thread(session_id: UUID, user=Depends(get_current_user)):
     """Fetch the full thread of messages for a session."""
     try:
         result = supabase.table("chat_messages") \
-            .select("*") \
+            .select("*, message_feedback(rating)") \
             .eq("session_id", str(session_id)) \
             .is_("deleted_at", "null") \
             .order("created_at", desc=False) \
             .execute()
         
-        return result.data
+        # Flatten the message_feedback array to a single rating value
+        messages = []
+        for msg in result.data:
+            feedback = msg.get("message_feedback", [])
+            msg["rating"] = feedback[0]["rating"] if feedback else None
+            messages.append(msg)
+            
+        return messages
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -202,4 +209,23 @@ async def delete_chat_session(session_id: UUID, user=Depends(get_current_user)):
         return {"message": "Chat session soft-deleted successfully"}
     except Exception as e:
         print(f"[ERROR] Error deleting chat session: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/feedback")
+async def submit_feedback(request: ChatFeedbackCreate, user=Depends(get_current_user)):
+    """
+    Store user feedback/rating for a specific message.
+    """
+    try:
+        feedback_data = {
+            "message_id": str(request.message_id),
+            "rating": request.rating,
+            "feedback_text": request.feedback_text,
+            "created_by": user.id
+        }
+        
+        supabase_admin.table("message_feedback").insert(feedback_data).execute()
+        return {"message": "Feedback submitted successfully"}
+    except Exception as e:
+        print(f"[ERROR] Feedback Submission Error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))

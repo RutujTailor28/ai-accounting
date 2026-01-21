@@ -3,9 +3,10 @@ from fastapi.responses import StreamingResponse
 from typing import List
 from uuid import UUID
 import json
+import re
 from app.schemas.chat import ChatQueryRequest, ChatMessageResponse
 from app.api.deps import get_current_user
-from app.core.supabase import supabase
+from app.core.supabase import supabase, supabase_admin
 from app.services.deps import embedding_service
 from app.ai.rag.retriever import vector_store
 from app.services.accounting_service import AccountingService
@@ -29,7 +30,7 @@ async def accounting_query(request: ChatQueryRequest, user=Depends(get_current_u
         ws_res = supabase.table("workspaces").select("*").eq("id", str(request.workspace_id)).single().execute()
         if not ws_res.data:
             raise HTTPException(status_code=404, detail="Workspace not found")
-        
+            
         file_ids = ws_res.data.get("file_ids", [])
         folder_ids = ws_res.data.get("folder_ids", [])
 
@@ -63,14 +64,15 @@ async def accounting_query(request: ChatQueryRequest, user=Depends(get_current_u
 
         # For accounting, we need to get ALL chunks from the documents, not just semantically similar ones
         # First get count to retrieve all available chunks
-        import re
+        
         count_result = vector_store.collection.get(
             where=vector_store._build_where_filter(
                 company_id=company_id,
                 document_names=doc_names,
                 **query_filters
             ),
-            include=[]
+            include=[],
+            limit=10000  # Explicitly set high limit to get actual count
         )
         total_available = len(count_result['ids'])
         print(f"[INFO] Accounting endpoint: Total available chunks for documents: {total_available}")
@@ -85,7 +87,8 @@ async def accounting_query(request: ChatQueryRequest, user=Depends(get_current_u
                     document_names=doc_names,
                     **query_filters
                 ),
-                include=['documents', 'metadatas']
+                include=['documents', 'metadatas'],
+                limit=10000  # Explicitly set high limit for accounting synthesis
             )
             chunks = all_results.get('documents', [])
             metadatas = all_results.get('metadatas', [])
@@ -175,7 +178,7 @@ async def accounting_query(request: ChatQueryRequest, user=Depends(get_current_u
         async def stream_generator():
             full_response = ""
             # Prepare streaming from AccountingService
-            async for token in accounting_service.stream_accounting_synthesis(request.question, chunks):
+            async for token in accounting_service.stream_accounting_synthesis(request.question, chunks, metadatas):
                 if isinstance(token, dict):
                      # Status update (already a dict, just wrap in data)
                      yield f"data: {json.dumps(token)}\n\n"
@@ -204,7 +207,7 @@ async def accounting_query(request: ChatQueryRequest, user=Depends(get_current_u
                 if session_title:
                     user_msg_data["session_title"] = session_title
                 
-                supabase.table("chat_messages").insert(user_msg_data).execute()
+                supabase_admin.table("chat_messages").insert(user_msg_data).execute()
 
                 # Save AI Synthesis
                 msg_data = {
@@ -218,9 +221,13 @@ async def accounting_query(request: ChatQueryRequest, user=Depends(get_current_u
                 if session_title:
                     msg_data["session_title"] = session_title
                 
-                supabase.table("chat_messages").insert(msg_data).execute()
+                saved_msg = supabase_admin.table("chat_messages").insert(msg_data).execute()
+                final_msg_id = saved_msg.data[0]['id'] if saved_msg.data else None
                 
-                # Signal end of stream
+                # Signal end of stream with actual message ID for feedback system
+                if final_msg_id:
+                    yield f"data: {json.dumps({'message_id': final_msg_id})}\n\n"
+                
                 yield "data: [DONE]\n\n"
             except Exception as e:
                 print(f"[ERROR] Failed to save synthesis history: {str(e)}")
