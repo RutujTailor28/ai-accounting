@@ -1,6 +1,7 @@
 from typing import List, Dict, Any, AsyncGenerator, Union
 import json
 import asyncio
+import hashlib
 from langchain_openai import ChatOpenAI
 from app.core.config import settings
 from app.services.ai_service import LLMService
@@ -20,14 +21,48 @@ class AccountingService:
         )
         self.ai_service = LLMService() # Reuse AI service for extraction helpers
         self.shared_accounts = set() # Track account names across batches for consistency
+        self.extraction_cache: Dict[str, List[Dict]] = {} # Cache: content_hash -> extracted transactions
         print(f"[INFO] AccountingService initialized with model={model}")
+    
+    async def _get_base_doc_name(self, filename: str) -> str:
+        """Strip extension and then duplicates like (1) or copy."""
+        import re
+        if not filename:
+             return ""
+        # Remove extension FIRST
+        base = re.sub(r'\.\w+$', '', filename)
+        # THEN remove common "duplicate" suffixes
+        base = re.sub(r'\s*\(\d+\)$', '', base, flags=re.IGNORECASE)
+        base = re.sub(r'\s+copy$', '', base, flags=re.IGNORECASE)
+        return base.strip().lower()
+
+    async def _normalize_narration(self, narration: str) -> str:
+        """
+        Normalize narration for robust deduplication.
+        Strips whitespace, special characters, and lowercases the text.
+        """
+        import re
+        if not narration:
+            return ""
+        # Remove special characters and extra whitespace, then lowercase
+        normalized = re.sub(r'[^a-zA-Z0-9]', '', narration).lower()
+        return normalized
 
     async def _extract_transactions_from_batch(self, batch_chunks: List[str]) -> List[Dict]:
         """
         Extract structured transaction data from a small batch of chunks.
+        Uses content-based caching to ensure identical chunks produce identical results.
         """
-        # Injection of already seen accounts to prevent duplicates
+        # Create a deterministic hash of the batch content for caching
         context = "\n".join(batch_chunks)
+        content_hash = hashlib.sha256(context.encode('utf-8')).hexdigest()
+        
+        # Check cache first
+        if content_hash in self.extraction_cache:
+            print(f"[CACHE HIT] Reusing cached extraction for batch (hash: {content_hash[:8]}...)")
+            return self.extraction_cache[content_hash]
+        
+        # Injection of already seen accounts to prevent duplicates
         known_accounts_str = ", ".join(list(self.shared_accounts)[:50]) if self.shared_accounts else "None yet"
         
         prompt = f"""
@@ -41,13 +76,15 @@ class AccountingService:
         
         INSTRUCTIONS:
         1. Extract EVERY transaction found.
-        2. **DOUBLE ENTRY PRINCIPLE**: Every transaction must have at least TWO entries (Debit & Credit).
+        2. **LITERAL NARRATION**: Preserve the original narration EXACTLY as it appears in the text. Do not truncate, summarize, or modify the narration.
+        3. **DETERMINISTIC DATES**: Extract dates in DD/MM/YYYY format.
+        4. **DOUBLE ENTRY PRINCIPLE**: Every transaction must have at least TWO entries (Debit & Credit).
            - **Bank Account**: One side is ALWAYS "Bank Account".
              - If statement says DEBIT (Money Out) -> Books: Credit "Bank Account" and Debit an **EXPENSE** or **ASSET** account. (NEVER Debit "Sales" for Money Out unless it is a refund).
              - If statement says CREDIT (Money In) -> Books: Debit "Bank Account" and Credit an **INCOME** or **LIABILITY** account.
            - **Counter Account**: Classify the other side based on narration. 
              - *Examples:* "Fuel Expense", "Office Rent", "Sales Income", "Capital", "Loan from Bank".
-        3. **CLASSIFICATION RULE (Ind AS)**:
+        5. **CLASSIFICATION RULE (Ind AS)**:
            - **Current**: Expected to be settled/realized within 12 months.
            - **Non-Current**: Held for long-term use (> 12 months).
         
@@ -82,7 +119,13 @@ class AccountingService:
             # We use non-streaming call here for simpler parsing
             response = await self.llm.ainvoke(prompt)
             data = self.ai_service._extract_json(response.content)
-            return data.get("transactions", [])
+            transactions = data.get("transactions", [])
+            
+            # Cache the result for future use
+            self.extraction_cache[content_hash] = transactions
+            print(f"[CACHE STORE] Cached {len(transactions)} transactions for batch (hash: {content_hash[:8]}...)")
+            
+            return transactions
         except Exception as e:
             print(f"[WARNING] Batch extraction failed: {e}")
             return []
@@ -117,7 +160,7 @@ class AccountingService:
         # PHASE 1: BATCH EXTRACTION (Map Step)
         # ---------------------------------------------------------
         total_chunks = len(context_chunks)
-        BATCH_SIZE = 35 # Increased for faster processing of large documents.
+        BATCH_SIZE = 50 # Increased for faster processing of large documents.
         
         all_transactions = []
         
@@ -140,24 +183,36 @@ class AccountingService:
                 
                 # Tag transactions with source metadata for robust deduplication
                 if transactions and batch_metas:
-                    source_ids = [m.get('chunk_index') for m in batch_metas if m.get('chunk_index') is not None]
+                    source_indices = [m.get('chunk_index') for m in batch_metas if m.get('chunk_index') is not None]
+                    doc_names = list(set(m.get('document_name') for m in batch_metas if m.get('document_name')))
+                    
+                    min_idx = min(source_indices) if source_indices else 0
+                    max_idx = max(source_indices) if source_indices else 0
+                    
                     for t in transactions:
-                        t['_source_chunks'] = source_ids
+                        t['_source_chunks_range'] = (min_idx, max_idx)
+                        t['_source_docs'] = doc_names
                 return transactions
 
         for i, batch in enumerate(batches):
             batch_metas = context_metadatas[i*BATCH_SIZE : (i+1)*BATCH_SIZE] if context_metadatas else None
             tasks.append(process_batch(i, batch, batch_metas))
         
-        # Process batches in parallel but yield results as they complete
-        completed_batches = 0
-        for future in asyncio.as_completed(tasks):
-            transactions = await future
-            completed_batches += 1
-            
+        # Process batches in parallel but collect results in DETERMINISTIC ORDER
+        # This ensures the same chunks always produce results in the same sequence
+        batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Process results in order
+        for i, result in enumerate(batch_results):
             # Update progress
-            yield {"status": f"Extracting transactions (Batch {completed_batches}/{total_batches} complete)..."}
+            yield {"status": f"Extracting transactions (Batch {i+1}/{total_batches} complete)..."}
             
+            # Handle exceptions
+            if isinstance(result, Exception):
+                print(f"[WARNING] Batch {i} extraction failed: {result}")
+                continue
+            
+            transactions = result
             if transactions:
                 # Add to shared accounts to help next batches stay consistent
                 for t in transactions:
@@ -165,7 +220,7 @@ class AccountingService:
                         self.shared_accounts.add(str(e.get('account')).strip().title())
                 
                 all_transactions.extend(transactions)
-                print(f"[INFO] Batch completed: Extracted {len(transactions)} transactions")
+                print(f"[INFO] Batch {i} completed: Extracted {len(transactions)} transactions")
 
         if not all_transactions:
             yield "[WARNING] No transactions could be extracted from the documents. Please check the file quality."
@@ -173,47 +228,43 @@ class AccountingService:
 
         print(f"[INFO] Total extracted transactions (pre-dedup): {len(all_transactions)}")
         
-        # --- DEDUPLICATION LOGIC ---
-        # We want to remove duplicates caused by overlapping chunks (RAG artifacts)
-        # but KEEP legitimate duplicate transactions in the bank statement.
+        # --- NO DEDUPLICATION ---
+        # Keep ALL transactions extracted by the AI, including any duplicates.
+        # Sort for deterministic ordering only.
         
-        unique_transactions = []
-        # Key: (date, narration, entries_sig), Value: List of source_chunk_sets
-        seen_tx_sources: Dict[tuple, List[set]] = {}
-        
-        for t in all_transactions:
+        # Sort by date, then by total amount, then by narration for consistent processing
+        def get_sort_key(t):
             date = str(t.get('date', '')).strip()
             narration = str(t.get('narration', '')).strip()
             raw_entries = t.get('entries', [])
-            sorted_entries = sorted(raw_entries, key=lambda x: (str(x.get('account')), str(x.get('amount'))))
-            entries_sig = "|".join([f"{e.get('account')}:{e.get('amount')}" for e in sorted_entries])
-            
-            tx_key = (date, narration, entries_sig)
-            current_sources = set(t.get('_source_chunks', []))
-            
-            if tx_key not in seen_tx_sources:
-                seen_tx_sources[tx_key] = [current_sources]
-                unique_transactions.append(t)
-            else:
-                # We've seen an identical transaction before. 
-                # Is it an overlap or a new legitimate one?
-                # If the source chunks overlap significantly with any previous instance, it's likely an overlap duplicate.
-                is_duplicate_of_overlap = False
-                for prev_sources in seen_tx_sources[tx_key]:
-                    # IMPORTANT: Only drop if it's an overlap artifact.
-                    # If sources are EXACTLY identical, it means they were extracted from the SAME batch/call.
-                    # Legitimate duplicates in the same document will appear in the same batch.
-                    if current_sources != prev_sources and current_sources.intersection(prev_sources):
-                        is_duplicate_of_overlap = True
-                        break
-                
-                if not is_duplicate_of_overlap:
-                    # New instance or same batch -> likely legitimate
-                    seen_tx_sources[tx_key].append(current_sources)
-                    unique_transactions.append(t)
+            total_amount = sum(float(e.get('amount', 0)) for e in raw_entries if str(e.get('type')).upper() == "DEBIT")
+            if total_amount == 0 and raw_entries:
+                total_amount = sum(float(e.get('amount', 0)) for e in raw_entries if str(e.get('type')).upper() == "CREDIT")
+            return (date, total_amount, narration)
         
-        all_transactions = unique_transactions
-        print(f"[INFO] Total unique transactions (post-dedup): {len(all_transactions)}")
+        all_transactions.sort(key=get_sort_key)
+        print(f"[DEBUG] Transactions sorted for deterministic ordering")
+        print(f"[INFO] Keeping ALL {len(all_transactions)} transactions (deduplication disabled)")
+        
+        # No deduplication - use all transactions as-is
+        print(f"[INFO] Total transactions after sorting: {len(all_transactions)} (no deduplication applied)")
+        
+        # --- VALIDATION: Calculate total debits and credits for consistency check ---
+        total_validation_dr = 0.0
+        total_validation_cr = 0.0
+        for t in all_transactions:
+            entries = t.get('entries', [])
+            for e in entries:
+                amount = float(e.get('amount', 0))
+                if str(e.get('type')).upper() == "DEBIT":
+                    total_validation_dr += amount
+                else:
+                    total_validation_cr += amount
+        
+        print(f"[VALIDATION] Total Debits: ₹{total_validation_dr:,.2f}, Total Credits: ₹{total_validation_cr:,.2f}")
+        if abs(total_validation_dr - total_validation_cr) > 0.01:
+            print(f"[WARNING] Transaction imbalance detected: Difference of ₹{abs(total_validation_dr - total_validation_cr):,.2f}")
+        
         yield {"status": f"Verifying Double-Entry Integrity for {len(all_transactions)} unique transactions..."}
 
         # ---------------------------------------------------------
@@ -288,7 +339,7 @@ class AccountingService:
                 yield f"| | | | | | |\n" # Spacer
             
             elif tx_count == MAX_JOURNAL_ENTRIES_SHOW + 1:
-                remaining = len(unique_transactions) - MAX_JOURNAL_ENTRIES_SHOW
+                remaining = len(all_transactions) - MAX_JOURNAL_ENTRIES_SHOW
                 yield f"| ... | ... | | ... | ... | *({remaining} more transactions processed internally. 100% data integrity maintained for final report.)* |\n"
 
         # ---------------------------------------------------------
