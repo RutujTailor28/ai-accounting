@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException, Depends
 from fastapi.responses import StreamingResponse
-from typing import List
+from typing import List, Dict, Any
 from uuid import UUID
 import json
 import re
@@ -210,13 +210,17 @@ async def accounting_query(request: ChatQueryRequest, user=Depends(get_current_u
                 supabase_admin.table("chat_messages").insert(user_msg_data).execute()
 
                 # Save AI Synthesis
+                # Phase 2: Extract ALL structured tables from combined generator output
+                structured_tables = await accounting_service.get_all_structured_tables(full_response)
+                
                 msg_data = {
                     "session_id": str(request.session_id),
                     "workspace_id": str(request.workspace_id),
                     "role": "assistant",
                     "content": full_response,
                     "company_id": company_id,
-                    "created_by": user.id
+                    "created_by": user.id,
+                    "data": {"tables": structured_tables}
                 }
                 if session_title:
                     msg_data["session_title"] = session_title
@@ -224,9 +228,9 @@ async def accounting_query(request: ChatQueryRequest, user=Depends(get_current_u
                 saved_msg = supabase_admin.table("chat_messages").insert(msg_data).execute()
                 final_msg_id = saved_msg.data[0]['id'] if saved_msg.data else None
                 
-                # Signal end of stream with actual message ID for feedback system
+                # Signal end of stream with actual message ID and structured data for frontend
                 if final_msg_id:
-                    yield f"data: {json.dumps({'message_id': final_msg_id})}\n\n"
+                    yield f"data: {json.dumps({'message_id': final_msg_id, 'data': {'tables': structured_tables}})}\n\n"
                 
                 yield "data: [DONE]\n\n"
             except Exception as e:
@@ -238,4 +242,26 @@ async def accounting_query(request: ChatQueryRequest, user=Depends(get_current_u
 
     except Exception as e:
         print(f"[ERROR] Accounting Query Error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.patch("/messages/{message_id}")
+async def update_accounting_message(message_id: UUID, content: str, data: Dict[str, Any] = None, user=Depends(get_current_user)):
+    """
+    Update a chat message's content and structured data.
+    Only the creator can edit their messages.
+    """
+    try:
+        # Verify ownership
+        msg_check = supabase.table("chat_messages").select("created_by").eq("id", str(message_id)).single().execute()
+        if not msg_check.data or msg_check.data["created_by"] != user.id:
+            raise HTTPException(status_code=403, detail="Forbidden")
+            
+        update_fields = {"content": content}
+        if data is not None:
+            update_fields["data"] = data
+            
+        res = supabase.table("chat_messages").update(update_fields).eq("id", str(message_id)).execute()
+        return res.data[0]
+    except Exception as e:
+        print(f"[ERROR] Update Message Error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
