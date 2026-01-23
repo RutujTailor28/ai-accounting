@@ -12,15 +12,27 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
     token = credentials.credentials
     try:
         # Verify the token with Supabase
+        # Note: supabase.auth.get_user(token) implicitly validates the JWT
         user_response = supabase.auth.get_user(token)
+        
         if not user_response.user:
+            print(f"[AUTH] 401: Token provided but no user found in response.")
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid or expired token",
                 headers={"WWW-Authenticate": "Bearer"},
             )
+        
         return user_response.user
     except Exception as e:
+        error_str = str(e).lower()
+        if "expired" in error_str:
+            print(f"[AUTH] 401: Token expired. Detail: {str(e)}")
+        elif "invalid" in error_str:
+            print(f"[AUTH] 401: Token invalid. Detail: {str(e)}")
+        else:
+            print(f"[AUTH] 401: Auth error. Detail: {str(e)}")
+            
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=f"Auth error: {str(e)}",

@@ -166,19 +166,23 @@ async def refresh_token(data: TokenRefreshRequest):
             company_id = response.user.user_metadata.get("company_id")
         
         if not company_id:
-            profile_res = supabase.table("profiles") \
-                .select("company_id") \
-                .eq("id", response.user.id) \
-                .execute()
-            if profile_res.data:
-                company_id = profile_res.data[0].get("company_id")
+            try:
+                profile_res = supabase.table("profiles") \
+                    .select("company_id") \
+                    .eq("id", response.user.id) \
+                    .execute()
+                if profile_res.data:
+                    company_id = profile_res.data[0].get("company_id")
+            except Exception as e:
+                print(f"[AUTH] Failed to fetch company_id in refresh: {str(e)}")
 
+        # Ensure we return valid strings, not None for required fields
         return LoginResponse(
             access_token=str(response.session.access_token),
             refresh_token=str(response.session.refresh_token),
             user_id=str(response.user.id),
             email=str(response.user.email),
-            company_id=str(company_id) or ""
+            company_id=str(company_id) if company_id else ""
         )
     except Exception as e:
         print(f"[ERROR] token refresh failed: {str(e)}")

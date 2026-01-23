@@ -208,7 +208,7 @@ class VectorStore:
                 results = self.collection.get(
                     where={"company_id": company_id}, 
                     include=[], 
-                    limit=10000 # Increased from default 100
+                    limit=1000000 # Safety: Increased to support very large workspaces
                 )
                 count = len(results['ids'])
             else:
