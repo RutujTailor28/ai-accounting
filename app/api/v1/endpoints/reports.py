@@ -70,6 +70,30 @@ async def stream_query_documents(request_body: QueryRequest, request: Request, u
         # Step 1: Generate Embedding
         query_embedding = embedding_service.generate_embedding(request_body.question)
         
+
+        # Resolve customer_id to folder_ids if provided
+        folder_ids = request_body.folder_ids or []
+        if request_body.customer_id:
+            customer_folders = supabase.table("folders") \
+                .select("id") \
+                .eq("customer_id", request_body.customer_id) \
+                .is_("deleted_at", "null") \
+                .execute()
+            
+            if customer_folders.data:
+                customer_folder_ids = [f["id"] for f in customer_folders.data]
+                if folder_ids:
+                    # If folder_ids were already provided, intersect them
+                    folder_ids = list(set(folder_ids) & set(customer_folder_ids))
+                else:
+                    folder_ids = customer_folder_ids
+            
+            if not folder_ids:
+                # If a customer was selected but has no folders/documents
+                async def no_customer_docs_gen():
+                    yield json.dumps({"type": "summary", "total_transactions": 0, "sources": [], "message": "No documents found for this customer."}) + "\n"
+                return StreamingResponse(no_customer_docs_gen(), media_type="application/x-ndjson")
+
         # Step 2: Retrieve Relevant Chunks
         count = vector_store.get_collection_count(company_id=request_body.company_id)
         
@@ -95,7 +119,7 @@ async def stream_query_documents(request_body: QueryRequest, request: Request, u
                 company_id=request_body.company_id, 
                 n_results=total_chunks,
                 file_types=request_body.file_types,
-                folder_ids=request_body.folder_ids,
+                folder_ids=folder_ids if folder_ids else None,
                 uploaded_by=request_body.uploaded_by,
                 tags=request_body.tags
             )
@@ -107,7 +131,7 @@ async def stream_query_documents(request_body: QueryRequest, request: Request, u
                 company_id=request_body.company_id, 
                 n_results=n_results,
                 file_types=request_body.file_types,
-                folder_ids=request_body.folder_ids,
+                folder_ids=folder_ids if folder_ids else None,
                 uploaded_by=request_body.uploaded_by,
                 tags=request_body.tags
             )
@@ -246,6 +270,30 @@ async def query_documents(request: QueryRequest, user=Depends(get_current_user))
         print(f"[INFO] Step 1: Generating query embedding...")
         query_embedding = embedding_service.generate_embedding(request.question)
         
+        # Resolve customer_id to folder_ids if provided
+        folder_ids = request.folder_ids or []
+        if request.customer_id:
+            customer_folders = supabase.table("folders") \
+                .select("id") \
+                .eq("customer_id", request.customer_id) \
+                .is_("deleted_at", "null") \
+                .execute()
+            
+            if customer_folders.data:
+                customer_folder_ids = [f["id"] for f in customer_folders.data]
+                if folder_ids:
+                    # If folder_ids were already provided, intersect them
+                    folder_ids = list(set(folder_ids) & set(customer_folder_ids))
+                else:
+                    folder_ids = customer_folder_ids
+            
+            if not folder_ids:
+                # If a customer was selected but has no folders/documents
+                return QueryResponse(
+                    answer="No documents found for this customer.",
+                    sources=[]
+                )
+
         # Step 2: Retrieve Relevant Chunks
         print(f"[INFO] Step 2: Retrieving relevant chunks from vector store...")
         # Get count first as a sanity check
@@ -273,7 +321,7 @@ async def query_documents(request: QueryRequest, user=Depends(get_current_user))
                 company_id=request.company_id, 
                 n_results=total_chunks,
                 file_types=request.file_types,
-                folder_ids=request.folder_ids,
+                folder_ids=folder_ids if folder_ids else None,
                 uploaded_by=request.uploaded_by,
                 tags=request.tags
             )
@@ -287,7 +335,7 @@ async def query_documents(request: QueryRequest, user=Depends(get_current_user))
                 company_id=request.company_id, 
                 n_results=n_results,
                 file_types=request.file_types,
-                folder_ids=request.folder_ids,
+                folder_ids=folder_ids if folder_ids else None,
                 uploaded_by=request.uploaded_by,
                 tags=request.tags
             )

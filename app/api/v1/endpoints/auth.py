@@ -1,9 +1,104 @@
 from fastapi import APIRouter, HTTPException, Depends, status
-from app.schemas.auth import UserLogin, LoginResponse, ForgotPasswordRequest, ResetPasswordRequest, TokenRefreshRequest
-from app.core.supabase import supabase
+from app.schemas.auth import UserLogin, LoginResponse, ForgotPasswordRequest, ResetPasswordRequest, TokenRefreshRequest, UserRegister
+from app.core.supabase import supabase, supabase_admin
+import uuid
 from app.api.deps import get_current_user
 
 router = APIRouter()
+
+@router.post("/signup", response_model=dict)
+async def signup(data: UserRegister):
+    """
+    Register a new user and initialize their company.
+    """
+    try:
+        # Sanitize email
+        email = data.email.strip().lower()
+        print(f"[DEBUG] Attempting signup for email: '{email}'")
+
+        # Step 2: Generate a unique company_id
+        company_id = f"comp-{str(uuid.uuid4())[:8]}"
+        print(f"[DEBUG] Generated company_id: {company_id}")
+
+        # Step 3: Register user in Supabase Auth using Admin Client
+        # Using Admin Client is more reliable for testing as it confirms the email automatically
+        try:
+            auth_res = supabase_admin.auth.admin.create_user({
+                "email": email,
+                "password": data.password,
+                "email_confirm": True,
+                "user_metadata": {
+                    "full_name": f"{data.first_name} {data.last_name}",
+                    "first_name": data.first_name,
+                    "last_name": data.last_name,
+                    "company_name": data.company_name,
+                    "company_id": company_id
+                }
+            })
+        except Exception as auth_e:
+            err_msg = str(auth_e).lower()
+            print(f"[ERROR] Supabase admin.create_user failed: {str(auth_e)}")
+            
+            if "already been registered" in err_msg or "already exists" in err_msg:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="User is already registered in Supabase Auth. Please delete the user from the Supabase Console (Authentication > Users) or use a different email."
+                )
+            
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Authentication system error: {str(auth_e)}"
+            )
+
+        if not auth_res.user:
+            print(f"[ERROR] auth_res.user is None. Full response: {auth_res}")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Failed to create user account"
+            )
+
+        user_id = auth_res.user.id
+        print(f"[DEBUG] User created with ID: {user_id}")
+
+        # Step 4: Create entry in 'company' table
+        company_data = {
+            "id": company_id,
+            "name": data.company_name
+        }
+        supabase_admin.table("company").upsert(company_data).execute()
+
+        # Step 5: Create profile in 'profiles' table
+        profile_data = {
+            "id": user_id,
+            "email": email,
+            "company_id": company_id,
+            "first_name": data.first_name,
+            "last_name": data.last_name,
+            "role": "admin"
+        }
+        
+        # Using upsert to handle case where profile might already exist (e.g. from previous failed attempt)
+        profile_res = supabase_admin.table("profiles").upsert(profile_data).execute()
+        
+        if not profile_res.data:
+            print(f"[ERROR] Failed to create profile for user {auth_res.user.id}")
+            # We don't necessarily want to fail the whole signup if Auth succeeded, 
+            # as login can recreate the profile as a fallback, but it's better to log it.
+
+        return {
+            "message": "User registered successfully",
+            "user_id": auth_res.user.id,
+            "company_id": company_id
+        }
+
+    except Exception as e:
+        print(f"[ERROR] Signup failed: {str(e)}")
+        if "already registered" in str(e).lower():
+             raise HTTPException(status_code=400, detail="User already registered")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
 
 @router.post("/login", response_model=LoginResponse)
 async def login(credentials: UserLogin):
@@ -25,51 +120,68 @@ async def login(credentials: UserLogin):
             
         print(f"[DEBUG] Login successful for {response.user.email}")
 
-        # Try to get company_id from user_metadata first (preferred method)
+        # Try to get company_id and company_name from user_metadata first
         company_id = None
+        company_name = None
         if hasattr(response.user, 'user_metadata') and response.user.user_metadata:
             company_id = response.user.user_metadata.get("company_id")
-            if company_id:
-                print(f"[INFO] Found company_id in user_metadata: {company_id}")
         
-        # Fallback: Check profiles table if not in user_metadata
-        if not company_id:
+        # Fallback/Refresh: Check company table
+        if company_id:
             try:
-                profile_res = supabase.table("profiles") \
+                comp_res = supabase_admin.table("company") \
+                    .select("name") \
+                    .eq("id", company_id) \
+                    .single() \
+                    .execute()
+                if comp_res.data:
+                    company_name = comp_res.data.get("name")
+            except Exception as e:
+                print(f"[WARNING] Could not fetch company name: {str(e)}")
+
+        # If still missing info, check profiles (legacy fallback)
+        if not company_id or not company_name:
+            try:
+                profile_res = supabase_admin.table("profiles") \
                     .select("company_id") \
                     .eq("id", response.user.id) \
                     .execute()
                 
                 if profile_res.data and len(profile_res.data) > 0:
-                    company_id = profile_res.data[0].get("company_id")
-                    print(f"[INFO] Found company_id in profiles table: {company_id}")
+                    profile = profile_res.data[0]
+                    company_id = company_id or profile.get("company_id")
+                    # company_name will be fetched from company table below or is already None
                 else:
-                    # Neither source has company_id - create profile with default
-                    print(f"[INFO] No company_id found. Creating default profile...")
-                    default_company_id = f"company-{response.user.id[:8]}"
+                    # Create default company and profile if nothing exists
+                    company_id = company_id or f"company-{response.user.id[:8]}"
+                    company_name = company_name or "My Company"
                     
-                    # Import admin client for bypassing RLS
-                    from app.core.supabase import supabase_admin
-                    
-                    # Create profile using admin client to bypass RLS
-                    new_profile = supabase_admin.table("profiles").insert({
+                    # 1. UPSERT Company
+                    supabase_admin.table("company").upsert({
+                        "id": company_id,
+                        "name": company_name
+                    }).execute()
+
+                    # 2. UPSERT Profile
+                    supabase_admin.table("profiles").upsert({
                         "id": response.user.id,
                         "email": response.user.email,
-                        "company_id": default_company_id,
+                        "company_id": company_id,
                         "first_name": response.user.email.split("@")[0],
-                        "last_name": ""
+                        "last_name": "",
+                        "role": "admin"
                     }).execute()
-                    
-                    if new_profile.data:
-                        company_id = default_company_id
-                        print(f"[INFO] Created profile with company_id: {company_id}")
-                    else:
-                        print(f"[ERROR] Profile creation failed: {new_profile}")
-                    
             except Exception as profile_e:
-                print(f"[WARNING] Profile fetch/create failed: {str(profile_e)}")
-                import traceback
-                traceback.print_exc()
+                print(f"[WARNING] Profile/Company sync failed: {str(profile_e)}")
+            
+            # Final check: If we have company_id but still no name, try fetching from company table
+            if company_id and not company_name:
+                try:
+                    c_res = supabase_admin.table("company").select("name").eq("id", company_id).single().execute()
+                    if c_res.data:
+                        company_name = c_res.data.get("name")
+                except:
+                    pass
 
         if not company_id:
             raise HTTPException(
@@ -83,7 +195,8 @@ async def login(credentials: UserLogin):
             refresh_token=str(response.session.refresh_token),
             user_id=str(response.user.id),
             email=str(response.user.email),
-            company_id=str(company_id)
+            company_id=str(company_id),
+            company_name=str(company_name) if company_name else None
         )
     except HTTPException:
         raise
@@ -99,19 +212,27 @@ async def get_me(user=Depends(get_current_user)):
     """
     Get current logged in user info.
     """
-    # Fetch profile for company_id
-    profile_res = supabase.table("profiles") \
-        .select("company_id") \
+    # Fetch profile and company info
+    # Joining with company table for the name
+    profile_res = supabase_admin.table("profiles") \
+        .select("company_id, company(name)") \
         .eq("id", user.id) \
         .single() \
         .execute()
     
-    company_id = profile_res.data.get("company_id") if profile_res.data else None
+    company_id = None
+    company_name = None
+
+    if profile_res.data:
+        company_id = profile_res.data.get("company_id")
+        # Prefer name from company table
+        company_name = profile_res.data.get("company", {}).get("name") if profile_res.data.get("company") else None
 
     return {
         "userId": user.id,
         "email": user.email,
         "companyId": company_id,
+        "companyName": company_name,
         "lastSignIn": user.last_sign_in_at
     }
 
@@ -160,29 +281,41 @@ async def refresh_token(data: TokenRefreshRequest):
                 detail="Invalid or expired refresh token"
             )
 
-        # Get company_id from user_metadata or profiles
+        # Get company info from metadata or tables
         company_id = None
+        company_name = None
         if hasattr(response.user, 'user_metadata') and response.user.user_metadata:
             company_id = response.user.user_metadata.get("company_id")
         
-        if not company_id:
+        if company_id:
             try:
-                profile_res = supabase.table("profiles") \
-                    .select("company_id") \
+                comp_res = supabase_admin.table("company").select("name").eq("id", company_id).single().execute()
+                if comp_res.data:
+                    company_name = comp_res.data.get("name")
+            except:
+                pass
+
+        if not company_id or not company_name:
+            try:
+                profile_res = supabase_admin.table("profiles") \
+                    .select("company_id, company(name)") \
                     .eq("id", response.user.id) \
                     .execute()
                 if profile_res.data:
-                    company_id = profile_res.data[0].get("company_id")
+                    profile = profile_res.data[0]
+                    company_id = company_id or profile.get("company_id")
+                    company_name = company_name or (profile.get("company", {}).get("name") if profile.get("company") else None)
             except Exception as e:
-                print(f"[AUTH] Failed to fetch company_id in refresh: {str(e)}")
-
+                print(f"[AUTH] Failed to fetch company_info in refresh: {str(e)}")
+ 
         # Ensure we return valid strings, not None for required fields
         return LoginResponse(
             access_token=str(response.session.access_token),
             refresh_token=str(response.session.refresh_token),
             user_id=str(response.user.id),
             email=str(response.user.email),
-            company_id=str(company_id) if company_id else ""
+            company_id=str(company_id) if company_id else "",
+            company_name=str(company_name) if company_name else None
         )
     except Exception as e:
         print(f"[ERROR] token refresh failed: {str(e)}")
@@ -190,3 +323,19 @@ async def refresh_token(data: TokenRefreshRequest):
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=f"Token refresh failed: {str(e)}"
         )
+
+@router.get("/company/{company_id}")
+async def get_company_details(company_id: str, _user=Depends(get_current_user)):
+    """
+    Get company details by ID.
+    """
+    try:
+        res = supabase.table("company").select("*").eq("id", company_id).single().execute()
+        if not res.data:
+            # Fallback for transient state
+            return {"id": company_id, "name": "My Company"}
+        return res.data
+    except Exception as e:
+        print(f"[ERROR] Failed to fetch company {company_id}: {str(e)}")
+        # Return a sensible fallback instead of 404/500 to keep UI happy
+        return {"id": company_id, "name": "My Company"}

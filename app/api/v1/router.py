@@ -1,5 +1,5 @@
 from fastapi import APIRouter
-from app.api.v1.endpoints import auth, users, roles, documents, reports, folders, workspaces, chat, accounting
+from app.api.v1.endpoints import auth, users, roles, documents, reports, folders, workspaces, chat, accounting, customers
 
 api_router = APIRouter()
 
@@ -12,3 +12,4 @@ api_router.include_router(folders.router, prefix="/folders", tags=["Folders"])
 api_router.include_router(workspaces.router, prefix="/workspaces", tags=["Workspaces"])
 api_router.include_router(chat.router, prefix="/chat", tags=["Chat"])
 api_router.include_router(accounting.router, prefix="/accounting", tags=["Accounting"])
+api_router.include_router(customers.router, prefix="/customers", tags=["Customers"])

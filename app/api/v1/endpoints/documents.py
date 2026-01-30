@@ -230,7 +230,7 @@ async def upload_document(
                     "parent_id": parent_id,
                     "created_by": user.id if hasattr(user, 'id') else None
                 }
-                new_folder = supabase.table("folders").insert(new_folder_data).execute()
+                new_folder = supabase_admin.table("folders").insert(new_folder_data).execute()
                 if not new_folder.data:
                     raise HTTPException(status_code=500, detail="Failed to create folder record")
                 target_folder_id = new_folder.data[0]['id']
@@ -260,7 +260,7 @@ async def upload_document(
             "created_by": user.id if hasattr(user, 'id') else None
         }
         
-        file_db_res = supabase.table("files").insert(file_record).execute()
+        file_db_res = supabase_admin.table("files").insert(file_record).execute()
         if not file_db_res.data:
             print(f"[ERROR] Failed to save file record: {file_db_res}")
             raise HTTPException(status_code=500, detail="Failed to save file metadata to database")

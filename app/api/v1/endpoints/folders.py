@@ -25,6 +25,7 @@ async def create_folder(folder_data: FolderCreate, user=Depends(get_current_user
             "name": folder_data.name,
             "company_id": company_id,
             "parent_id": str(folder_data.parent_id) if folder_data.parent_id else None,
+            "customer_id": str(folder_data.customer_id) if folder_data.customer_id else None,
             "created_by": user.id
         }
 
@@ -73,14 +74,42 @@ async def list_folders(user=Depends(get_current_user)):
         
         company_id = profile_res.data["company_id"]
 
-        result = supabase.table("folders") \
+        # Fetch folders
+        folders_res = supabase.table("folders") \
             .select("*") \
             .eq("company_id", company_id) \
             .is_("deleted_at", "null") \
             .order("name") \
             .execute()
         
-        return result.data or []
+        folders = folders_res.data or []
+
+        # Fetch all files for this company to count them
+        files_res = supabase.table("files") \
+            .select("folder_id, size") \
+            .eq("company_id", company_id) \
+            .is_("deleted_at", "null") \
+            .execute()
+        
+        files = files_res.data or []
+
+        # Aggregate counts and sizes
+        folder_stats = {}
+        for f in files:
+            f_id = f.get("folder_id")
+            if f_id:
+                if f_id not in folder_stats:
+                    folder_stats[f_id] = {"count": 0, "size": 0}
+                folder_stats[f_id]["count"] += 1
+                folder_stats[f_id]["size"] += (f.get("size") or 0)
+
+        # Attach stats to folders
+        for folder in folders:
+            stats = folder_stats.get(folder["id"], {"count": 0, "size": 0})
+            folder["file_count"] = stats["count"]
+            folder["total_size"] = stats["size"]
+        
+        return folders
     except Exception as e:
         print(f"[ERROR] Error listing folders: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))

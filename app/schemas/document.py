@@ -25,6 +25,7 @@ class QueryRequest(CamelModel):
     start_date: Optional[str] = Field(None, description="Start date for filtering documents (ISO format)")
     end_date: Optional[str] = Field(None, description="End date for filtering documents (ISO format)")
     tags: Optional[List[str]] = Field(None, description="Filter by tags")
+    customer_id: Optional[str] = Field(None, description="Filter by customer ID")
 
 class QueryResponse(CamelModel):
     """Response model for query results."""
