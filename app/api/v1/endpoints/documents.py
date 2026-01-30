@@ -256,6 +256,7 @@ async def upload_document(
             "s3_url": s3_url,
             "file_type": file.filename.split('.')[-1].lower() if '.' in file.filename else 'unknown',
             "company_id": company_id,
+            "size": len(file_content),
             "created_by": user.id if hasattr(user, 'id') else None
         }
         
@@ -264,7 +265,7 @@ async def upload_document(
             print(f"[ERROR] Failed to save file record: {file_db_res}")
             raise HTTPException(status_code=500, detail="Failed to save file metadata to database")
             
-        print(f"[INFO] DONE: File record saved to database.")
+        print(f"[INFO] DONE: File record saved to database (Size: {len(file_content)} bytes).")
 
         # Schedule background processing to prevent 502 timeouts
         background_tasks.add_task(
@@ -307,6 +308,45 @@ async def reset_vector_db(user=Depends(get_current_user)):
         
     return {"message": "Vector database has been successfully reset. All AI memory is cleared."}
 
+@router.get("/{file_id}", response_model=FileResponse)
+async def get_document(
+    file_id: str,
+    user=Depends(get_current_user)
+):
+    """
+    Get detailed metadata for a specific document.
+    """
+    try:
+        # Step 0: Get user's company_id
+        profile_res = supabase.table("profiles").select("company_id").eq("id", user.id).single().execute()
+        if not profile_res.data or not profile_res.data.get("company_id"):
+            raise HTTPException(status_code=400, detail="User profile or company assignment missing")
+        
+        company_id = profile_res.data["company_id"]
+
+        # 1. Get File Metadata and verify ownership
+        result = supabase.table("files") \
+            .select("*") \
+            .eq("id", file_id) \
+            .eq("company_id", company_id) \
+            .is_("deleted_at", "null") \
+            .execute()
+        
+        if not result.data:
+            raise HTTPException(status_code=404, detail="File not found or access denied")
+            
+        file_data = result.data[0]
+        
+        if file_data.get("s3_key"):
+            file_data["s3_url"] = s3_storage.generate_presigned_url(file_data["s3_key"], expires_in=3600)
+            
+        return file_data
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[ERROR] Error fetching document metadata: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @router.get("/{file_id}/url", response_model=dict)
 async def get_document_url(
@@ -367,7 +407,6 @@ async def get_document_url(
         print(f"[ERROR] Error generating document URL: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
-
 @router.delete("/{file_id}", response_model=dict)
 async def delete_document(
     file_id: str,
@@ -422,8 +461,7 @@ async def delete_document(
             "details": {
                 "database": "Updated deleted_at"
             }
-        }
-        
+        }    
     except HTTPException:
         raise
     except Exception as e:

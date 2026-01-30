@@ -174,8 +174,12 @@ class LLMService:
 
                 STRATEGY:
                 1. Look for the absolute header (often the first few lines of the file).
-                2. Identify Bank Name (e.g., "IDBI Bank", "HDFC Bank", "State Bank of India", "Kotak", "Axis", "ICICI").
-                3. Identify Account Holder Name (e.g., "Name of the Assessee", "Beneficiary Name:", "Account Name:").
+                2. **BANK NAME IDENTIFICATION (CRITICAL)**:
+                   - Look for the official bank name in the main header (usually first 10-20 lines).
+                   - Check for bank logos, letterheads, or explicit "Bank Statement" titles at the top.
+                   - **CRITICAL**: Ignore bank names found inside transaction lists or UPI IDs (e.g. "@oksbi", "to SBI account"). Only identify the ISSUING bank of the statement itself.
+                   - **CRITICAL**: If you cannot find an explicit issuing bank name in the header, return "Unknown" - DO NOT guess.
+                3. Identify Account Holder Name (e.g., "Name of the Assessee", "Beneficiary Name:", "Account Name:", "Customer Name:").
                 4. IDENTIFY DOCUMENT TYPE:
                    - **Bank Statement**: Contains transaction lists with Date, Narration, Withdrawal/Deposit, Balance.
                    - **Balance Sheet**: Summary of Assets and Liabilities. Look for terms like "Share Capital", "Fixed Assets", "Current Liabilities", "Balance Sheet as on...".
@@ -188,7 +192,7 @@ class LLMService:
                 ---
 
                 Return ONLY a JSON object: {{"bank_name": "IDENTIFIED BANK NAME", "account_holder": "IDENTIFIED NAME", "document_type": "TYPE"}}
-                If a field is truly not found, use "Unknown".
+                **CRITICAL**: For bank_name, use the FULL official name (e.g., "HDFC Bank", "IDBI Bank Ltd."). If truly not found, use "Unknown".
                 """
                 response = await self.llm.ainvoke(prompt)
                 meta = self._extract_json(response.content)
@@ -196,6 +200,8 @@ class LLMService:
                 bank_name = meta.get("bank_name", "Unknown")
                 account_holder = meta.get("account_holder", "Unknown")
                 doc_type = meta.get("document_type", "Unknown")
+                
+                # Removed manual bank heuristic logic to allow LLM to find the bank name dynamically.
 
                 return doc, {"bank_name": bank_name, "account_holder": account_holder, "document_type": doc_type}
             except Exception as e:
@@ -241,7 +247,7 @@ class LLMService:
             meta_str = ""
             if doc_metadata and doc_name in doc_metadata:
                 m = doc_metadata[doc_name]
-                meta_str = f" [TYPE: {m.get('document_type', 'Unknown')}, BANK: {m['bank_name']}, HOLDER: {m['account_holder']}]"
+                meta_str = f" [TYPE: {m.get('document_type', 'Unknown')}, STATEMENT_BANK: {m['bank_name']}, HOLDER: {m['account_holder']}]"
                 
             context_parts.append(f"[Context {i+1} - Source: {doc_name}{meta_str}]\n{chunk}")
         
@@ -263,34 +269,57 @@ class LLMService:
 {context}
 
 **CRITICAL INSTRUCTIONS:**
-1. **Understand the Query:** Identify if the user is looking for SPECIFIC TRANSACTIONS or a GENERAL SUMMARY (like a Balance Sheet or P&L).
+1. **CATEGORIZATION ACCURACY (HIGHEST PRIORITY)**:
+   - **EQUITY AND LIABILITIES**: Capital, Loans, Sundry Creditors, Provisions, Outstanding Expenses.
+   - **ASSETS**: Fixed Assets (Cars, Land, Furniture), Sundry Debtors, Bank Balance, Cash in Hand, Deposits, Prepaid Expenses.
+   - **SUNDRY DEBTORS ARE ALWAYS ASSETS**. Do NOT place them in Liabilities.
+   - **SUNDRY CREDITORS ARE ALWAYS LIABILITIES**.
 
-2. **Document Analysis & Identification:**
+2. **Understand the Query:** Identify if the user is looking for SPECIFIC TRANSACTIONS or a GENERAL SUMMARY (like a Balance Sheet or P&L).
+
+3. **Document Analysis & Identification:**
    - Scan the context to identify the DOCUMENT TYPE (e.g., Bank Statement, Balance Sheet, P&L).
    - Identify the FINANCIAL PERIOD or YEAR mentioned in the document headers.
    - If the user asks for "previous year", look for documents dated {current_year - 1}.
 
-3. **HANDLING SUMMARY REPORTS (Balance Sheet / P&L / Computation):**
+4. **HANDLING SUMMARY REPORTS (Balance Sheet / P&L / Computation):**
    - If the user asks for a high-level summary (e.g., "give me balance sheet", "show p&l", "financial report"), your PRIMARY goal is to find and extract that report's structural tables.
-   - **MANDATORY**: Look for keywords like "Balance Sheet", "Assets", "Liabilities", "Equity", "Profit & Loss", "Capital Account", "Income", "Expenditure" in the text.
-   - **DO NOT** extract individual bank statement transactions (lines with specific amounts/dates) if a summary report is requested.
-   - **Cleanly format the summary data into a Markdown Table**.
-   - **PERSISTENCE:** Scan the *entire* document context. Financial reports are often found in documents labeled "Computation", "P&L", or "Balance Sheet" in the source name or the [TYPE: ...] header.
-   - **REPORT FORMAT**: Your response MUST START with the textual report/table, then end with the JSON block:
-      "I found the [Report Type]:
+   - **MANDATORY**: Look for keywords like "Balance Sheet", "Assets", "Liabilities", "Equity", "Profit & Loss", "Capital Account", "Income", "Expenditure", "Statement of Affairs", "Financial Position" in the text.
+   - **DO NOT** extract individual bank statement transactions if a summary report is requested.
+   - **TABLE INTEGRITY**: You MUST produce a single continuous markdown table for each section. **DO NOT** break a table with empty lines or interleaved text. Output EVERY row for a section in one block.
+   - **MANDATORY**: Cleanly format the summary data into a Markdown Table.
+   - **CATEGORIZATION ACCURACY (CRITICAL)**:
+     - **EQUITY AND LIABILITIES**: Capital, Loans, Sundry Creditors, Provisions, Outstanding Expenses.
+     - **ASSETS**: Fixed Assets (Cars, Land, Furniture), Sundry Debtors, Bank Balance, Cash in Hand, Deposits, Prepaid Expenses.
+     - **SUNDRY DEBTORS ARE ALWAYS ASSETS**. Do NOT place them in Liabilities.
+   - **VERTICALIZATION RULE (CRITICAL)**: Many documents show Liabilities and Assets side-by-side in a 4-column layout. You MUST VERTICALIZE this.
+     - NEVER produce a table with 4 columns (Liabilities, Amount, Assets, Amount).
+     - Process the entire "LIABILITIES" column/side first.
+     - Then process the entire "ASSETS" column/side first.
+     - Output them as TWO SEPARATE TABLES, one after the other.
+   - **BALANCE SHEET COMPLETENESS**: For a Balance Sheet, you MUST provide BOTH an "ASSETS" table AND an "EQUITY AND LIABILITIES" table. DO NOT stop after the first table.
+   - **STRICT FORMATTING**: 
+     - **START DIRECTLY** with the first markdown table.
+     - **DO NOT** include any report titles, headers, or introductory text (e.g. NO "BALANCE SHEET").
+     - **DO NOT** use markdown headers (#) or bolding (**).
+     - **DO NOT** wrap the entire response in markdown code blocks (```markdown or ```).
+   - **REPORT FORMAT**: 
       | Particulars | Amount |
-      |---|---|
-      ...
+      | :--- | :--- |
+      | [Row Data] | [Amount] |
       
-      {{"transactions": []}}"
-   - If the request is for a report and you found NO such report in the context, return an empty transaction list and a message:
-     "{{ "transactions": [], "message": "No [Report Type] found in this section of the records." }}"
+      {{"transactions": []}}
+   - If the request is for a report and you found NO such report in the context, return:
+     "{{"transactions": [], "message": "I could not find a structured [Report Type] table in the provided documents."}}"
 
-4. **HANDLING TRANSACTION QUERIES:**
-   - If the user asks for specific records (e.g., "all UPI payments", "checks above 5000"), extract them as a JSON list.
-   - Follow the direction (DEBIT/CREDIT) rules strictly using balance comparison.
-   - If you found transactions, include the JSON block at the end.
+4. **STRICT PRE-FILTERING (HIGHEST PRIORITY):**
+   - Identify the SPECIFIC INTENT: Is the user asking for "Cash", "UPI", "ATM", "NEFT", etc.?
+   - **CASH FILTER**: If the user asks for "Cash", you MUST EXCLUDE any transaction that contains UPI identifiers, VPA IDs, or NEFT/IMPS markers. ONLY include "CASH", "ATM", "WITHDRAWAL", "SELF", or "WDL".
+   - **UPI FILTER**: If the user asks for "UPI", you MUST EXCLUDE any transaction that contains "CASH" or "ATM" identifiers.
+   - **STRICT EXCLUSION**: Your goal is NOT to find "similar" things, but to find EXACT matches for the requested type. 
+   - If a transaction is ambiguous or does not explicitly match the requested type, **SKIP IT**.
 
+5. **HANDLING TRANSACTION QUERIES:**
    - Transaction dates
    - Amounts (debit/credit)
    - Description/narration
@@ -299,17 +328,20 @@ class LLMService:
    - **BALANCE VALUES** - These are CRITICAL for determining transaction direction
 
 **PROCESSING WORKFLOW (FOLLOW THIS EXACT ORDER):**
-1. Read through the context line by line
-2. For each transaction line:
+1. **IDENTIFY FILTER**: Determine the specific transaction type or keyword the user is looking for (e.g., "Cash").
+2. **SCAN LINE-BY-LINE**: Read through the context.
+3. **APPLY FILTER**: For each line, check: "Does this line match the IDENTIFIED FILTER?"
+4. **DECIDE**:
+   - If NO: **STOP immediately** for this line. Do NOT extract anything. Move to the next line.
+   - If YES: Proceed to step 5.
+5. **EXTRACT (MATCHING ONLY)**:
    a. Extract: Date, Description, Amount(s), Balance
-   b. **FIND THE PREVIOUS LINE'S BALANCE** (or opening balance if first transaction)
+   b. **FIND THE PREVIOUS LINE'S BALANCE**
    c. **COMPARE**: Current Balance vs Previous Balance
-   d. **DETERMINE DIRECTION**: 
-      - If Current Balance > Previous Balance → **CREDIT**
-      - If Current Balance < Previous Balance → **DEBIT**
-   e. Extract all other fields (transaction_id, type, etc.)
-3. Continue this process for ALL matching transactions
-4. **DO NOT ASSUME** - Always verify direction using balance comparison
+   d. **DETERMINE DIRECTION** (Credit if balance increased, Debit if decreased)
+   e. Extract all other fields
+6. **VERIFY COMPLETENESS**: Ensure EVERY record that matches the filter is extracted.
+7. **VERIFY PURITY**: Ensure NO record that fails the filter (e.g. no UPI in a Cash search) is extracted.
 
 3. **COMPLETE EXTRACTION REQUIREMENT:**
    - Extract **EVERY SINGLE RECORD** that matches the user's query from the provided context
@@ -344,12 +376,12 @@ class LLMService:
    
    - **Examples:**
      - Previous line balance: 19,773.73
-     - Current line: "22/11/24 UPI-SANJAY 350.00 20,123.73"
+     - Current line: "22/11/24 TXN-NARRATION-DATA 350.00 20,123.73"
      - Current balance: 20,123.73
      - Comparison: 20,123.73 > 19,773.73 → Balance INCREASED → **CREDIT**
      
      - Previous line balance: 20,123.73
-     - Current line: "22/11/24 UPI-PAYMENT 500.00 19,623.73"
+     - Current line: "22/11/24 PAYMENT-DETAIL 500.00 19,623.73"
      - Current balance: 19,623.73
      - Comparison: 19,623.73 < 20,123.73 → Balance DECREASED → **DEBIT**
    
@@ -362,8 +394,8 @@ class LLMService:
       - **ALWAYS check BOTH columns - never assume the first number is the only transaction**
    
    **STEP 3: KEYWORD DETECTION (TERTIARY METHOD - USE AS CONFIRMATION):**
-      - **CREDIT keywords**: "Deposit", "CR", "Credit", "Interest", "Received", "Refund", "Salary", "Inward", "Credit to", "Received from", "UPI-RECEIVED", "NEFT-CREDIT", "IMPS-CREDIT", "RTGS-CREDIT", "Dividend", "Bonus", "Reversal", "Reversal of", "Refund of"
-      - **DEBIT keywords**: "Withdrawal", "DR", "Debit", "Payment", "Paid", "Outward", "Payment to", "Transfer to", "UPI-PAID", "NEFT-DEBIT", "IMPS-DEBIT", "RTGS-DEBIT"
+      - **CREDIT keywords**: "Deposit", "CR", "Credit", "Interest", "Received", "Refund", "Salary", "Inward", "Credit to", "Received from", "NEFT-CREDIT", "IMPS-CREDIT", "RTGS-CREDIT", "Dividend", "Bonus", "Reversal", "Reversal of", "Refund of"
+      - **DEBIT keywords**: "Withdrawal", "DR", "Debit", "Payment", "Paid", "Outward", "Payment to", "Transfer to", "NEFT-DEBIT", "IMPS-DEBIT", "RTGS-DEBIT"
       - If description contains CREDIT keywords → **direction = "CREDIT"**
       - If description contains DEBIT keywords → **direction = "DEBIT"**
    
@@ -389,45 +421,45 @@ class LLMService:
    
    **Example 1 - Two Number Format (Amount + Balance):**
    - Previous balance: 19,773.73
-   - Line: "22/11/24 UPI-SANJAY SINGH-PAYTMQR1LJPTAZGXV@PAYTM 350.00 20,123.73"
+   - Line: "22/11/24 TXN-NARRATION-DATA SINGH-PAYTMQR1LJPTAZGXV@PAYTM 350.00 20,123.73"
    - Current balance: 20,123.73
-   - Comparison: 20,123.73 > 19,773.73 → Balance INCREASED → **CREDIT** ✅
+   - Comparison: 20,123.73 > 19,773.73 → Balance INCREASED → **CREDIT** 
    
    **Example 2 - Three Number Format (Debit + Credit + Balance):**
    - Line: "22/11/24 Salary Credit 0.00 50000.00 60000.00"
    - Previous balance: 10,000.00
    - Current balance: 60,000.00
-   - Comparison: 60,000.00 > 10,000.00 → Balance INCREASED → **CREDIT** ✅
-   - Also: 50,000.00 is in 2nd column (Credit column) → Confirms **CREDIT** ✅
+   - Comparison: 60,000.00 > 10,000.00 → Balance INCREASED → **CREDIT** 
+   - Also: 50,000.00 is in 2nd column (Credit column) → Confirms **CREDIT** 
    
    **Example 3 - Single Amount with Balance:**
    - Previous balance: 10,000.00
-   - Line: "22/11/24 UPI-RECEIVED from John 1000.00 11000.00"
+   - Line: "22/11/24 RECEIVED-DATA from John 1000.00 11000.00"
    - Current balance: 11,000.00
-   - Comparison: 11,000.00 > 10,000.00 → Balance INCREASED → **CREDIT** ✅
-   - Also: Keyword "RECEIVED" → Confirms **CREDIT** ✅
+   - Comparison: 11,000.00 > 10,000.00 → Balance INCREASED → **CREDIT** 
+   - Also: Keyword "RECEIVED" → Confirms **CREDIT** 
    
    **Example 4 - Interest Payment:**
    - Previous balance: 10,000.00
    - Line: "22/11/24 Interest 500.00 10500.00"
    - Current balance: 10,500.00
-   - Comparison: 10,500.00 > 10,000.00 → Balance INCREASED → **CREDIT** ✅
+   - Comparison: 10,500.00 > 10,000.00 → Balance INCREASED → **CREDIT** 
    
    **Example 5 - Refund:**
    - Previous balance: 10,000.00
    - Line: "22/11/24 Refund 0.00 2000.00 12000.00"
    - Current balance: 12,000.00
-   - Comparison: 12,000.00 > 10,000.00 → Balance INCREASED → **CREDIT** ✅
-   - Also: 2,000.00 is in 2nd column (Credit column) → Confirms **CREDIT** ✅
+   - Comparison: 12,000.00 > 10,000.00 → Balance INCREASED → **CREDIT** 
+   - Also: 2,000.00 is in 2nd column (Credit column) → Confirms **CREDIT** 
    
    **MANDATORY VALIDATION FOR EVERY TRANSACTION:**
    - **BEFORE marking direction, you MUST:**
-     1. ✅ Find the balance on the current line
-     2. ✅ Find the balance from the previous transaction line (or opening balance)
-     3. ✅ Compare: Current Balance vs Previous Balance
-     4. ✅ If Current > Previous → Mark as **CREDIT**
-     5. ✅ If Current < Previous → Mark as **DEBIT**
-     6. ✅ If Current = Previous → Check for other indicators (rare case)
+     1.  Find the balance on the current line
+     2.  Find the balance from the previous transaction line (or opening balance)
+     3.  Compare: Current Balance vs Previous Balance
+     4.  If Current > Previous → Mark as **CREDIT**
+     5.  If Current < Previous → Mark as **DEBIT**
+     6.  If Current = Previous → Check for other indicators (rare case)
    
    - **AFTER extracting each transaction, verify:**
      1. Did I compare the balance with the previous line? (REQUIRED)
@@ -452,7 +484,7 @@ class LLMService:
          "direction": "CREDIT or DEBIT",
          "transaction_id": "UPI ID/reference number/Chq No/Instrument No if available",
          "type": "UPI/NEFT/CASH/CHQ/IMPS/RTGS etc if identifiable",
-         "bank_name": "MANDATORY: Use the 'STATEMENT_BANK' name from the block header. DO NOT use names found in UPI IDs (like @oksbi or @okicici).",
+         "bank_name": "MANDATORY: Use the 'STATEMENT_BANK' name from the block header exactly. DO NOT guess based on narrations.",
          "source_document": "name of the document this transaction was found in"
        }}
      ]
@@ -482,6 +514,7 @@ class LLMService:
 - **BANK NAME CONSISTENCY**: Do NOT change the `bank_name` based on the payee or UPI ID (like @oksbi). Use the bank name of the statement owner.
 - Keep descriptions complete including any reference numbers found at the end of the line.
 - **FINAL CHECK**: Before returning results, count how many CREDIT vs DEBIT transactions you found. If you found significantly more DEBITS than CREDITS, you may have missed some credit transactions. Re-check the data.
+- **STRICT FILTER ADHERENCE**: If the user asked for "Cash", and you see ANY transaction with "UPI", "VPA", or "@" identifiers, you HAVE FAILED. REMOVE THEM. Only matching records must remain.
 
 **RESPONSE (JSON ONLY):**
 """
@@ -501,23 +534,52 @@ class LLMService:
             # Use robust JSON extraction
             parsed_json = self._extract_json(answer)
             
-            # Normalize key to 'transactions' if 'data' is present
             if "data" in parsed_json and "transactions" not in parsed_json:
                 parsed_json["transactions"] = parsed_json.pop("data")
             
+            # Applying secondary Python filter
+            if "transactions" in parsed_json:
+                initial_count = len(parsed_json["transactions"])
+                parsed_json["transactions"] = [tx for tx in parsed_json["transactions"] if not self._should_filter_transaction(tx, question)]
+                if initial_count > len(parsed_json["transactions"]):
+                    print(f"[FILTER] Standard answer: Filtered out {initial_count - len(parsed_json['transactions'])} non-matching transactions.")
+
             sources = list(set(source_documents))
 
             # For summary-style questions, make the "where did it come from?" explicit in the
             # human-readable answer shown in Search UI.
             q_lower = (question or "").lower()
             is_summary = any(kw in q_lower for kw in ["balance sheet", "p&l", "profit", "loss", "report", "summary", "computation"])
-            if is_summary and sources:
-                sources_md = "\n".join([f"- {s}" for s in sorted(sources)])
-                answer = f"{answer}\n\n---\n\n**Sources (uploaded documents used):**\n{sources_md}\n"
-            
+            # Clean up the human-readable answer (remove raw JSON blobs)
+            human_answer = answer
+            # Remove ```json ... ``` blocks
+            human_answer = re.sub(r'```json\s*.*?\s*```', '', human_answer, flags=re.DOTALL)
+            # Remove any raw { ... } that looks like JSON if the whole line is JSON
+            human_lines = []
+            for line in human_answer.split('\n'):
+                line_strip = line.strip()
+                if (line_strip.startswith('{') and line_strip.endswith('}')) or \
+                   (line_strip.startswith('[') and line_strip.endswith(']')):
+                    # Check if it actually parses as JSON to be sure
+                    try:
+                        json.loads(line_strip)
+                        continue # Skip this line
+                    except:
+                        pass
+                human_lines.append(line)
+            human_answer = "\n".join(human_lines).strip()
+
+            # Fallback for human_answer if it was purely JSON that got scrubbed
+            if not human_answer and "message" in parsed_json:
+                human_answer = parsed_json["message"]
+            elif not human_answer and "transactions" in parsed_json and parsed_json["transactions"]:
+                human_answer = f"I found {len(parsed_json['transactions'])} matching records."
+            elif not human_answer:
+                human_answer = "I could not find the information you requested in the uploaded documents."
+
             return {
                 "answer": json.dumps(parsed_json),
-                "full_answer": answer, # Raw LLM text including markdown
+                "full_answer": human_answer, 
                 "sources": sources
             }
         except Exception as e:
@@ -592,7 +654,18 @@ class LLMService:
                     source_documents = [d for _, d in filtered]
                     print(f"[INFO] Summary focus enabled: filtered to {len(context_chunks)} chunks from {len(keep_docs)} docs")
             else:
-                print("[INFO] Summary focus: No document matches found; using full context to avoid missing data.")
+                print("[INFO] Summary focus (stream): No document matches found; using full context to avoid missing data.")
+        elif doc_metadata:
+             # Transaction search focus: exclude documents that are obviously NOT statements/ledgers
+            exclude_types = ["computation", "balance sheet", "p&l", "profit", "loss", "ledger", "journal", "capital account", "tax", "computation of income"]
+            skip_docs = {d for d, m in doc_metadata.items() if any(et in str(m.get("document_type", "")).lower() for et in exclude_types) or any(et in (d or "").lower() for et in ["cp.pdf", "computation", "ledger"])}
+            
+            if skip_docs:
+                filtered = [(c, d) for c, d in zip(context_chunks, source_documents) if d not in skip_docs]
+                if filtered:
+                    context_chunks = [c for c, _ in filtered]
+                    source_documents = [d for _, d in filtered]
+                    print(f"[INFO] Transaction search focus (sync): excluded {len(skip_docs)} non-transaction documents: {list(skip_docs)}")
         
         async def process_batch_with_sem(batch, batch_source_docs):
             async with sem:
@@ -707,105 +780,18 @@ class LLMService:
             credit_percentage = (credit_count / len(all_transactions)) * 100
             print(f"[INFO] Credit transactions: {credit_count} ({credit_percentage:.1f}% of total)")
 
+        # APPLY SECONDARY PYTHON FILTER
+        initial_count = len(all_transactions)
+        all_transactions = [tx for tx in all_transactions if not self._should_filter_transaction(tx, question)]
+        if initial_count > len(all_transactions):
+            print(f"[FILTER] Exhaustive answer (sync): Filtered out {initial_count - len(all_transactions)} non-matching transactions.")
+
         return {
             "answer": json.dumps({"transactions": all_transactions}),
             "full_answer": full_answer,
             "sources": list(all_sources)
         }
 
-    def _extract_balance_sheet_from_text(self, text: str) -> Dict[str, Any]:
-        """
-        Deterministically extract a Balance Sheet (Liabilities/Assets) table from text.
-        Works well for fixed-width exported PDFs like karm-bl.pdf.
-        """
-        if not text:
-            return {"found": False}
-
-        t = text.replace("\r", "\n")
-        if "BALANCE SHEET" not in t.upper():
-            return {"found": False}
-
-        liabilities = []
-        assets = []
-
-        # Locate the section header "LIABILITIES ... ASSETS"
-        lines = [ln.rstrip() for ln in t.split("\n")]
-        start_idx = None
-        for i, ln in enumerate(lines):
-            u = ln.upper()
-            # Handle PDFs that space letters: "L I A B I L I T I E S"
-            u_compact = re.sub(r"[^A-Z]", "", u)
-            if ("LIABILITIES" in u or "ASSETS" in u) and ("LIABILITIES" in u_compact and "ASSETS" in u_compact):
-                start_idx = i
-                break
-            if "LIABILITIES" in u and "ASSETS" in u:
-                start_idx = i
-                break
-
-        if start_idx is None:
-            return {"found": False}
-
-        # Parse subsequent lines that look like:
-        # Account Name   Amount   Account Name   Amount
-        amount_re = re.compile(r"(-?\d[\d,]*\.\d{2})")
-
-        for ln in lines[start_idx + 1:]:
-            if not ln.strip():
-                continue
-            u = ln.upper()
-            if "PAGE NO" in u:
-                continue
-            # Stop if we hit signatures/ending marker
-            if "TOTAL" in u and ("====" in ln or "...." in ln):
-                # keep totals line, but still parse it
-                pass
-
-            # Remove decoration
-            cleaned = ln.replace("═", " ").replace("─", " ").replace("*", " ").strip()
-            if not cleaned:
-                continue
-
-            amts = amount_re.findall(cleaned)
-            if len(amts) >= 2:
-                # Use first two amounts as left/right columns
-                left_amt = amts[0]
-                right_amt = amts[1]
-
-                left_name = cleaned.split(left_amt)[0].strip(" .:-")
-                right_part = cleaned.split(left_amt, 1)[1]
-                right_name = right_part.split(right_amt)[0].strip(" .:-")
-
-                if left_name and left_amt:
-                    liabilities.append({"particulars": left_name, "amount": left_amt})
-                if right_name and right_amt:
-                    assets.append({"particulars": right_name, "amount": right_amt})
-            elif len(amts) == 1:
-                # Sometimes only one side exists on a line; try to classify by keywords
-                amt = amts[0]
-                name = cleaned.split(amt)[0].strip(" .:-")
-                if not name:
-                    continue
-                if any(k in u for k in ["ASSET", "ASSEST", "FIXED", "STOCK", "CASH", "BANK", "DEBTOR", "INVENT"]):
-                    assets.append({"particulars": name, "amount": amt})
-                else:
-                    liabilities.append({"particulars": name, "amount": amt})
-
-        # Basic quality check: we should have at least a couple of rows on either side
-        if len(liabilities) < 2 and len(assets) < 2:
-            return {"found": False}
-
-        def md_table(rows: List[Dict[str, str]]) -> str:
-            out = ["| Particulars | Amount |", "|---|---:|"]
-            for r in rows[:200]:  # cap to avoid huge markdown
-                out.append(f"| {r['particulars']} | {r['amount']} |")
-            return "\n".join(out)
-
-        return {
-            "found": True,
-            "liabilities": liabilities,
-            "assets": assets,
-            "markdown": f"**Liabilities**\n\n{md_table(liabilities)}\n\n**Assets**\n\n{md_table(assets)}",
-        }
 
     async def generate_summary_report(
         self,
@@ -814,28 +800,115 @@ class LLMService:
         source_documents: List[str],
     ) -> Dict[str, Any]:
         """
-        Generate summary reports (Balance Sheet / P&L / Computation) for Search.
-        Prefer deterministic parsing when possible; fallback to LLM otherwise.
+        Generate summary reports (Balance Sheet / P&L / Computation) for Search using LLM.
         """
-        q_lower = (question or "").lower()
-        is_balance_sheet = "balance sheet" in q_lower
+        if not context_chunks:
+            return {"answer": "No document content provided.", "sources": []}
 
-        # Combine chunks (already filtered upstream) into a single text block.
-        combined = "\n\n".join(context_chunks or [])
+        # Combine chunks into a single text block for the LLM
+        combined_context = "\n\n".join(context_chunks)
         sources = sorted(set([d for d in source_documents or [] if d and d.lower() != "unknown"]))
 
-        if is_balance_sheet:
-            extracted = self._extract_balance_sheet_from_text(combined)
-            if extracted.get("found"):
-                full_answer = f"## Balance Sheet (extracted from uploaded documents)\n\n{extracted['markdown']}\n\n---\n\n**Sources (uploaded documents used):**\n" + "\n".join([f"- {s}" for s in sources])
-                return {
-                    "answer": json.dumps({"transactions": [], "balance_sheet": {"liabilities": extracted["liabilities"], "assets": extracted["assets"]}}),
-                    "full_answer": full_answer,
-                    "sources": sources,
-                }
+        prompt = f"""You are a specialized financial analyst. Your task is to extract a structured Financial Report (Balance Sheet, Profit & Loss, or Computation of Income) from the provided document context.
 
-        # Fallback to LLM (keeps existing behavior)
-        return await self.generate_answer(question=question, context_chunks=context_chunks, source_documents=source_documents)
+**USER REQUEST:** "{question}"
+
+**DOCUMENT CONTEXT:**
+{combined_context}
+
+**INSTRUCTIONS:**
+1. **CATEGORIZATION ACCURACY (HIGHEST PRIORITY)**:
+   - **EQUITY AND LIABILITIES**: Capital, Loans, Sundry Creditors, Provisions, Outstanding Expenses.
+   - **ASSETS**: Fixed Assets (Cars, Land, Furniture), Sundry Debtors, Bank Balance, Cash in Hand, Deposits, Prepaid Expenses.
+   - **SUNDRY DEBTORS ARE ALWAYS ASSETS**. Do NOT place them in Liabilities.
+   - **SUNDRY CREDITORS ARE ALWAYS LIABILITIES**.
+
+2. **Identify the Report Type**: Determine if the context contains a Balance Sheet, P&L Account, or Computation of Income.
+3. **Handle OCR Artifacts**: Be aware that headers might be spaced out (e.g., "L I A B I L I T I E S") or misspelled (e.g., "ASSESTS"). Use your intelligence to map them correctly.
+4. **Accuracy is Critical**:
+   - For Balance Sheets: Correctly separate **Liabilities/Equity** and **Assets**. (e.g. Loans are Liabilities, Cars/Fixed Assets are Assets).
+   - For P&L: Separate **Income/Revenue** and **Expenses/Expenditure**.
+   - Preserve the exact names and amounts as seen in the document.
+5. **TABLE INTEGRITY**: You MUST produce a single continuous markdown table for each section. **DO NOT** break a table with empty lines or interleaved text. Output EVERY row for a section in one block.
+6. **VERTICALIZATION RULE (CRITICAL)**: Many documents show Liabilities and Assets side-by-side in a 4-column layout. You MUST VERTICALIZE this.
+   - NEVER produce a table with 4 columns (Liabilities, Amount, Assets, Amount).
+   - Process the entire "LIABILITIES" column/side first.
+   - Then process the entire "ASSETS" column/side first.
+   - Output them as TWO SEPARATE TABLES, one after the other.
+5. **BALANCE SHEET COMPLETENESS**: For a Balance Sheet, you MUST provide BOTH an "ASSETS" section AND an "EQUITY AND LIABILITIES" section. Extract all rows for both sides.
+8. **STRICT FORMATTING**: 
+   - **START DIRECTLY** with the first markdown table.
+   - **DO NOT** include any report titles, headers, or introductory text (e.g. NO "BALANCE SHEET").
+   - **DO NOT** use markdown headers (#) or bolding (**).
+   - **DO NOT** wrap the entire response in markdown code blocks (```markdown or ```).
+8. **Output Format**:
+   - **Textual Part**: Start directly with the first markdown table.
+   - **JSON Part**: At the end, include a JSON block with the following structure:
+     - If Balance Sheet: `{{"transactions": [], "balance_sheet": {{"liabilities": [{{"particulars": "...", "amount": "..."}}], "assets": [{{"particulars": "...", "amount": "..."}}]}}}}`
+     - If P&L: `{{"transactions": [], "p_and_l": {{"income": [{{"particulars": "...", "amount": "..."}}], "expenses": [{{"particulars": "...", "amount": "..."}}]}}}}`
+
+**RESPONSE (Markdown + JSON):**
+"""
+        try:
+            print(f"[INFO] Generating LLM-based summary report for: {question[:50]}...")
+            response = await self.llm.ainvoke(prompt)
+            answer = response.content.strip()
+            
+            # Extract JSON and metadata
+            parsed_json = self._extract_json(answer)
+            
+            # Clean up the human-readable answer (remove raw JSON blobs)
+            human_answer = answer
+            human_answer = re.sub(r'```json\s*.*?\s*```', '', human_answer, flags=re.DOTALL)
+            human_lines = []
+            for line in human_answer.split('\n'):
+                line_strip = line.strip()
+                if (line_strip.startswith('{') and line_strip.endswith('}')) or \
+                   (line_strip.startswith('[') and line_strip.endswith(']')):
+                    try:
+                        json.loads(line_strip)
+                        continue
+                    except:
+                        pass
+                human_lines.append(line)
+            human_answer = "\n".join(human_lines).strip()
+
+            # Ensure the structured data is passed back in the 'answer' field for the frontend
+            return {
+                "answer": json.dumps(parsed_json),
+                "full_answer": human_answer,
+                "sources": sources
+            }
+        except Exception as e:
+            print(f"[ERROR] LLM Summary Report generation failed: {e}")
+            raise
+
+    def _should_filter_transaction(self, t: Dict[str, Any], question: str) -> bool:
+        """
+        Hard-coded secondary filter to remove obvious non-matches that the LLM might leak.
+        Returns True if the transaction SHOULD BE FILTERED OUT (removed).
+        """
+        q_lower = (question or "").lower()
+        desc = str(t.get("description", "")).lower()
+        t_type = str(t.get("type", "")).lower()
+        
+        # 1. CASH/ATM STRICT FILTER
+        if any(kw in q_lower for kw in ["cash", "atm", "self", "withdrawal", "wdl"]):
+            # If user asks for CASH, block anything that looks like UPI or NEFT
+            if any(kw in desc for kw in ["upi", "vpa", "@", "paytm", "g-pay", "phonepe", "neft", "imps", "rtgs"]):
+                return True
+            if any(kw in t_type for kw in ["upi", "neft", "imps", "rtgs"]):
+                return True
+                
+        # 2. UPI STRICT FILTER
+        if any(kw in q_lower for kw in ["upi", "vpa"]):
+            # If user asks for UPI, block anything that looks like Cash or ATM
+            if any(kw in desc for kw in ["cash", "atm", "self", "withdrawal", "wdl"]):
+                return True
+            if any(kw in t_type for kw in ["cash", "atm", "withdrawal"]):
+                return True
+                
+        return False
 
     async def stream_exhaustive_answer(
         self,
@@ -898,6 +971,17 @@ class LLMService:
                     print(f"[INFO] Summary focus enabled (stream): filtered to {len(context_chunks)} chunks from {len(keep_docs)} docs")
             else:
                 print("[INFO] Summary focus (stream): No document matches found; using full context to avoid missing data.")
+        elif doc_metadata:
+            # Transaction focus: exclude documents that are obviously NOT statements/ledgers
+            exclude_types = ["computation", "balance sheet", "p&l", "profit", "loss", "ledger", "journal", "capital account", "tax", "computation of income"]
+            skip_docs = {d for d, m in doc_metadata.items() if any(et in str(m.get("document_type", "")).lower() for et in exclude_types) or any(et in (d or "").lower() for et in ["cp.pdf", "computation", "ledger"])}
+            
+            if skip_docs:
+                filtered = [(c, d) for c, d in zip(context_chunks, source_documents) if d not in skip_docs]
+                if filtered:
+                    context_chunks = [c for c, _ in filtered]
+                    source_documents = [d for _, d in filtered]
+                    print(f"[INFO] Transaction search focus: excluded {len(skip_docs)} non-transaction documents: {list(skip_docs)}")
         
         total_batches = (len(context_chunks) + batch_size - 1) // batch_size
         tasks = []
@@ -909,10 +993,14 @@ class LLMService:
 
         print(f"[INFO] Streaming exhaustive extraction: {len(context_chunks)} chunks")
 
+        # Explicitly create Tasks so we can cancel them if the stream is aborted
+        running_tasks = []
         for i in range(0, len(context_chunks), batch_size):
             batch = context_chunks[i:i + batch_size]
             batch_source_docs = source_documents[i:i + batch_size]
-            tasks.append(process_batch_with_sem(batch, batch_source_docs))
+            # Create task directly
+            task = asyncio.create_task(process_batch_with_sem(batch, batch_source_docs))
+            running_tasks.append(task)
 
         completed_count = 0
         all_transactions_count = 0
@@ -923,105 +1011,124 @@ class LLMService:
         all_unique_transactions = []  # Store all unique transactions to extract sources at end
         full_answers = [] # Aggregated textual responses
 
-        for future in asyncio.as_completed(tasks):
-            try:
-                result = await future
-                completed_count += 1
+        try:
+            for future in asyncio.as_completed(running_tasks):
+                try:
+                    result = await future
+                    completed_count += 1
                 
-                # yield progress
-                yield json.dumps({
-                    "type": "progress",
-                    "completed": completed_count,
-                    "total": total_batches,
-                    "percent": int((completed_count / total_batches) * 100)
-                })
+                    # yield progress
+                    yield json.dumps({
+                        "type": "progress",
+                        "completed": completed_count,
+                        "total": total_batches,
+                        "percent": int((completed_count / total_batches) * 100)
+                    })
                 
-                # Collect textual answer (deduplicated for generic "no records" messages)
-                if result.get('full_answer'):
-                    ans = result['full_answer'].strip()
-                    is_empty_msg = '{"transactions": [], "message":' in ans or '{"transactions": []}' in ans
+                    # Collect textual answer
+                    if result.get('full_answer'):
+                        ans = result['full_answer'].strip()
+                        # Skip if it's just boilerplate "not found" or purely JSON-like
+                        is_bad = any(kw in ans.lower() for kw in ["not find", "no transactions", "not available"]) or ans.startswith('{') or ans.startswith('[')
                     
-                    if is_empty_msg:
-                        # Only keep empty message if we have nothing else
-                        if not any('{"transactions": [' in a and ']}' in a and len(a) > 30 for a in full_answers):
+                        if is_bad:
+                            # Only keep if we have nothing else yet
+                            if all_transactions_count == 0 and not full_answers:
+                                full_answers.append(ans)
+                        else:
+                            # If we have real data, remove previous placeholders and JSON
+                            full_answers = [a for a in full_answers if not (any(kw in a.lower() for kw in ["not find", "no transactions", "not available"]) or a.startswith('{') or a.startswith('['))]
                             if ans not in full_answers:
                                 full_answers.append(ans)
-                    else:
-                        # If we have a real answer, we can remove the empty messages
-                        full_answers = [a for a in full_answers if '{"transactions": [], "message":' not in a]
-                        full_answers.append(ans)
 
                 
-                # Process result
-                try:
-                    content = json.loads(result['answer'])
+                    # Process result
+                    try:
+                        content = json.loads(result['answer'])
                     
-                    # DYNAMIC: Find the data list
-                    txs = []
-                    if content.get('transactions'): txs = content['transactions']
-                    elif content.get('data'): txs = content['data']
-                    # Fallback scan values for list
-                    elif not txs:
-                         for val in content.values():
-                            if isinstance(val, list) and val:
-                                txs = val
-                                break
+                        # DYNAMIC: Find the data list
+                        txs = []
+                        if content.get('transactions'): txs = content['transactions']
+                        elif content.get('data'): txs = content['data']
+                        # Fallback scan values for list
+                        elif not txs:
+                             for val in content.values():
+                                if isinstance(val, list) and val:
+                                    txs = val
+                                    break
 
-                    if txs:
-                        unique_txs = []
-                        for t in txs:
-                            # Create a fingerprint to avoid duplicates
-                            # Include direction to prevent credits and debits from being considered duplicates
-                            desc = str(t.get('description', '')).strip().lower()
-                            amt = str(t.get('amount', '0')).replace(',', '').replace('.', '')  # Normalize amount
-                            date = str(t.get('date', ''))
-                            direction = str(t.get('direction', '')).upper()
-                            tx_id = str(t.get('transaction_id', '')).strip()
-                            source_doc = str(t.get('source_document', '')).strip()
-                            bank_name = str(t.get('bank_name', '')).strip()
+                        if txs:
+                            unique_txs = []
+                            for t in txs:
+                                # Create a fingerprint to avoid duplicates
+                                # Include direction to prevent credits and debits from being considered duplicates
+                                desc = str(t.get('description', '')).strip().lower()
+                                amt = str(t.get('amount', '0')).replace(',', '').replace('.', '')  # Normalize amount
+                                date = str(t.get('date', ''))
+                                direction = str(t.get('direction', '')).upper()
+                                tx_id = str(t.get('transaction_id', '')).strip()
+                                source_doc = str(t.get('source_document', '')).strip()
+                                bank_name = str(t.get('bank_name', '')).strip()
                             
-                            # Use transaction_id if available for better uniqueness
-                            if tx_id:
-                                fp = f"{date}|{amt}|{direction}|{tx_id}"
-                            else:
-                                # Include direction, source_document, and bank_name to distinguish similar transactions
-                                # Use first 100 chars of description to handle very long descriptions
-                                desc_short = desc[:100] if len(desc) > 100 else desc
-                                fp = f"{date}|{amt}|{direction}|{desc_short}|{source_doc}|{bank_name}"
+                                # Use transaction_id if available for better uniqueness
+                                if tx_id:
+                                    fp = f"{date}|{amt}|{direction}|{tx_id}"
+                                else:
+                                    # Include direction, source_document, and bank_name to distinguish similar transactions
+                                    # Use first 100 chars of description to handle very long descriptions
+                                    desc_short = desc[:100] if len(desc) > 100 else desc
+                                    fp = f"{date}|{amt}|{direction}|{desc_short}|{source_doc}|{bank_name}"
                             
-                            if fp not in seen_fingerprints:
-                                seen_fingerprints.add(fp)
-                                unique_txs.append(t)
-                                all_unique_transactions.append(t)  # Store for source extraction
-                            else:
-                                # Log when a transaction is being skipped as duplicate
-                                skipped_direction = str(t.get('direction', '')).upper()
-                                if skipped_direction == 'CREDIT':
-                                    print(f"[DEBUG] Skipping duplicate CREDIT transaction: {date}|{amt}|{desc[:50]}")
+                                if fp not in seen_fingerprints:
+                                    # Apply secondary hard-coded filter
+                                    if self._should_filter_transaction(t, question):
+                                        print(f"[FILTER] Dropped non-matching transaction: {desc[:50]}")
+                                        continue
+                                    
+                                    seen_fingerprints.add(fp)
+                                    unique_txs.append(t)
+                                    all_unique_transactions.append(t)  # Store for source extraction
+                                else:
+                                    # Log when a transaction is being skipped as duplicate
+                                    skipped_direction = str(t.get('direction', '')).upper()
+                                    if skipped_direction == 'CREDIT':
+                                        print(f"[DEBUG] Skipping duplicate CREDIT transaction: {date}|{amt}|{desc[:50]}")
 
-                        if unique_txs:
-                            count = len(unique_txs)
-                            batch_credits = sum(1 for tx in unique_txs if str(tx.get('direction', '')).upper() == 'CREDIT')
-                            batch_debits = sum(1 for tx in unique_txs if str(tx.get('direction', '')).upper() == 'DEBIT')
-                            all_credit_count += batch_credits
-                            all_debit_count += batch_debits
-                            print(f"[DEBUG] Stream batch {completed_count}: Found {count} unique items ({batch_credits} CREDITS, {batch_debits} DEBITS)")
-                            print(f"[DEBUG] Stream batch {completed_count}: Yielding {count} transactions to frontend (cumulative: {all_credit_count} CREDITS, {all_debit_count} DEBITS)")
-                            all_transactions_count += count
-                            yield json.dumps({
-                                "type": "data",
-                                "transactions": unique_txs
-                            })
-                    else:
-                        print(f"[DEBUG] Stream batch {completed_count}: No new transactions found")
+                            if unique_txs:
+                                count = len(unique_txs)
+                                batch_credits = sum(1 for tx in unique_txs if str(tx.get('direction', '')).upper() == 'CREDIT')
+                                batch_debits = sum(1 for tx in unique_txs if str(tx.get('direction', '')).upper() == 'DEBIT')
+                                all_credit_count += batch_credits
+                                all_debit_count += batch_debits
+                                print(f"[DEBUG] Stream batch {completed_count}: Found {count} unique items ({batch_credits} CREDITS, {batch_debits} DEBITS)")
+                                print(f"[DEBUG] Stream batch {completed_count}: Yielding {count} transactions to frontend (cumulative: {all_credit_count} CREDITS, {all_debit_count} DEBITS)")
+                                all_transactions_count += count
+                                yield json.dumps({
+                                    "type": "data",
+                                    "transactions": unique_txs
+                                })
+                        else:
+                            print(f"[DEBUG] Stream batch {completed_count}: No new transactions found")
+                        
+                    except Exception as e:
+                        print(f"[WARNING] Failed to parse batch result in stream: {e}")
                         
                 except Exception as e:
-                    print(f"[WARNING] Failed to parse batch result in stream: {e}")
-                        
-            except Exception as e:
-                print(f"[ERROR] Stream batch failed: {e}")
-                yield json.dumps({"type": "error", "message": str(e)})
+                    print(f"[ERROR] Stream batch failed: {e}")
+                    yield json.dumps({"type": "error", "message": str(e)})
 
+        except GeneratorExit:
+            print(f"[INFO] Stream interrupted by client. Cancelling {len([ t for t in running_tasks if not t.done()])} pending tasks...")
+            raise
+        finally:
+            # Ensure all pending tasks are cancelled when the generator exits (success or error)
+            cancelled_count = 0
+            for task in running_tasks:
+                if not task.done():
+                    task.cancel()
+                    cancelled_count += 1
+            if cancelled_count > 0:
+                print(f"[INFO] Cancelled {cancelled_count} pending background tasks.")
         # Extract source documents ONLY from transactions that made it into final results
         for tx in all_unique_transactions:
             source_doc = str(tx.get('source_document', '')).strip()
@@ -1035,18 +1142,25 @@ class LLMService:
                 all_sources = set([d for d in source_documents if d and d.lower() != "unknown"])
 
         # Final summary with credit/debit breakdown
+        final_full_answer = "\n---\n".join(full_answers).strip()
+        # If we found transactions, scrub any remaining "not found" boilerplate from the text
+        if all_transactions_count > 0:
+            not_found_patterns = [
+                "I could not find the requested information in the documents.",
+                "No transactions found",
+                "Information not available in uploaded records"
+            ]
+            for pat in not_found_patterns:
+                final_full_answer = final_full_answer.replace(pat, "")
+            final_full_answer = final_full_answer.replace('{"transactions": []}', "").strip()
+
         print(f"[INFO] Streaming extraction complete: {all_transactions_count} total ({all_credit_count} CREDITS, {all_debit_count} DEBITS)")
-        print(f"[INFO] Source documents with transactions: {len(all_sources)} documents")
-        if all_transactions_count > 10 and all_credit_count == 0:
-            print(f"[WARNING] Large dataset ({all_transactions_count} transactions) with zero credits. This may indicate credit extraction issues.")
-        elif all_credit_count > 0:
-            credit_percentage = (all_credit_count / all_transactions_count) * 100 if all_transactions_count > 0 else 0
-            print(f"[INFO] Credit transactions: {all_credit_count} ({credit_percentage:.1f}% of total)")
         yield json.dumps({
             "type": "summary",
             "total_transactions": all_transactions_count,
             "total_credits": all_credit_count,
             "total_debits": all_debit_count,
             "sources": list(all_sources),
-            "full_answer": "".join(full_answers) # New: include aggregated text answer
+            "full_answer": final_full_answer
         })
+            

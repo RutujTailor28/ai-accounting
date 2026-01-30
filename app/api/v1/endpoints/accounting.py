@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, Request
 from fastapi.responses import StreamingResponse
 from typing import List, Dict, Any
 from uuid import UUID
@@ -17,7 +17,7 @@ router = APIRouter()
 accounting_service = AccountingService()
 
 @router.post("/query")
-async def accounting_query(request: ChatQueryRequest, user=Depends(get_current_user)):
+async def accounting_query(request_body: ChatQueryRequest, request: Request, user=Depends(get_current_user)):
     """
     Generate accounting reports (entries, balance sheets) from workspace documents with streaming.
     """
@@ -27,7 +27,7 @@ async def accounting_query(request: ChatQueryRequest, user=Depends(get_current_u
         company_id = profile_res.data["company_id"]
 
         # Step 1: Resolve Workspace and its documents (High Context)
-        ws_res = supabase.table("workspaces").select("*").eq("id", str(request.workspace_id)).single().execute()
+        ws_res = supabase.table("workspaces").select("*").eq("id", str(request_body.workspace_id)).single().execute()
         if not ws_res.data:
             raise HTTPException(status_code=404, detail="Workspace not found")
             
@@ -50,16 +50,16 @@ async def accounting_query(request: ChatQueryRequest, user=Depends(get_current_u
 
         # Step 2: Retrieve ALL Chunks (High Context for Reports)
         # For accounting reports, we often need the full story, so we pull more results than usual
-        query_embedding = embedding_service.generate_embedding(request.question)
+        query_embedding = embedding_service.generate_embedding(request_body.question)
         
         # Prepare filters
         query_filters = {
-            "file_types": request.file_types,
-            "folder_ids": request.folder_ids,
-            "uploaded_by": request.uploaded_by,
-            "start_date": request.start_date,
-            "end_date": request.end_date,
-            "tags": request.tags
+            "file_types": request_body.file_types,
+            "folder_ids": request_body.folder_ids,
+            "uploaded_by": request_body.uploaded_by,
+            "start_date": request_body.start_date,
+            "end_date": request_body.end_date,
+            "tags": request_body.tags
         }
 
         # For accounting, we need to get ALL chunks from the documents, not just semantically similar ones
@@ -95,9 +95,9 @@ async def accounting_query(request: ChatQueryRequest, user=Depends(get_current_u
             print(f"[INFO] Accounting endpoint: Retrieved {len(chunks)} chunks (ALL chunks from documents) for accounting synthesis")
             
             # Filter out header/footer chunks that don't contain transaction-like patterns
-            transaction_keywords = ['UPI', 'NEFT', 'IMPS', 'RTGS', 'PAYMENT', 'RECEIVED', 'TRANSFER', 
-                                  'DEBIT', 'CREDIT', 'WITHDRAWAL', 'DEPOSIT', 'DATE', '/', 'Rs.', 'AMOUNT',
-                                  'CHQ', 'CHEQUE', 'INSTRUMENT',
+            transaction_keywords = ['CASH', 'WDL', 'ATM', 'WITHDRAWAL', 'SELF', 'UPI', 'NEFT', 'IMPS', 'RTGS', 
+                                  'PAYMENT', 'RECEIVED', 'TRANSFER', 'DEBIT', 'CREDIT', 
+                                  'DEPOSIT', 'DATE', '/', 'Rs.', 'AMOUNT', 'CHQ', 'CHEQUE', 'INSTRUMENT',
                                   '22/', '23/', '24/', '25/', '01/', '02/', '03/', '04/', '05/',
                                   '06/', '07/', '08/', '09/', '10/', '11/', '12/']
             
@@ -177,9 +177,19 @@ async def accounting_query(request: ChatQueryRequest, user=Depends(get_current_u
 
         # Step 3: Define Streaming Generator
         async def stream_generator():
+            # Check if client disconnected before starting
+            if await request.is_disconnected():
+                print("[INFO] Client disconnected before accounting stream started, aborting")
+                return
+            
             full_response = ""
             # Prepare streaming from AccountingService
-            async for token in accounting_service.stream_accounting_synthesis(request.question, chunks, metadatas):
+            async for token in accounting_service.stream_accounting_synthesis(request_body.question, chunks, metadatas):
+                # Check if client disconnected before yielding each token
+                if await request.is_disconnected():
+                    print("[INFO] ✅ Client disconnected during accounting streaming, stopping processing")
+                    return
+                
                 if isinstance(token, dict):
                      # Status update (already a dict, just wrap in data)
                      yield f"data: {json.dumps(token)}\n\n"
@@ -188,20 +198,25 @@ async def accounting_query(request: ChatQueryRequest, user=Depends(get_current_u
                     # SSE Format: data: <payload>\n\n
                     yield f"data: {json.dumps({'token': token})}\n\n"
             
+            # Check disconnection before saving history
+            if await request.is_disconnected():
+                print("[INFO] Client disconnected before saving history, skipping save")
+                return
+            
             # Step 4: After stream finishes, save to history
             try:
                 # Check if session is new to set the title
-                history_check = supabase.table("chat_messages").select("id").eq("session_id", str(request.session_id)).limit(1).execute()
+                history_check = supabase.table("chat_messages").select("id").eq("session_id", str(request_body.session_id)).limit(1).execute()
                 session_title = None
                 if not history_check.data:
-                    session_title = request.question[:100]
+                    session_title = request_body.question[:100]
 
                 # Save User Question
                 user_msg_data = {
-                    "session_id": str(request.session_id),
-                    "workspace_id": str(request.workspace_id),
+                    "session_id": str(request_body.session_id),
+                    "workspace_id": str(request_body.workspace_id),
                     "role": "user",
-                    "content": request.question,
+                    "content": request_body.question,
                     "company_id": company_id,
                     "created_by": user.id
                 }
@@ -215,8 +230,8 @@ async def accounting_query(request: ChatQueryRequest, user=Depends(get_current_u
                 structured_tables = await accounting_service.get_all_structured_tables(full_response)
                 
                 msg_data = {
-                    "session_id": str(request.session_id),
-                    "workspace_id": str(request.workspace_id),
+                    "session_id": str(request_body.session_id),
+                    "workspace_id": str(request_body.workspace_id),
                     "role": "assistant",
                     "content": full_response,
                     "company_id": company_id,

@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Depends, Query
+from fastapi import APIRouter, HTTPException, Depends, Query, Request
 from fastapi.responses import StreamingResponse
 from app.schemas.document import QueryRequest, QueryResponse
 from app.ai.rag.retriever import vector_store
@@ -59,19 +59,19 @@ async def debug_document_chunks(
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/query/stream")
-async def stream_query_documents(request: QueryRequest, user=Depends(get_current_user)):
+async def stream_query_documents(request_body: QueryRequest, request: Request, user=Depends(get_current_user)):
     """
     Stream query results for real-time updates (NDJSON format).
     """
     try:
-        print(f"[INFO] Received STREAM query request: question='{request.question}', company_id={request.company_id}")
-        print(f"[INFO] Filters - file_types: {request.file_types}, folder_ids: {request.folder_ids}, uploaded_by: {request.uploaded_by}, tags: {request.tags}")
+        print(f"[INFO] Received STREAM query request: question='{request_body.question}', company_id={request_body.company_id}")
+        print(f"[INFO] Filters - file_types: {request_body.file_types}, folder_ids: {request_body.folder_ids}, uploaded_by: {request_body.uploaded_by}, tags: {request_body.tags}")
         
         # Step 1: Generate Embedding
-        query_embedding = embedding_service.generate_embedding(request.question)
+        query_embedding = embedding_service.generate_embedding(request_body.question)
         
         # Step 2: Retrieve Relevant Chunks
-        count = vector_store.get_collection_count(company_id=request.company_id)
+        count = vector_store.get_collection_count(company_id=request_body.company_id)
         
         if count == 0:
             async def empty_gen():
@@ -79,9 +79,10 @@ async def stream_query_documents(request: QueryRequest, user=Depends(get_current
             return StreamingResponse(empty_gen(), media_type="application/x-ndjson")
 
         # Retrieval logic
-        q_lower = request.question.lower()
+        q_lower = request_body.question.lower()
         is_exhaustive = any(kw in q_lower for kw in [
-            "all", "every", "sum", "total", "exhaustive", "upi", "cheque", "chq", "instrument"
+            "all", "every", "sum", "total", "exhaustive", "upi", "cheque", "chq", "instrument",
+            "cash", "atm", "self", "withdrawal"
         ])
         # Summary/report questions should also scan broadly; otherwise top-k may miss the table.
         is_summary = any(kw in q_lower for kw in ["balance sheet", "p&l", "profit", "loss", "report", "summary", "computation"])
@@ -91,24 +92,24 @@ async def stream_query_documents(request: QueryRequest, user=Depends(get_current
             print(f"[INFO] Streaming exhaustive extraction for {total_chunks} chunks (is_exhaustive={is_exhaustive}, is_summary={is_summary})")
             results = vector_store.query(
                 query_embedding, 
-                company_id=request.company_id, 
+                company_id=request_body.company_id, 
                 n_results=total_chunks,
-                file_types=request.file_types,
-                folder_ids=request.folder_ids,
-                uploaded_by=request.uploaded_by,
-                tags=request.tags
+                file_types=request_body.file_types,
+                folder_ids=request_body.folder_ids,
+                uploaded_by=request_body.uploaded_by,
+                tags=request_body.tags
             )
         else:
             n_results = 10
             print(f"[INFO] Standard answer mode triggered (n_results={n_results})")
             results = vector_store.query(
                 query_embedding, 
-                company_id=request.company_id, 
+                company_id=request_body.company_id, 
                 n_results=n_results,
-                file_types=request.file_types,
-                folder_ids=request.folder_ids,
-                uploaded_by=request.uploaded_by,
-                tags=request.tags
+                file_types=request_body.file_types,
+                folder_ids=request_body.folder_ids,
+                uploaded_by=request_body.uploaded_by,
+                tags=request_body.tags
             )
         
         # Access the query results correctly
@@ -125,10 +126,15 @@ async def stream_query_documents(request: QueryRequest, user=Depends(get_current
         # Step 3: Stream generation
         async def response_generator():
             try:
+                # Check if client disconnected before starting
+                if await request.is_disconnected():
+                    print("[INFO] Client disconnected before streaming started, aborting")
+                    return
+                
                 if is_summary:
                     # Filter down to likely report documents to avoid massive contexts
                     # Match by keywords in question and document name
-                    ql = (request.question or "").lower()
+                    ql = (request_body.question or "").lower()
                     
                     def _is_relevant_doc(doc_name: str) -> bool:
                         dn = (doc_name or "").lower()
@@ -154,10 +160,16 @@ async def stream_query_documents(request: QueryRequest, user=Depends(get_current
 
                     # Summary reports: return a single deterministic summary when possible
                     result = await llm_service.generate_summary_report(
-                        question=request.question,
+                        question=request_body.question,
                         context_chunks=documents_local,
                         source_documents=source_documents_local,
                     )
+                    
+                    # Check disconnection before yielding
+                    if await request.is_disconnected():
+                        print("[INFO] Client disconnected during summary generation, stopping")
+                        return
+                    
                     yield json.dumps({
                         "type": "summary",
                         "total_transactions": 0,
@@ -169,20 +181,30 @@ async def stream_query_documents(request: QueryRequest, user=Depends(get_current
                     return
                 elif is_exhaustive:
                     async for chunk in llm_service.stream_exhaustive_answer(
-                        question=request.question,
+                        question=request_body.question,
                         context_chunks=documents,
                         source_documents=source_documents,
                         batch_size=20 # Reduced for higher precision and completeness
                     ):
+                        # Check if client disconnected before yielding each chunk
+                        if await request.is_disconnected():
+                            print("[INFO] ✅ Client disconnected during exhaustive streaming, stopping processing")
+                            return
                         yield chunk + "\n"
                 else:
                     # Standard mode: just generate and yield once
                     print(f"[INFO] Standard answer mode triggered (Streaming wrapper)")
                     result = await llm_service.generate_answer(
-                        question=request.question,
+                        question=request_body.question,
                         context_chunks=documents,
                         source_documents=source_documents
                     )
+                    
+                    # Check disconnection before processing result
+                    if await request.is_disconnected():
+                        print("[INFO] Client disconnected during standard answer generation, stopping")
+                        return
+                    
                     total_txs = 0
                     try:
                         # Use the helper to extract JSON even if markdown is present
@@ -237,7 +259,8 @@ async def query_documents(request: QueryRequest, user=Depends(get_current_user))
         # Retrieval logic based on question intent
         # Added more keywords to ensure financial queries trigger exhaustive search
         is_exhaustive = any(kw in request.question.lower() for kw in [
-            "all", "every", "sum", "total", "exhaustive", "upi", "cheque", "chq", "instrument"
+            "all", "every", "sum", "total", "exhaustive", "upi", "cheque", "chq", "instrument",
+            "cash", "atm", "self", "withdrawal"
         ])
         
         if is_exhaustive:

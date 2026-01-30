@@ -93,6 +93,7 @@ async def list_folder_files(folder_id: UUID, user=Depends(get_current_user)):
         result = supabase.table("files") \
             .select("*") \
             .eq("folder_id", str(folder_id)) \
+            .is_("deleted_at", "null") \
             .order("created_at", desc=True) \
             .execute()
         

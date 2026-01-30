@@ -49,14 +49,15 @@ class AccountingService:
         normalized = re.sub(r'[^a-zA-Z0-9]', '', narration).lower()
         return normalized
 
-    async def _extract_transactions_from_batch(self, batch_chunks: List[str]) -> List[Dict]:
+    async def _extract_transactions_from_batch(self, batch_chunks: List[str], context_query: str = None) -> List[Dict]:
         """
         Extract structured transaction data from a small batch of chunks.
         Uses content-based caching to ensure identical chunks produce identical results.
         """
         # Create a deterministic hash of the batch content for caching
         context = "\n".join(batch_chunks)
-        content_hash = hashlib.sha256(context.encode('utf-8')).hexdigest()
+        query_part = f"_{context_query}" if context_query else ""
+        content_hash = hashlib.sha256((context + query_part).encode('utf-8')).hexdigest()
         
         # Check cache first
         if content_hash in self.extraction_cache:
@@ -66,20 +67,32 @@ class AccountingService:
         # Injection of already seen accounts to prevent duplicates
         known_accounts_str = ", ".join(list(self.shared_accounts)[:50]) if self.shared_accounts else "None yet"
         
+        query_instruction = ""
+        if context_query:
+            query_instruction = f"""
+        USER INTENT: "{context_query}"
+        
+        STRICT PRE-FILTERING (MANDATORY):
+        1. Identify if the user is asking for a SPECIFIC transaction type (Cash, UPI, etc.).
+        2. FOR EACH TRANSACTION in the text:
+           - If it does NOT match the requested type, STOP and SKIP it.
+           - If it IS AMBIGUOUS, SKIP IT.
+        3. CASH SEARCH: Exclude any line containing UPI, VPA, NEFT, or @ markers.
+        4. UPI SEARCH: Exclude any line containing CASH, ATM, or WITHDRAWAL markers.
+        """
+
         prompt = f"""
         You are an expert Data Entry Clerk. Your task is to extract accounting transactions from the text below.
-        
+        {query_instruction}
+
         INPUT TEXT:
         {context}
         
-        KNOWN CHART OF ACCOUNTS (Use these names if they match to ensure consistency):
-        {known_accounts_str}
-        
         INSTRUCTIONS:
-        1. Extract EVERY transaction found.
-        2. **LITERAL NARRATION**: Preserve the original narration EXACTLY as it appears in the text. Do not truncate, summarize, or modify the narration.
+        1. Extract ONLY matching transactions based on the USER INTENT.
+        2. **LITERAL NARRATION**: Preserve the original narration EXACTLY.
         3. **DETERMINISTIC DATES**: Extract dates in DD/MM/YYYY format.
-        4. **DOUBLE ENTRY PRINCIPLE**: Every transaction must have at least TWO entries (Debit & Credit).
+        4. **DOUBLE ENTRY PRINCIPLE**: Every transaction must have at least TWO entries (Debit & Credit). One side is ALWAYS "Bank Account".
            - **Bank Account**: One side is ALWAYS "Bank Account".
              - If statement says DEBIT (Money Out) -> Books: Credit "Bank Account" and Debit an **EXPENSE** or **ASSET** account. (NEVER Debit "Sales" for Money Out unless it is a refund).
              - If statement says CREDIT (Money In) -> Books: Debit "Bank Account" and Credit an **INCOME** or **LIABILITY** account.
@@ -157,9 +170,9 @@ class AccountingService:
             yield "[ERROR] No context data provided."
             return
 
-        # ---------------------------------------------------------
+        
         # PHASE 1: BATCH EXTRACTION (Map Step)
-        # ---------------------------------------------------------
+        
         total_chunks = len(context_chunks)
         BATCH_SIZE = 50 # Increased for faster processing of large documents.
         
@@ -180,7 +193,7 @@ class AccountingService:
             async with sem:
                 # Add a small stagger to prevent all requests hitting exactly at t=0
                 await asyncio.sleep(index * 0.1) 
-                transactions = await self._extract_transactions_from_batch(batch_data)
+                transactions = await self._extract_transactions_from_batch(batch_data, context_query=question)
                 
                 # Tag transactions with source metadata for robust deduplication
                 if transactions and batch_metas:
@@ -277,9 +290,9 @@ class AccountingService:
         
         yield {"status": f"Verifying Double-Entry Integrity for {len(all_transactions)} unique transactions..."}
 
-        # ---------------------------------------------------------
+        
         # PHASE 2: FINANCIAL PROCESSING (Python Core)
-        # ---------------------------------------------------------
+        
         
         # Data Structures for Financial Statements
         ledger_balances: Dict[str, float] = {}
@@ -313,7 +326,7 @@ class AccountingService:
             
             if abs(dr_total - cr_total) > 0.01:
                 print(f"[ERROR] Transaction Imbalance: Dr {dr_total} != Cr {cr_total} for {narration}")
-                continue
+                continue    
                 
             tx_count += 1
             
@@ -368,15 +381,15 @@ class AccountingService:
             "rows": journal_rows_data
         })
 
-        # ---------------------------------------------------------
+        
         # PHASE 3: REPORT GENERATION (LLM Synthesis with Rules)
-        # ---------------------------------------------------------
+        
         
         yield {"status": "Compiling Trial Balance..."}
         
-        # ---------------------------------------------------------
+        
         # DETERMINISTIC CLASSIFICATION (VOTING)
-        # ---------------------------------------------------------
+        
         # Resolve categories by majority vote to prevent batch-order randomness
         from collections import Counter
         account_categories: Dict[str, str] = {}
@@ -457,13 +470,12 @@ class AccountingService:
         })
 
         if abs(total_debits - total_credits) > 0.01:
-            yield f"\n⚠️ IMBALANCE DETECTED: A mismatch of ₹ {abs(total_debits - total_credits):,.2f} was found in the data extraction. A Suspense Account has been added to balance the books.\n"
+            yield f"\n IMBALANCE DETECTED: A mismatch of ₹ {abs(total_debits - total_credits):,.2f} was found in the data extraction. A Suspense Account has been added to balance the books.\n"
 
         yield {"status": "Synthesizing Final Balance Sheet with AI..."}
 
-        # ---------------------------------------------------------
+        
         # PHASE 3: REPORT GENERATION (AI-Led Synthesis)
-        # ---------------------------------------------------------
         # We provide the AI with the clean Trial Balance and strict accounting rules.
         # AI manages all calculations (P&L, Net Profit, BS Tally).
         

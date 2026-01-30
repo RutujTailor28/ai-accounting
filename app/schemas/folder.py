@@ -33,6 +33,7 @@ class FileBase(CamelModel):
     s3_url: str
     file_type: str
     company_id: str
+    size: Optional[int] = None
 
 
 class FileResponse(FileBase):
