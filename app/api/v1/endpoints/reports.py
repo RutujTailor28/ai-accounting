@@ -5,6 +5,7 @@ from app.ai.rag.retriever import vector_store
 from app.services.deps import embedding_service, llm_service
 from app.api.deps import get_current_user
 import json
+from app.core.supabase import supabase
 
 router = APIRouter()
 
@@ -73,6 +74,8 @@ async def stream_query_documents(request_body: QueryRequest, request: Request, u
 
         # Resolve customer_id to folder_ids if provided
         folder_ids = request_body.folder_ids or []
+        target_document_names = []
+        
         if request_body.customer_id:
             customer_folders = supabase.table("folders") \
                 .select("id") \
@@ -82,13 +85,26 @@ async def stream_query_documents(request_body: QueryRequest, request: Request, u
             
             if customer_folders.data:
                 customer_folder_ids = [f["id"] for f in customer_folders.data]
+                
+                # Fetch all files in these folders to get document names
+                if customer_folder_ids:
+                    customer_files = supabase.table("files") \
+                        .select("name") \
+                        .in_("folder_id", customer_folder_ids) \
+                        .is_("deleted_at", "null") \
+                        .execute()
+                    
+                    if customer_files.data:
+                        target_document_names = [f["name"] for f in customer_files.data]
+                        print(f"[INFO] Resolved {len(target_document_names)} documents for customer {request_body.customer_id}")
+                
                 if folder_ids:
                     # If folder_ids were already provided, intersect them
                     folder_ids = list(set(folder_ids) & set(customer_folder_ids))
                 else:
                     folder_ids = customer_folder_ids
             
-            if not folder_ids:
+            if not folder_ids and not target_document_names:
                 # If a customer was selected but has no folders/documents
                 async def no_customer_docs_gen():
                     yield json.dumps({"type": "summary", "total_transactions": 0, "sources": [], "message": "No documents found for this customer."}) + "\n"
@@ -112,17 +128,71 @@ async def stream_query_documents(request_body: QueryRequest, request: Request, u
         is_summary = any(kw in q_lower for kw in ["balance sheet", "p&l", "profit", "loss", "report", "summary", "computation"])
         
         if is_exhaustive or is_summary:
-            total_chunks = count
-            print(f"[INFO] Streaming exhaustive extraction for {total_chunks} chunks (is_exhaustive={is_exhaustive}, is_summary={is_summary})")
-            results = vector_store.query(
-                query_embedding, 
-                company_id=request_body.company_id, 
-                n_results=total_chunks,
-                file_types=request_body.file_types,
-                folder_ids=folder_ids if folder_ids else None,
-                uploaded_by=request_body.uploaded_by,
-                tags=request_body.tags
+            print(f"[INFO] Streaming exhaustive extraction for ALL chunks (is_exhaustive={is_exhaustive}, is_summary={is_summary})")
+            
+            # Manual Pagination Loop to fetch ALL chunks safely
+            all_chunks = []
+            all_metadatas = []
+            
+            offset = 0
+            limit = 5000
+            
+            where_filter = vector_store._build_where_filter(
+                 company_id=request_body.company_id,
+                 document_names=target_document_names if target_document_names else None,
+                 file_types=request_body.file_types,
+                 uploaded_by=request_body.uploaded_by,
+                 tags=request_body.tags
             )
+            
+            print(f"[INFO] Fetching all chunks with filter: {where_filter}...")
+            
+            while True:
+                batch = vector_store.collection.get(
+                    where=where_filter,
+                    include=['documents', 'metadatas'],
+                    limit=limit,
+                    offset=offset
+                )
+                
+                b_docs = batch.get('documents', [])
+                b_metas = batch.get('metadatas', [])
+                
+                if not b_docs:
+                    break
+                    
+                all_chunks.extend(b_docs)
+                all_metadatas.extend(b_metas)
+                
+                offset += len(b_docs)
+                if len(b_docs) < limit:
+                    break
+            
+            # Deterministic Sorting
+            # Key: (Document Name, Chunk Index)
+            combined = []
+            for i in range(len(all_chunks)):
+                meta = all_metadatas[i] or {}
+                # Tie-breaker: content snippet
+                sort_key = (
+                    meta.get('document_name', ''),
+                    int(meta.get('chunk_index', 0)),
+                    all_chunks[i][:20]
+                )
+                combined.append((sort_key, all_chunks[i], meta))
+            
+            combined.sort(key=lambda x: x[0])
+            
+            sorted_chunks = [x[1] for x in combined]
+            sorted_metas = [x[2] for x in combined]
+            
+            print(f"[INFO] Retrieved and sorted {len(sorted_chunks)} chunks for processing")
+            
+            # Mimic expected structure
+            results = {
+                'documents': [sorted_chunks],
+                'metadatas': [sorted_metas]
+            }
         else:
             n_results = 10
             print(f"[INFO] Standard answer mode triggered (n_results={n_results})")
@@ -131,7 +201,8 @@ async def stream_query_documents(request_body: QueryRequest, request: Request, u
                 company_id=request_body.company_id, 
                 n_results=n_results,
                 file_types=request_body.file_types,
-                folder_ids=folder_ids if folder_ids else None,
+                folder_ids=None, # Disable folder filter
+                document_names=target_document_names if target_document_names else None,
                 uploaded_by=request_body.uploaded_by,
                 tags=request_body.tags
             )
@@ -208,7 +279,7 @@ async def stream_query_documents(request_body: QueryRequest, request: Request, u
                         question=request_body.question,
                         context_chunks=documents,
                         source_documents=source_documents,
-                        batch_size=20 # Reduced for higher precision and completeness
+                        batch_size=10 # Reduced to 10 to prevent JSON parsing errors and improve accuracy
                     ):
                         # Check if client disconnected before yielding each chunk
                         if await request.is_disconnected():
@@ -272,6 +343,8 @@ async def query_documents(request: QueryRequest, user=Depends(get_current_user))
         
         # Resolve customer_id to folder_ids if provided
         folder_ids = request.folder_ids or []
+        target_document_names = []
+        
         if request.customer_id:
             customer_folders = supabase.table("folders") \
                 .select("id") \
@@ -281,13 +354,26 @@ async def query_documents(request: QueryRequest, user=Depends(get_current_user))
             
             if customer_folders.data:
                 customer_folder_ids = [f["id"] for f in customer_folders.data]
+                
+                # Fetch all files in these folders
+                if customer_folder_ids:
+                    customer_files = supabase.table("files") \
+                        .select("name") \
+                        .in_("folder_id", customer_folder_ids) \
+                        .is_("deleted_at", "null") \
+                        .execute()
+                    
+                    if customer_files.data:
+                        target_document_names = [f["name"] for f in customer_files.data]
+                        print(f"[INFO] Resolved {len(target_document_names)} documents for customer {request.customer_id}")
+
                 if folder_ids:
                     # If folder_ids were already provided, intersect them
                     folder_ids = list(set(folder_ids) & set(customer_folder_ids))
                 else:
                     folder_ids = customer_folder_ids
             
-            if not folder_ids:
+            if not folder_ids and not target_document_names:
                 # If a customer was selected but has no folders/documents
                 return QueryResponse(
                     answer="No documents found for this customer.",
@@ -314,17 +400,65 @@ async def query_documents(request: QueryRequest, user=Depends(get_current_user))
         if is_exhaustive:
             print(f"[INFO] Exhaustive extraction mode triggered due to keywords in question")
             # User has paid plan: Retrieve ALL chunks to ensure we don't miss transaction data
-            total_chunks = count
-            print(f"[INFO] Retrieving ALL {total_chunks} chunks for exhaustive extraction (Paid Plan Enabled)")
-            results = vector_store.query(
-                query_embedding, 
-                company_id=request.company_id, 
-                n_results=total_chunks,
-                file_types=request.file_types,
-                folder_ids=folder_ids if folder_ids else None,
-                uploaded_by=request.uploaded_by,
-                tags=request.tags
+            print(f"[INFO] Retrieving ALL chunks for exhaustive extraction (Paid Plan Enabled) - Pagination & Sort")
+            
+            # Manual Pagination Loop
+            all_chunks = []
+            all_metadatas = []
+            offset = 0
+            limit = 5000
+            
+            where_filter = vector_store._build_where_filter(
+                 company_id=request.company_id,
+                 document_names=target_document_names if target_document_names else None,
+                 file_types=request.file_types,
+                 uploaded_by=request.uploaded_by,
+                 tags=request.tags
             )
+            
+            while True:
+                batch = vector_store.collection.get(
+                    where=where_filter,
+                    include=['documents', 'metadatas'],
+                    limit=limit,
+                    offset=offset
+                )
+                
+                b_docs = batch.get('documents', [])
+                b_metas = batch.get('metadatas', [])
+                
+                if not b_docs:
+                    break
+                    
+                all_chunks.extend(b_docs)
+                all_metadatas.extend(b_metas)
+                
+                offset += len(b_docs)
+                if len(b_docs) < limit:
+                    break
+            
+            # Deterministic Sorting
+            combined = []
+            for i in range(len(all_chunks)):
+                meta = all_metadatas[i] or {}
+                sort_key = (
+                    meta.get('document_name', ''),
+                    int(meta.get('chunk_index', 0)),
+                    all_chunks[i][:20]
+                )
+                combined.append((sort_key, all_chunks[i], meta))
+            
+            combined.sort(key=lambda x: x[0])
+            
+            sorted_chunks = [x[1] for x in combined]
+            sorted_metas = [x[2] for x in combined]
+            
+            print(f"[INFO] Retrieved and sorted {len(sorted_chunks)} chunks for processing")
+            
+            results = {
+                'documents': [sorted_chunks],
+                'metadatas': [sorted_metas]
+            }
         else:
             # For summary reports, increase chunk count to ensure we find the report table
             is_summary = any(kw in request.question.lower() for kw in ["balance sheet", "p&l", "profit", "loss", "report", "summary", "computation"])
@@ -335,7 +469,8 @@ async def query_documents(request: QueryRequest, user=Depends(get_current_user))
                 company_id=request.company_id, 
                 n_results=n_results,
                 file_types=request.file_types,
-                folder_ids=folder_ids if folder_ids else None,
+                folder_ids=None, # Disable folder filter
+                document_names=target_document_names if target_document_names else None,
                 uploaded_by=request.uploaded_by,
                 tags=request.tags
             )

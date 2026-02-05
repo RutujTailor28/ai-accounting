@@ -1,5 +1,5 @@
 from typing import List, Optional
-from datetime import datetime
+import datetime
 from pydantic import Field
 from .base import CamelModel
 
@@ -31,5 +31,23 @@ class UserResponse(CamelModel):
     first_name: Optional[str] = None
     last_name: Optional[str] = None
     company_id: Optional[str] = None
-    created_at: datetime
+    created_at: datetime.datetime
     roles: List[str] = Field(default_factory=list)
+
+
+class ProfileUpdate(CamelModel):
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+
+
+class ProfileResponse(CamelModel):
+    id: str
+    email: str
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    company_id: Optional[str] = None
+    role: str = "user"
+    permissions: List[str] = []
+
+    class Config:
+        from_attributes = True

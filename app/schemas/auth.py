@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, List
 from .base import CamelModel
 
 class UserLogin(CamelModel):
@@ -20,6 +20,8 @@ class LoginResponse(CamelModel):
     email: str
     company_id: str
     company_name: Optional[str] = None
+    role: str = "user"
+    permissions: List[str] = []
 
 class TokenRefreshRequest(CamelModel):
     refresh_token: str

@@ -3,6 +3,8 @@ from app.schemas.auth import UserLogin, LoginResponse, ForgotPasswordRequest, Re
 from app.core.supabase import supabase, supabase_admin
 import uuid
 from app.api.deps import get_current_user
+from app.schemas.user import ProfileResponse, ProfileUpdate
+from app.schemas.company import CompanyResponse, CompanyUpdate
 
 router = APIRouter()
 
@@ -73,12 +75,22 @@ async def signup(data: UserRegister):
             "email": email,
             "company_id": company_id,
             "first_name": data.first_name,
-            "last_name": data.last_name,
-            "role": "admin"
+            "last_name": data.last_name
         }
         
         # Using upsert to handle case where profile might already exist (e.g. from previous failed attempt)
         profile_res = supabase_admin.table("profiles").upsert(profile_data).execute()
+
+        # Step 6: Assign 'admin' role to the first user
+        try:
+            role_res = supabase_admin.table("roles").select("id").eq("name", "admin").single().execute()
+            if role_res.data:
+                supabase_admin.table("user_roles").insert({
+                    "user_id": user_id,
+                    "role_id": role_res.data['id']
+                }).execute()
+        except Exception as role_e:
+            print(f"[WARNING] Failed to assign admin role: {str(role_e)}")
         
         if not profile_res.data:
             print(f"[ERROR] Failed to create profile for user {auth_res.user.id}")
@@ -189,6 +201,26 @@ async def login(credentials: UserLogin):
                 detail="User profile could not be created. Please contact your administrator."
             )
 
+        # Fetch role and permissions
+        role = "user"
+        permissions = []
+        try:
+            role_res = supabase_admin.table("user_roles").select("roles(name, permissions)").eq("user_id", response.user.id).execute()
+            print(f"[DEBUG] Role fetch result for {response.user.email}: {role_res.data}")
+            if role_res.data:
+                # Handle potential structure variations
+                item = role_res.data[0]
+                role_info = item.get("roles", {})
+                if isinstance(role_info, dict):
+                    role = role_info.get("name", "user")
+                    permissions = role_info.get("permissions", [])
+                elif isinstance(role_info, list) and len(role_info) > 0:
+                     role = role_info[0].get("name", "user")
+                     permissions = role_info[0].get("permissions", [])
+            print(f"[DEBUG] Determined role: {role}, permissions: {permissions}")
+        except Exception as e:
+            print(f"[WARNING] Could not fetch user role: {str(e)}")
+
         # Ensure we return valid strings, not None for required fields
         return LoginResponse(
             access_token=str(response.session.access_token),
@@ -196,7 +228,9 @@ async def login(credentials: UserLogin):
             user_id=str(response.user.id),
             email=str(response.user.email),
             company_id=str(company_id),
-            company_name=str(company_name) if company_name else None
+            company_name=str(company_name) if company_name else None,
+            role=role,
+            permissions=permissions
         )
     except HTTPException:
         raise
@@ -228,12 +262,26 @@ async def get_me(user=Depends(get_current_user)):
         # Prefer name from company table
         company_name = profile_res.data.get("company", {}).get("name") if profile_res.data.get("company") else None
 
+    # Fetch role and permissions
+    role = "user"
+    permissions = []
+    try:
+        role_res = supabase_admin.table("user_roles").select("roles(name, permissions)").eq("user_id", user.id).execute()
+        if role_res.data:
+            role_info = role_res.data[0].get("roles", {})
+            role = role_info.get("name", "user")
+            permissions = role_info.get("permissions", [])
+    except Exception as e:
+        print(f"[WARNING] Could not fetch user role in get_me: {str(e)}")
+
     return {
         "userId": user.id,
         "email": user.email,
         "companyId": company_id,
         "companyName": company_name,
-        "lastSignIn": user.last_sign_in_at
+        "lastSignIn": user.last_sign_in_at,
+        "role": role,
+        "permissions": permissions
     }
 
 @router.post("/forgot-password")
@@ -308,6 +356,15 @@ async def refresh_token(data: TokenRefreshRequest):
             except Exception as e:
                 print(f"[AUTH] Failed to fetch company_info in refresh: {str(e)}")
  
+        # Fetch role
+        role = "user"
+        try:
+            role_res = supabase_admin.table("user_roles").select("roles(name)").eq("user_id", response.user.id).execute()
+            if role_res.data:
+                role = role_res.data[0].get("roles", {}).get("name", "user")
+        except Exception as e:
+            print(f"[WARNING] Could not fetch user role in refresh: {str(e)}")
+
         # Ensure we return valid strings, not None for required fields
         return LoginResponse(
             access_token=str(response.session.access_token),
@@ -315,7 +372,8 @@ async def refresh_token(data: TokenRefreshRequest):
             user_id=str(response.user.id),
             email=str(response.user.email),
             company_id=str(company_id) if company_id else "",
-            company_name=str(company_name) if company_name else None
+            company_name=str(company_name) if company_name else None,
+            role=role
         )
     except Exception as e:
         print(f"[ERROR] token refresh failed: {str(e)}")
@@ -328,14 +386,93 @@ async def refresh_token(data: TokenRefreshRequest):
 async def get_company_details(company_id: str, _user=Depends(get_current_user)):
     """
     Get company details by ID.
+    Uses supabase_admin to bypass RLS for service-to-service communication.
     """
     try:
-        res = supabase.table("company").select("*").eq("id", company_id).single().execute()
+        # Using supabase_admin to ensure we can fetch company even with RLS enabled
+        res = supabase_admin.table("company").select("*").eq("id", company_id).single().execute()
         if not res.data:
-            # Fallback for transient state
+            print(f"[DEBUG] Company {company_id} not found in database, returning placeholder")
             return {"id": company_id, "name": "My Company"}
         return res.data
     except Exception as e:
+        # PGRST116 often means 0 rows found when .single() is used
+        if "PGRST116" in str(e):
+            print(f"[DEBUG] Company {company_id} not found (.single()), returning placeholder")
+            return {"id": company_id, "name": "My Company"}
+            
         print(f"[ERROR] Failed to fetch company {company_id}: {str(e)}")
         # Return a sensible fallback instead of 404/500 to keep UI happy
         return {"id": company_id, "name": "My Company"}
+
+
+@router.get("/profile", response_model=ProfileResponse)
+async def get_profile(user=Depends(get_current_user)):
+    """Get current user's profile info."""
+    try:
+        res = supabase_admin.table("profiles").select("*").eq("id", user.id).single().execute()
+        if not res.data:
+            raise HTTPException(status_code=404, detail="Profile not found")
+        return res.data
+    except Exception as e:
+        if isinstance(e, HTTPException): raise e
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.patch("/profile", response_model=ProfileResponse)
+async def update_profile(data: ProfileUpdate, user=Depends(get_current_user)):
+    """Update current user's profile info."""
+    try:
+        update_data = data.model_dump(exclude_unset=True)
+        if not update_data:
+            return await get_profile(user)
+        
+        res = supabase_admin.table("profiles").update(update_data).eq("id", user.id).execute()
+        if not res.data:
+            raise HTTPException(status_code=404, detail="Profile not found")
+        return res.data[0]
+    except Exception as e:
+        if isinstance(e, HTTPException): raise e
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/company", response_model=CompanyResponse)
+async def get_current_company(user=Depends(get_current_user)):
+    """Get current user's company info."""
+    try:
+        # Get company_id from profile
+        profile = supabase_admin.table("profiles").select("company_id").eq("id", user.id).single().execute()
+        if not profile.data or not profile.data.get("company_id"):
+            raise HTTPException(status_code=400, detail="User has no company assigned")
+        
+        company_id = profile.data["company_id"]
+        res = supabase_admin.table("company").select("*").eq("id", company_id).single().execute()
+        if not res.data:
+            raise HTTPException(status_code=404, detail="Company not found")
+        return res.data
+    except Exception as e:
+        if isinstance(e, HTTPException): raise e
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.patch("/company", response_model=CompanyResponse)
+async def update_current_company(data: CompanyUpdate, user=Depends(get_current_user)):
+    """Update current user's company info."""
+    try:
+        # Get company_id from profile
+        profile = supabase_admin.table("profiles").select("company_id").eq("id", user.id).single().execute()
+        if not profile.data or not profile.data.get("company_id"):
+            raise HTTPException(status_code=400, detail="User has no company assigned")
+        
+        company_id = profile.data["company_id"]
+        update_data = data.model_dump(exclude_unset=True)
+        if not update_data:
+            return await get_current_company(user)
+        
+        res = supabase_admin.table("company").update(update_data).eq("id", company_id).execute()
+        if not res.data:
+            raise HTTPException(status_code=404, detail="Company not found")
+        return res.data[0]
+    except Exception as e:
+        if isinstance(e, HTTPException): raise e
+        raise HTTPException(status_code=500, detail=str(e))

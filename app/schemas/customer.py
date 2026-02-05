@@ -8,6 +8,8 @@ from app.schemas.folder import FolderResponse
 class CustomerBase(CamelModel):
     name: str
     company_id: str
+    aadhar_number: Optional[str] = None
+    pan_number: Optional[str] = None
 
 class CustomerCreate(CamelModel):
     name: str

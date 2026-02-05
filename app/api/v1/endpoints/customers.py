@@ -7,6 +7,8 @@ from app.integrations.storage.s3_storage import s3_storage
 from app.schemas.customer import CustomerResponse, CustomerCreate
 import io
 from uuid import UUID
+import re
+
 
 router = APIRouter()
 
@@ -14,6 +16,8 @@ router = APIRouter()
 async def create_customer(
     background_tasks: BackgroundTasks,
     name: str = Form(...),
+    aadhar_number: str = Form(...),
+    pan_number: str = Form(...),
     aadhar: UploadFile = File(...),
     pan: UploadFile = File(...),
     user=Depends(get_current_user)
@@ -21,6 +25,13 @@ async def create_customer(
     """
     Create a new customer (in customers table), a root folder, and upload mandatory documents.
     """
+    # Validate formats
+    if not re.match(r"^\d{12}$", aadhar_number):
+        raise HTTPException(status_code=400, detail="Invalid Aadhar Number format. Must be 12 digits.")
+    
+    if not re.match(r"^[A-Z]{5}[0-9]{4}[A-Z]{1}$", pan_number.upper()):
+        raise HTTPException(status_code=400, detail="Invalid PAN Number format. Must be 10 characters (e.g. ABCDE1234F).")
+
     try:
         # Step 0: Get user's company_id
         profile_res = supabase.table("profiles").select("company_id").eq("id", user.id).single().execute()
@@ -30,19 +41,34 @@ async def create_customer(
         company_id = profile_res.data["company_id"]
 
         # Step 1: Create record in 'customers' table
-        # Check if customer already exists in 'customers' table
-        existing_cust = supabase.table("customers") \
+        # Check if customer already exists in 'customers' table by NAME
+        existing_cust_name = supabase.table("customers") \
             .select("id") \
             .eq("name", name) \
             .eq("company_id", company_id) \
             .is_("deleted_at", "null") \
             .execute()
         
-        if existing_cust.data:
+        if existing_cust_name.data:
             raise HTTPException(status_code=400, detail=f"Customer with name '{name}' already exists")
+
+        # Check for duplicate Aadhar or PAN
+        existing_cust_docs = supabase.table("customers") \
+            .select("id, name") \
+            .eq("company_id", company_id) \
+            .is_("deleted_at", "null") \
+            .or_(f"aadhar_number.eq.{aadhar_number},pan_number.eq.{pan_number}") \
+            .execute()
+
+        if existing_cust_docs.data:
+            # Determine which one matched
+            matched = existing_cust_docs.data[0]
+            raise HTTPException(status_code=400, detail=f"Customer '{matched['name']}' already exists with this Aadhar or PAN number")
 
         cust_data = {
             "name": name,
+            "aadhar_number": aadhar_number,
+            "pan_number": pan_number,
             "company_id": company_id,
             "created_by": user.id
         }
