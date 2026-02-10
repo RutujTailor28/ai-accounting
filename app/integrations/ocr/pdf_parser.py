@@ -4,6 +4,9 @@ import openpyxl
 import xlrd
 import pandas as pd
 from docx import Document
+import pdf2image
+import pytesseract
+import io
 
 
 class DocumentParser:
@@ -49,17 +52,67 @@ class DocumentParser:
     
     @staticmethod
     def _parse_pdf(file_content: BinaryIO) -> str:
-        """Extract text from PDF file."""
-        pdf_reader = PyPDF2.PdfReader(file_content)
+        """
+        Extract text from PDF file using hybrid approach:
+        1. Try native extraction (PyPDF2)
+        2. If text is insufficient/empty, fall back to OCR (pdf2image + pytesseract)
+        """
+        # Create a copy of file_content for OCR if needed, as PyPDF2 might consume it
+        # We need bytes for pdf2image, so we read it all
+        start_pos = file_content.tell()
+        file_content.seek(0)
+        file_bytes = file_content.read()
+        file_content.seek(start_pos) # Reset for safety if needed elsewhere, though we use bytes below
+        
+        file_content_for_pypdf = io.BytesIO(file_bytes)
+        
+        # Method 1: Native Extraction
+        pdf_reader = PyPDF2.PdfReader(file_content_for_pypdf)
         text_parts = []
         
         for page_num, page in enumerate(pdf_reader.pages):
             text = page.extract_text()
-            if text.strip():
+            if text and text.strip():
                 text_parts.append(text)
         
         full_text = '\n\n'.join(text_parts)
-        print(f"[INFO] Extracted {len(full_text)} characters from PDF ({len(pdf_reader.pages)} pages)")
+        
+        # Heuristic: If we extracted very little text per page, it's likely a scanned document
+        # Threshold: < 50 characters average per page generally indicates a scan or image-heavy PDF
+        total_pages = len(pdf_reader.pages)
+        avg_chars_per_page = len(full_text) / total_pages if total_pages > 0 else 0
+        
+        if len(full_text.strip()) < 100 or avg_chars_per_page < 50:
+            print(f"[INFO] PDF text extraction insufficient ({len(full_text)} chars, avg {avg_chars_per_page:.1f}/page). Falling back to OCR.")
+            try:
+                # Method 2: OCR with Tesseract
+                # Convert PDF to images
+                images = pdf2image.convert_from_bytes(file_bytes)
+                ocr_text_parts = []
+                
+                print(f"[INFO] OCR Processing {len(images)} pages...")
+                for i, image in enumerate(images):
+                    # Extract text from image
+                    text = pytesseract.image_to_string(image)
+                    if text.strip():
+                        ocr_text_parts.append(text)
+                    if (i + 1) % 5 == 0:
+                        print(f"[INFO] OCR processed page {i+1}/{len(images)}")
+                
+                ocr_full_text = '\n\n'.join(ocr_text_parts)
+                
+                if len(ocr_full_text.strip()) > len(full_text.strip()):
+                    print(f"[INFO] OCR extraction successful. Extracted {len(ocr_full_text)} characters.")
+                    return ocr_full_text
+                else:
+                    print("[WARNING] OCR extracted less text than native. Reverting to native.")
+                    return full_text
+                    
+            except Exception as e:
+                print(f"[ERROR] OCR failed: {str(e)}. Returning natively extracted text.")
+                return full_text
+        
+        print(f"[INFO] Extracted {len(full_text)} characters from PDF ({len(pdf_reader.pages)} pages) using native extraction")
         return full_text
     
     @staticmethod
