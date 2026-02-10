@@ -285,7 +285,7 @@ async def stream_query_documents(request_body: QueryRequest, request: Request, u
                         question=request_body.question,
                         context_chunks=documents,
                         source_documents=source_documents,
-                        batch_size=10 # Reduced to 10 to prevent JSON parsing errors and improve accuracy
+                        batch_size=5 # Reduced to 10 to prevent JSON parsing errors and improve accuracy
                     ):
                         # Check if client disconnected before yielding each chunk
                         if await request.is_disconnected():

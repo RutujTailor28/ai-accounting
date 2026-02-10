@@ -37,7 +37,7 @@ class LLMService:
             model=settings.openrouter_model,
             openai_api_key=settings.openrouter_api_key,
             openai_api_base=settings.openrouter_base_url,
-            temperature=0.1,
+            temperature=0.0,
             max_tokens=50000,  # Increased to allow complete extraction of all matching records without truncation
             default_headers={
                 "HTTP-Referer": "https://localhost:8000", # Optional: Your site URL
@@ -592,7 +592,7 @@ class LLMService:
         question: str,
         context_chunks: List[str],
         source_documents: List[str],
-        batch_size: int = 20
+        batch_size: int = 5
     ) -> Dict[str, Any]:
         """
         Iteratively extract information from batches of chunks.
@@ -835,13 +835,13 @@ class LLMService:
    - Process the entire "LIABILITIES" column/side first.
    - Then process the entire "ASSETS" column/side first.
    - Output them as TWO SEPARATE TABLES, one after the other.
-5. **BALANCE SHEET COMPLETENESS**: For a Balance Sheet, you MUST provide BOTH an "ASSETS" section AND an "EQUITY AND LIABILITIES" section. Extract all rows for both sides.
+7. **BALANCE SHEET COMPLETENESS**: For a Balance Sheet, you MUST provide BOTH an "ASSETS" section AND an "EQUITY AND LIABILITIES" section. Extract all rows for both sides.
 8. **STRICT FORMATTING**: 
    - **START DIRECTLY** with the first markdown table.
    - **DO NOT** include any report titles, headers, or introductory text (e.g. NO "BALANCE SHEET").
    - **DO NOT** use markdown headers (#) or bolding (**).
    - **DO NOT** wrap the entire response in markdown code blocks (```markdown or ```).
-8. **Output Format**:
+9. **Output Format**:
    - **Textual Part**: Start directly with the first markdown table.
    - **JSON Part**: At the end, include a JSON block with the following structure:
      - If Balance Sheet: `{{"transactions": [], "balance_sheet": {{"liabilities": [{{"particulars": "...", "amount": "..."}}], "assets": [{{"particulars": "...", "amount": "..."}}]}}}}`
@@ -915,7 +915,7 @@ class LLMService:
         question: str,
         context_chunks: List[str],
         source_documents: List[str],
-        batch_size: int = 20
+        batch_size: int = 5
     ):
         """
         Stream extraction results as they are processed.
