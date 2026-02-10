@@ -1137,8 +1137,10 @@ class LLMService:
         # For summary outputs (no transactions), still show the documents we scanned.
         if is_summary and not all_sources:
             if filtered_sources_for_summary is not None:
+                # If we filtered sources for the summary, use those specific sources
                 all_sources = set(filtered_sources_for_summary)
             else:
+                # Otherwise, fallback to all valid source documents
                 all_sources = set([d for d in source_documents if d and d.lower() != "unknown"])
 
         # Final summary with credit/debit breakdown

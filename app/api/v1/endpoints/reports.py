@@ -266,14 +266,19 @@ async def stream_query_documents(request_body: QueryRequest, request: Request, u
                         print("[INFO] Client disconnected during summary generation, stopping")
                         return
                     
-                    yield json.dumps({
+                    summary_payload = {
                         "type": "summary",
                         "total_transactions": 0,
                         "total_credits": 0,
                         "total_debits": 0,
-                        "sources": result.get("sources", []),
+                        "sources": list(result.get("sources", [])), # Ensure it's a list
                         "full_answer": result.get("full_answer", result.get("answer", "")),
-                    }) + "\n"
+                        "data": json.loads(result.get("answer", "{}")) # Pass structured data for renderer
+                    }
+                    if "balance_sheet" in result.get("answer", ""):
+                         print(f"[INFO] Summary report generated with {len(result.get('sources', []))} sources")
+                    
+                    yield json.dumps(summary_payload) + "\n"
                     return
                 elif is_exhaustive:
                     async for chunk in llm_service.stream_exhaustive_answer(
