@@ -141,6 +141,7 @@ async def stream_query_documents(request_body: QueryRequest, request: Request, u
                  company_id=request_body.company_id,
                  document_names=target_document_names if target_document_names else None,
                  file_types=request_body.file_types,
+                 folder_ids=folder_ids,
                  uploaded_by=request_body.uploaded_by,
                  tags=request_body.tags
             )
@@ -201,7 +202,7 @@ async def stream_query_documents(request_body: QueryRequest, request: Request, u
                 company_id=request_body.company_id, 
                 n_results=n_results,
                 file_types=request_body.file_types,
-                folder_ids=None, # Disable folder filter
+                folder_ids=folder_ids, 
                 document_names=target_document_names if target_document_names else None,
                 uploaded_by=request_body.uploaded_by,
                 tags=request_body.tags
@@ -412,6 +413,7 @@ async def query_documents(request: QueryRequest, user=Depends(get_current_user))
                  company_id=request.company_id,
                  document_names=target_document_names if target_document_names else None,
                  file_types=request.file_types,
+                 folder_ids=folder_ids,
                  uploaded_by=request.uploaded_by,
                  tags=request.tags
             )
@@ -469,7 +471,7 @@ async def query_documents(request: QueryRequest, user=Depends(get_current_user))
                 company_id=request.company_id, 
                 n_results=n_results,
                 file_types=request.file_types,
-                folder_ids=None, # Disable folder filter
+                folder_ids=folder_ids,
                 document_names=target_document_names if target_document_names else None,
                 uploaded_by=request.uploaded_by,
                 tags=request.tags
