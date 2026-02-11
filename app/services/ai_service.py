@@ -566,6 +566,12 @@ class LLMService:
             # Use robust JSON extraction
             parsed_json = self._extract_json(answer)
             
+            # CRITICAL: If _extract_json hit its fallback (indicated by "message" key and empty transactions),
+            # we must treat this as a FAILURE and retry, rather than silently returning 0 results.
+            if "message" in parsed_json and not parsed_json.get("transactions"):
+                print(f"[WARNING] JSON extraction failed (Fallback triggered). Raw response preview: {answer[:100]}...")
+                raise ValueError("Failed to extract valid JSON from LLM response")
+            
             if "data" in parsed_json and "transactions" not in parsed_json:
                 parsed_json["transactions"] = parsed_json.pop("data")
             
@@ -1134,20 +1140,20 @@ class LLMService:
                                     desc_short = desc[:100] if len(desc) > 100 else desc
                                     fp = f"{date}|{amt}|{direction}|{desc_short}|{source_doc}|{bank_name}"
                             
-                                if fp not in seen_fingerprints:
+                                # if fp not in seen_fingerprints:
                                     # Apply secondary hard-coded filter
-                                    if self._should_filter_transaction(t, question):
-                                        print(f"[FILTER] Dropped non-matching transaction: {desc[:50]}")
-                                        continue
-                                    
-                                    seen_fingerprints.add(fp)
-                                    unique_txs.append(t)
-                                    all_unique_transactions.append(t)  # Store for source extraction
-                                else:
-                                    # Log when a transaction is being skipped as duplicate
-                                    skipped_direction = str(t.get('direction', '')).upper()
-                                    if skipped_direction == 'CREDIT':
-                                        print(f"[DEBUG] Skipping duplicate CREDIT transaction: {date}|{amt}|{desc[:50]}")
+                                if self._should_filter_transaction(t, question):
+                                    print(f"[FILTER] Dropped non-matching transaction: {desc[:50]}")
+                                    continue
+                                
+                                # seen_fingerprints.add(fp)
+                                unique_txs.append(t)
+                                all_unique_transactions.append(t)  # Store for source extraction
+                                # else:
+                                #     # Log when a transaction is being skipped as duplicate
+                                #     skipped_direction = str(t.get('direction', '')).upper()
+                                #     if skipped_direction == 'CREDIT':
+                                #         print(f"[DEBUG] Skipping duplicate CREDIT transaction: {date}|{amt}|{desc[:50]}")
 
                             if unique_txs:
                                 count = len(unique_txs)
