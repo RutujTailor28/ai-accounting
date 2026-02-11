@@ -192,12 +192,30 @@ class LLMService:
                 ---
 
                 Return ONLY a JSON object: {{"bank_name": "IDENTIFIED BANK NAME", "account_holder": "IDENTIFIED NAME", "document_type": "TYPE"}}
-                **CRITICAL**: For bank_name, use the FULL official name (e.g., "HDFC Bank", "IDBI Bank Ltd."). If truly not found, use "Unknown".
+                **CRITICAL**: For bank_name, use the FULL official name (e.g., "HDFC Bank", "IDBI Bank Ltd."). If you identify a bank logo or letterhead, use THAT as the bank name. If truly not found, use "Unknown".
+                **BANK NAME NORMALIZATION**: If you see "IDBI BANK LIMITED", return "IDBI BANK LTD.". If you see "HDFC BANK LIMITED", return "HDFC BANK". Keep it consistent.
                 """
                 response = await self.llm.ainvoke(prompt)
                 meta = self._extract_json(response.content)
                 
-                bank_name = meta.get("bank_name", "Unknown")
+                bank_name = str(meta.get("bank_name", "Unknown")).strip()
+                # Normalize common variations to ensure fingerprint consistency
+                bank_map = {
+                    "idbi bank limited": "IDBI Bank Ltd.",
+                    "idbi bank ltd": "IDBI Bank Ltd.",
+                    "hdfc bank limited": "HDFC Bank",
+                    "hdfc bank ltd": "HDFC Bank",
+                    "icici bank limited": "ICICI Bank",
+                    "state bank of india": "SBI",
+                    "axis bank limited": "Axis Bank",
+                    "kotak mahindra bank": "Kotak Bank"
+                }
+                bank_name_lower = bank_name.lower().replace(".", "").strip()
+                for key, val in bank_map.items():
+                    if key in bank_name_lower:
+                        bank_name = val
+                        break
+
                 account_holder = meta.get("account_holder", "Unknown")
                 doc_type = meta.get("document_type", "Unknown")
                 
@@ -326,6 +344,16 @@ class LLMService:
    - UPI IDs, reference numbers, or payee names
    - Transaction types (UPI, NEFT, cash, etc.)
    - **BALANCE VALUES** - These are CRITICAL for determining transaction direction
+   
+   **DATE PARSING & FILTERING (CRITICAL):**
+   - **User Input Format:** The user provides dates in **YYYY-MM-DD** format (e.g., 2024-03-01).
+   - **Document Format:** Bank statements often use **DD/MM/YYYY** or **DD-MM-YYYY** (e.g., 01/03/2024).
+   - **YOUR JOB:** You MUST map the user's YYYY-MM-DD request to the document's DD/MM/YYYY dates.
+   - **Example:** If user asks for "2024-03-01 to 2024-03-31":
+     - INCLUDE: "01/03/2024", "15/03/2024", "31/03/2024"
+     - EXCLUDE: "01/01/2024" (January), "03/01/2024" (January 3rd)
+   - **Ambiguity:** If a date is ambiguous (e.g., 01/02/2024 could be Jan 2nd or Feb 1st), use the context of other dates in the document to decide. Indian/UK banks use DD/MM/YYYY. US banks use MM/DD/YYYY.
+   - **STRICT FILTER ADHERENCE:** Only extract transactions that fall WITHIN the requested date range.
 
 **PROCESSING WORKFLOW (FOLLOW THIS EXACT ORDER):**
 1. **IDENTIFY FILTER**: Determine the specific transaction type or keyword the user is looking for (e.g., "Cash").
@@ -528,6 +556,10 @@ class LLMService:
             response = await self.llm.ainvoke(prompt)
             print(f"[DEBUG] [Received from AI] Response length: {len(response.content)} chars")
             
+            if not response.content or not response.content.strip():
+                print(f"[WARNING] Received empty response from LLM (0 chars). Triggering retry...")
+                raise ValueError("Empty response from LLM")
+            
             # Clean up the response
             answer = response.content.strip()
             
@@ -592,7 +624,7 @@ class LLMService:
         question: str,
         context_chunks: List[str],
         source_documents: List[str],
-        batch_size: int = 5
+        batch_size: int = 15
     ) -> Dict[str, Any]:
         """
         Iteratively extract information from batches of chunks.
@@ -657,8 +689,9 @@ class LLMService:
                 print("[INFO] Summary focus (stream): No document matches found; using full context to avoid missing data.")
         elif doc_metadata:
              # Transaction search focus: exclude documents that are obviously NOT statements/ledgers
-            exclude_types = ["computation", "balance sheet", "p&l", "profit", "loss", "ledger", "journal", "capital account", "tax", "computation of income"]
-            skip_docs = {d for d, m in doc_metadata.items() if any(et in str(m.get("document_type", "")).lower() for et in exclude_types) or any(et in (d or "").lower() for et in ["cp.pdf", "computation", "ledger"])}
+             # Relaxed: removed 'ledger', 'capital account' from exclusion to be more inclusive.
+            exclude_types = ["computation", "balance sheet", "p&l", "profit", "loss", "tax", "computation of income"]
+            skip_docs = {d for d, m in doc_metadata.items() if any(et in str(m.get("document_type", "")).lower() for et in exclude_types) or any(et in (d or "").lower() for et in ["cp.pdf", "computation"])}
             
             if skip_docs:
                 filtered = [(c, d) for c, d in zip(context_chunks, source_documents) if d not in skip_docs]
@@ -666,10 +699,19 @@ class LLMService:
                     context_chunks = [c for c, _ in filtered]
                     source_documents = [d for _, d in filtered]
                     print(f"[INFO] Transaction search focus (sync): excluded {len(skip_docs)} non-transaction documents: {list(skip_docs)}")
+                else:
+                    print(f"[WARNING] Transaction search focus (sync): All {len(skip_docs)} documents were filtered out. Using original context to avoid empty results.")
         
         async def process_batch_with_sem(batch, batch_source_docs):
             async with sem:
-                return await retry_with_backoff(self.generate_answer, question, batch, batch_source_docs, doc_metadata)
+                # Add overall retry to handle non-429 LLM failures
+                for attempt in range(2):
+                    try:
+                        return await retry_with_backoff(self.generate_answer, question, batch, batch_source_docs, doc_metadata)
+                    except Exception as e:
+                        if attempt == 1: raise e
+                        print(f"[WARNING] Batch failed, retrying once... Error: {e}")
+                        await asyncio.sleep(2)
 
         # Create tasks for each batch
         tasks = []
@@ -740,13 +782,13 @@ class LLMService:
                             fp = f"{date}|{amt}|{direction}|{tx_id}"
                         else:
                             # Include direction, source_document, and bank_name to distinguish similar transactions
-                            # Use first 100 chars of description to handle very long descriptions
-                            desc_short = desc[:100] if len(desc) > 100 else desc
-                            fp = f"{date}|{amt}|{direction}|{desc_short}|{source_doc}|{bank_name}"
+                            # Use first 100 chars of normalized description to handle variations
+                            desc_norm = re.sub(r'[^a-zA-Z0-9]', '', desc)
+                            fp = f"{date}|{amt}|{direction}|{desc_norm[:50]}|{source_doc}|{bank_name}"
                         
-                        if fp not in seen_fingerprints:
-                            seen_fingerprints.add(fp)
-                            all_transactions.append(t)
+                        # if fp not in seen_fingerprints:
+                        #     seen_fingerprints.add(fp)
+                        all_transactions.append(t)
 
             except Exception as e:
                 print(f"[DEBUG] Error merging batch result: {str(e)}")
@@ -915,7 +957,7 @@ class LLMService:
         question: str,
         context_chunks: List[str],
         source_documents: List[str],
-        batch_size: int = 5
+        batch_size: int = 10
     ):
         """
         Stream extraction results as they are processed.
@@ -973,8 +1015,9 @@ class LLMService:
                 print("[INFO] Summary focus (stream): No document matches found; using full context to avoid missing data.")
         elif doc_metadata:
             # Transaction focus: exclude documents that are obviously NOT statements/ledgers
-            exclude_types = ["computation", "balance sheet", "p&l", "profit", "loss", "ledger", "journal", "capital account", "tax", "computation of income"]
-            skip_docs = {d for d, m in doc_metadata.items() if any(et in str(m.get("document_type", "")).lower() for et in exclude_types) or any(et in (d or "").lower() for et in ["cp.pdf", "computation", "ledger"])}
+            # Relaxed: removed 'ledger', 'capital account' from exclusion to be more inclusive.
+            exclude_types = ["computation", "balance sheet", "p&l", "profit", "loss", "tax", "computation of income"]
+            skip_docs = {d for d, m in doc_metadata.items() if any(et in str(m.get("document_type", "")).lower() for et in exclude_types) or any(et in (d or "").lower() for et in ["cp.pdf", "computation"])}
             
             if skip_docs:
                 filtered = [(c, d) for c, d in zip(context_chunks, source_documents) if d not in skip_docs]
@@ -982,6 +1025,8 @@ class LLMService:
                     context_chunks = [c for c, _ in filtered]
                     source_documents = [d for _, d in filtered]
                     print(f"[INFO] Transaction search focus: excluded {len(skip_docs)} non-transaction documents: {list(skip_docs)}")
+                else:
+                    print(f"[WARNING] Transaction search focus: All {len(skip_docs)} documents were filtered out. Using original context to avoid empty results.")
         
         total_batches = (len(context_chunks) + batch_size - 1) // batch_size
         tasks = []
@@ -989,7 +1034,17 @@ class LLMService:
         
         async def process_batch_with_sem(batch, batch_source_docs):
             async with sem:
-                return await retry_with_backoff(self.generate_answer, question, batch, batch_source_docs, doc_metadata)
+                # Add overall retry to handle non-429 LLM failures and empty responses
+                # Increased retries to 3 to handle flaky free-tier models
+                for attempt in range(3):
+                    try:
+                        return await retry_with_backoff(self.generate_answer, question, batch, batch_source_docs, doc_metadata)
+                    except Exception as e:
+                        if attempt == 2: 
+                            print(f"[ERROR] Batch failed after 3 attempts. Last error: {e}")
+                            raise e
+                        print(f"[WARNING] Stream batch failed (Attempt {attempt+1}/3), retrying... Error: {e}")
+                        await asyncio.sleep(2 * (attempt + 1))
 
         print(f"[INFO] Streaming exhaustive extraction: {len(context_chunks)} chunks")
 

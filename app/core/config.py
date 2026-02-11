@@ -20,8 +20,8 @@ class Settings(BaseSettings):
     openai_api_key: Optional[str] = None
     
     # Chunking Configuration
-    chunk_size: int = 500
-    chunk_overlap: int = 100
+    chunk_size: int = 2000
+    chunk_overlap: int = 200
     
     # Vector Database
     chroma_persist_directory: str = "./chroma_db"

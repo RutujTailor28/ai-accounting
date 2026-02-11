@@ -31,7 +31,8 @@ async def _process_document_background(
     folder_name: str,
     target_folder_id: str,
     user_id: str,
-    s3_key: str
+    s3_key: str,
+    file_id: str = None
 ):
     """
     Background worker to parse, chunk, and embed a document.
@@ -98,7 +99,8 @@ async def _process_document_background(
                     "created_by": user_id,
                     "created_at": now_ts,
                     "content_date": content_date_ts,
-                    "chunk_index": i + j
+                    "chunk_index": i + j,
+                    "file_id": file_id
                 }
                 for j in range(len(batch_chunks))
             ]
@@ -276,7 +278,8 @@ async def upload_document(
             folder_name=folder_name,
             target_folder_id=target_folder_id,
             user_id=user.id if hasattr(user, 'id') else None,
-            s3_key=s3_key
+            s3_key=s3_key,
+            file_id=file_db_res.data[0]['id']
         )
         
         return UploadResponse(
@@ -456,12 +459,18 @@ async def delete_document(
         # but filter it out in queries. Hard delete from S3/Vector 
         # could be moved to a separate cleanup job if desired.
 
+
+        # 2. Delete from Vector Database
+        print(f"[INFO] Step 2: Removing document from Vector Store: {doc_name}")
+        vector_store.delete_document(company_id, doc_name)
+
         return {
             "message": "File soft-deleted successfully",
             "details": {
-                "database": "Updated deleted_at"
+                "database": "Updated deleted_at",
+                "vector_store": "Removed chunks"
             }
-        }    
+        }
     except HTTPException:
         raise
     except Exception as e:

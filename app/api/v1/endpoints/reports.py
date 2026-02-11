@@ -73,9 +73,16 @@ async def stream_query_documents(request_body: QueryRequest, request: Request, u
         
 
         # Resolve customer_id to folder_ids if provided
+        # Resolve customer_id to folder_ids if provided
         folder_ids = request_body.folder_ids or []
         target_document_names = []
         
+        # Date Filter Injection
+        effective_question = request_body.question
+        if request_body.start_date and request_body.end_date:
+            effective_question += f" from {request_body.start_date} to {request_body.end_date}"
+            print(f"[INFO] Injected date range into question: {effective_question}")
+                
         if request_body.customer_id:
             customer_folders = supabase.table("folders") \
                 .select("id") \
@@ -86,23 +93,25 @@ async def stream_query_documents(request_body: QueryRequest, request: Request, u
             if customer_folders.data:
                 customer_folder_ids = [f["id"] for f in customer_folders.data]
                 
-                # Fetch all files in these folders to get document names
-                if customer_folder_ids:
+                if folder_ids:
+                    # If folder_ids were already provided, intersect them
+                    effective_folder_ids = list(set(folder_ids) & set(customer_folder_ids))
+                else:
+                    effective_folder_ids = customer_folder_ids
+
+                # Fetch all files in these effective folders to get document names
+                if effective_folder_ids:
                     customer_files = supabase.table("files") \
                         .select("name") \
-                        .in_("folder_id", customer_folder_ids) \
+                        .in_("folder_id", effective_folder_ids) \
                         .is_("deleted_at", "null") \
                         .execute()
                     
                     if customer_files.data:
                         target_document_names = [f["name"] for f in customer_files.data]
-                        print(f"[INFO] Resolved {len(target_document_names)} documents for customer {request_body.customer_id}")
+                        print(f"[INFO] Resolved {len(target_document_names)} documents for customer {request_body.customer_id} in {len(effective_folder_ids)} folders")
                 
-                if folder_ids:
-                    # If folder_ids were already provided, intersect them
-                    folder_ids = list(set(folder_ids) & set(customer_folder_ids))
-                else:
-                    folder_ids = customer_folder_ids
+                folder_ids = effective_folder_ids
             
             if not folder_ids and not target_document_names:
                 # If a customer was selected but has no folders/documents
@@ -141,6 +150,7 @@ async def stream_query_documents(request_body: QueryRequest, request: Request, u
                  company_id=request_body.company_id,
                  document_names=target_document_names if target_document_names else None,
                  file_types=request_body.file_types,
+                 # Strict folder filter: always apply if provided
                  folder_ids=folder_ids,
                  uploaded_by=request_body.uploaded_by,
                  tags=request_body.tags
@@ -256,7 +266,7 @@ async def stream_query_documents(request_body: QueryRequest, request: Request, u
 
                     # Summary reports: return a single deterministic summary when possible
                     result = await llm_service.generate_summary_report(
-                        question=request_body.question,
+                        question=effective_question,
                         context_chunks=documents_local,
                         source_documents=source_documents_local,
                     )
@@ -282,10 +292,10 @@ async def stream_query_documents(request_body: QueryRequest, request: Request, u
                     return
                 elif is_exhaustive:
                     async for chunk in llm_service.stream_exhaustive_answer(
-                        question=request_body.question,
+                        question=effective_question,
                         context_chunks=documents,
                         source_documents=source_documents,
-                        batch_size=5 # Reduced to 10 to prevent JSON parsing errors and improve accuracy
+                        batch_size=15 # Increased for efficiency and consistency with LLMService defaults
                     ):
                         # Check if client disconnected before yielding each chunk
                         if await request.is_disconnected():
@@ -296,7 +306,7 @@ async def stream_query_documents(request_body: QueryRequest, request: Request, u
                     # Standard mode: just generate and yield once
                     print(f"[INFO] Standard answer mode triggered (Streaming wrapper)")
                     result = await llm_service.generate_answer(
-                        question=request_body.question,
+                        question=effective_question,
                         context_chunks=documents,
                         source_documents=source_documents
                     )
@@ -348,8 +358,15 @@ async def query_documents(request: QueryRequest, user=Depends(get_current_user))
         query_embedding = embedding_service.generate_embedding(request.question)
         
         # Resolve customer_id to folder_ids if provided
+        # Resolve customer_id to folder_ids if provided
         folder_ids = request.folder_ids or []
         target_document_names = []
+
+        # Date Filter Injection
+        effective_question = request.question
+        if request.start_date and request.end_date:
+            effective_question += f" from {request.start_date} to {request.end_date}"
+            print(f"[INFO] Injected date range into question: {effective_question}")
         
         if request.customer_id:
             customer_folders = supabase.table("folders") \
@@ -361,23 +378,25 @@ async def query_documents(request: QueryRequest, user=Depends(get_current_user))
             if customer_folders.data:
                 customer_folder_ids = [f["id"] for f in customer_folders.data]
                 
-                # Fetch all files in these folders
-                if customer_folder_ids:
+                if folder_ids:
+                    # If folder_ids were already provided, intersect them
+                    effective_folder_ids = list(set(folder_ids) & set(customer_folder_ids))
+                else:
+                    effective_folder_ids = customer_folder_ids
+
+                # Fetch all files in these effective folders
+                if effective_folder_ids:
                     customer_files = supabase.table("files") \
                         .select("name") \
-                        .in_("folder_id", customer_folder_ids) \
+                        .in_("folder_id", effective_folder_ids) \
                         .is_("deleted_at", "null") \
                         .execute()
                     
                     if customer_files.data:
                         target_document_names = [f["name"] for f in customer_files.data]
-                        print(f"[INFO] Resolved {len(target_document_names)} documents for customer {request.customer_id}")
+                        print(f"[INFO] Resolved {len(target_document_names)} documents for customer {request.customer_id} in {len(effective_folder_ids)} folders")
 
-                if folder_ids:
-                    # If folder_ids were already provided, intersect them
-                    folder_ids = list(set(folder_ids) & set(customer_folder_ids))
-                else:
-                    folder_ids = customer_folder_ids
+                folder_ids = effective_folder_ids
             
             if not folder_ids and not target_document_names:
                 # If a customer was selected but has no folders/documents
@@ -418,6 +437,7 @@ async def query_documents(request: QueryRequest, user=Depends(get_current_user))
                  company_id=request.company_id,
                  document_names=target_document_names if target_document_names else None,
                  file_types=request.file_types,
+                 # Strict folder filter: always apply if provided
                  folder_ids=folder_ids,
                  uploaded_by=request.uploaded_by,
                  tags=request.tags
@@ -504,14 +524,14 @@ async def query_documents(request: QueryRequest, user=Depends(get_current_user))
         if is_exhaustive:
             print(f"[INFO] Exhaustive extraction mode triggered due to keywords in question")
             result = await llm_service.generate_exhaustive_answer(
-                question=request.question,
+                question=effective_question,
                 context_chunks=documents,
                 source_documents=source_documents
             )
         else:
             print(f"[INFO] Standard answer mode triggered")
             result = await llm_service.generate_answer(
-                question=request.question,
+                question=effective_question,
                 context_chunks=documents,
                 source_documents=source_documents
             )
