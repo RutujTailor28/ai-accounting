@@ -82,7 +82,8 @@ async def chat_query(request: ChatQueryRequest, user=Depends(get_current_user)):
         llm_result = await llm_service.generate_answer(
             question=request.question,
             context_chunks=documents,
-            source_documents=source_documents
+            source_documents=source_documents,
+            company_id=company_id
         )
         
         parsed_answer = json.loads(llm_result["answer"])

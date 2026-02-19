@@ -1,11 +1,13 @@
 from typing import List, Dict, Any
+import json
 import asyncio
 from langchain_openai import ChatOpenAI
 from app.core.config import settings
 import random
 from datetime import date
 import re
-import json
+from app.ai.rag.retriever import vector_store
+
 
 # Helper for rate limit retries
 async def retry_with_backoff(func, *args, **kwargs):
@@ -155,72 +157,96 @@ class LLMService:
             "transactions": []
         }
 
-    async def _extract_document_metadata(self, context_chunks: List[str], source_documents: List[str]) -> Dict[str, Dict[str, str]]:
+    async def _extract_document_metadata(self, context_chunks: List[str], source_documents: List[str], company_id: str = None) -> Dict[str, Dict[str, str]]:
         """
-        Identify the Bank Name and Account Holder for each unique document by scanning the first few chunks.
-        Parallelized for speed.
+        Identify the Bank Name and Account Holder for each unique document.
+        IMPROVED: Explicitly fetches the first 3 chunks (header) from VectorDB to ensure we see the logo/bank name,
+        instead of relying only on the random chunks retrieved for the query.
         """
-        unique_docs = list(set(source_documents))
+        unique_docs = list(set([d for d in source_documents if d and d != "Unknown"]))
         
         async def scan_single_doc(doc):
             try:
-                # Find the first few chunks for this document to get a complete header
-                all_doc_indices = [i for i, x in enumerate(source_documents) if x == doc]
-                # Take up to 10 chunks to ensure we see the full header
-                header_indices = all_doc_indices[:10]
-                peek_context = "\n".join([context_chunks[i] for i in header_indices])
+                # 1. Fetch HEADER chunks explicitly from Vector Store
+                # We need the top of the file to see the Bank Name/Logo
+                header_text = ""
+                if company_id:
+                    try:
+                        # Query for the first 3 chunks of this document (indices 0, 1, 2)
+                        # We use a loose filter because chunk naming might vary, but standard is {doc_name}_0, {doc_name}_1
+                        # safest is to get by metadata
+                        v_res = vector_store.collection.get(
+                            where={
+                                "$and": [
+                                    {"company_id": {"$eq": company_id}},
+                                    {"document_name": {"$eq": doc}},
+                                    {"chunk_index": {"$lt": 3}} # Get first 3 chunks
+                                ]
+                            },
+                            include=["documents", "metadatas"]
+                        )
+                        
+                        if v_res and v_res.get("documents"):
+                            # Sort by chunk index to ensure order
+                            sorted_chunks = sorted(
+                                zip(v_res["documents"], v_res["metadatas"]), 
+                                key=lambda x: x[1].get("chunk_index", 999)
+                            )
+                            header_chunks = [c[0] for c in sorted_chunks]
+                            header_text = "\n".join(header_chunks)
+                            print(f"[INFO] Fetched {len(header_chunks)} header chunks for {doc} from DB")
+                    except Exception as ve:
+                        print(f"[WARNING] Failed to fetch headers for {doc} from DB: {ve}")
 
-                prompt = f"""You are a professional financial document analyzer. Your goal is to identify the Issuing Bank Name, the Main Account Holder Name, and the DOCUMENT TYPE from the provided snippet.
+                # 2. Also include the chunks provided in the context (which might be from middle of file)
+                # Find indices in the provided context
+                all_doc_indices = [i for i, x in enumerate(source_documents) if x == doc]
+                # Take up to 5 context chunks
+                context_indices = all_doc_indices[:5]
+                context_text = "\n".join([context_chunks[i] for i in context_indices])
+
+                # Combine: Header (Priority) + Context
+                full_peek_content = f"--- DOCUMENT HEADER (Start of File) ---\n{header_text}\n\n--- RELEVANT EXTRACTS_FROM_QUERY ---\n{context_text}"
+
+                prompt = f"""You are a professional financial document analyzer. Your goal is to identify the Issuing Bank Name, the Main Account Holder Name, and the DOCUMENT TYPE.
+                
+                I have provided two sections:
+                1. THE HEADER (Start of file) - Look here for Bank Name/Logo.
+                2. RELEVANT EXTRACTS - Look here for context if header is unclear.
 
                 STRATEGY:
-                1. Look for the absolute header (often the first few lines of the file).
-                2. **BANK NAME IDENTIFICATION (CRITICAL)**:
-                   - Look for the official bank name in the main header (usually first 10-20 lines).
+                1. **BANK NAME IDENTIFICATION (CRITICAL)**:
+                   - Look for the official bank name in the **HEADER SECTION**.
                    - Check for bank logos, letterheads, or explicit "Bank Statement" titles at the top.
-                   - **CRITICAL**: Ignore bank names found inside transaction lists or UPI IDs (e.g. "@oksbi", "to SBI account"). Only identify the ISSUING bank of the statement itself.
-                   - **CRITICAL**: If you cannot find an explicit issuing bank name in the header, return "Unknown" - DO NOT guess.
-                3. Identify Account Holder Name (e.g., "Name of the Assessee", "Beneficiary Name:", "Account Name:", "Customer Name:").
-                4. IDENTIFY DOCUMENT TYPE:
-                   - **Bank Statement**: Contains transaction lists with Date, Narration, Withdrawal/Deposit, Balance.
-                   - **Balance Sheet**: Summary of Assets and Liabilities. Look for terms like "Share Capital", "Fixed Assets", "Current Liabilities", "Balance Sheet as on...".
-                   - **Profit & Loss Account**: Summary of Income and Expenditure. Look for terms like "Sales", "Expenses", "Net Profit", "Profit & Loss A/c for the period...".
-                   - **Computation of Income**: Detailed tax/income calculations. Often contains many sections like "Income from House Property", "Business Income", etc.
+                   - **CRITICAL**: Ignore bank names found inside transaction lists (e.g. "Transfer to SBI"). Only identify the ISSUING bank.
+                   - If header is empty/unclear, look at the extracts.
+                   - **CRITICAL**: If you cannot find an explicit issuing bank name, return "Unknown".
+
+                2. Identify Account Holder Name (e.g., "Name of the Assessee", "Beneficiary Name:", "Account Name:").
+                
+                3. IDENTIFY DOCUMENT TYPE:
+                   - **Bank Statement**: Transaction lists, withdrawals, deposits.
+                   - **Balance Sheet**: Assets, Liabilities, Equity.
+                   - **Profit & Loss**: Income, Expenses, Net Profit.
+                   - **Computation of Income**: Tax calculations, detailed income breakdown.
 
                 SNIPPET:
-                --- 
-                {peek_context[:6000]}
+                {full_peek_content[:15000]}
                 ---
 
                 Return ONLY a JSON object: {{"bank_name": "IDENTIFIED BANK NAME", "account_holder": "IDENTIFIED NAME", "document_type": "TYPE"}}
-                **CRITICAL**: For bank_name, use the FULL official name (e.g., "HDFC Bank", "IDBI Bank Ltd."). If you identify a bank logo or letterhead, use THAT as the bank name. If truly not found, use "Unknown".
-                **BANK NAME NORMALIZATION**: If you see "IDBI BANK LIMITED", return "IDBI BANK LTD.". If you see "HDFC BANK LIMITED", return "HDFC BANK". Keep it consistent.
+                
+                **RULES FOR BANK NAME**:
+                - Extract the **Full Official Name** (e.g. "State Bank of India", "HDFC Bank"). 
+                - Do not abbreviate.
                 """
                 response = await self.llm.ainvoke(prompt)
                 meta = self._extract_json(response.content)
                 
                 bank_name = str(meta.get("bank_name", "Unknown")).strip()
-                # Normalize common variations to ensure fingerprint consistency
-                bank_map = {
-                    "idbi bank limited": "IDBI Bank Ltd.",
-                    "idbi bank ltd": "IDBI Bank Ltd.",
-                    "hdfc bank limited": "HDFC Bank",
-                    "hdfc bank ltd": "HDFC Bank",
-                    "icici bank limited": "ICICI Bank",
-                    "state bank of india": "SBI",
-                    "axis bank limited": "Axis Bank",
-                    "kotak mahindra bank": "Kotak Bank"
-                }
-                bank_name_lower = bank_name.lower().replace(".", "").strip()
-                for key, val in bank_map.items():
-                    if key in bank_name_lower:
-                        bank_name = val
-                        break
-
                 account_holder = meta.get("account_holder", "Unknown")
                 doc_type = meta.get("document_type", "Unknown")
                 
-                # Removed manual bank heuristic logic to allow LLM to find the bank name dynamically.
-
                 return doc, {"bank_name": bank_name, "account_holder": account_holder, "document_type": doc_type}
             except Exception as e:
                 print(f"[ERROR] Failed to extract metadata for {doc}: {e}")
@@ -241,7 +267,8 @@ class LLMService:
         question: str,
         context_chunks: List[str],
         source_documents: List[str],
-        doc_metadata: Dict[str, Dict[str, str]] = None
+        doc_metadata: Dict[str, Dict[str, str]] = None,
+        company_id: str = None
     ) -> Dict[str, Any]:
         """
         Generate an answer based on the question and retrieved context using a DYNAMIC schema.
@@ -255,7 +282,7 @@ class LLMService:
         
         # Step 1: Pre-scan for document metadata if not provided
         if doc_metadata is None:
-            doc_metadata = await self._extract_document_metadata(context_chunks, source_documents)
+            doc_metadata = await self._extract_document_metadata(context_chunks, source_documents, company_id=company_id)
         # Build context from chunks WITH source document information and preset metadata
         context_parts = []
         for i, chunk in enumerate(context_chunks):
@@ -276,12 +303,35 @@ class LLMService:
         current_date_str = today.strftime("%d-%m-%Y")
         current_year = today.year
         
+        # Retrieve relevant feedback/corrections for this query
+        # This is the "Learning" part of the Agent
+        feedback_context = ""
+        try:
+            if company_id:
+                # Generate embedding for the query to find similar past mistakes
+                from app.services.deps import embedding_service
+                q_emb = embedding_service.generate_embedding(question)
+                
+                relevant_feedback = vector_store.query_feedback(q_emb, company_id)
+                if relevant_feedback:
+                    feedback_context = "\n**LESSONS LEARNED (PAST USER CORRECTIONS):**\n"
+                    for i, fb in enumerate(relevant_feedback):
+                        feedback_context += f"- {fb}\n"
+                    print(f"[INFO] Injected {len(relevant_feedback)} past corrections into prompt for company {company_id}")
+            else:
+                print(f"[WARNING] No company_id provided to generate_answer; skipping feedback retrieval.")
+        except Exception as e:
+            print(f"[WARNING] Failed to retrieve feedback: {e}")
+            feedback_context = ""
+
         # Enhanced Financial Assistant Prompt
         prompt = f"""You are an expert financial assistant designed to analyze and extract information from uploaded bank documents such as statements, ledgers, journals, Balance Sheets, and Profit & Loss statements. Your task is to help users find specific transactions or understand financial summaries by interpreting their queries.
 
 **CURRENT SYSTEM DATE:** {current_date_str} (Use this to resolve "this year", "previous year", "last month", etc. Previous year = {current_year - 1})
 
 **USER QUERY:** "{question}"
+
+{feedback_context}
 
 **DOCUMENT CONTEXT:**
 {context}
@@ -302,7 +352,7 @@ class LLMService:
 
 4. **HANDLING SUMMARY REPORTS (Balance Sheet / P&L / Computation):**
    - If the user asks for a high-level summary (e.g., "give me balance sheet", "show p&l", "financial report"), your PRIMARY goal is to find and extract that report's structural tables.
-   - **MANDATORY**: Look for keywords like "Balance Sheet", "Assets", "Liabilities", "Equity", "Profit & Loss", "Capital Account", "Income", "Expenditure", "Statement of Affairs", "Financial Position" in the text.
+   - **MANDATORY**: Look for keywords like "Balance Sheet", "Assets", "Liabilities", "Equity", "Profit & Loss", "p & l", "Capital Account", "Income", "Expenditure", "Statement of Affairs", "Financial Position" in the text.
    - **DO NOT** extract individual bank statement transactions if a summary report is requested.
    - **TABLE INTEGRITY**: You MUST produce a single continuous markdown table for each section. **DO NOT** break a table with empty lines or interleaved text. Output EVERY row for a section in one block.
    - **MANDATORY**: Cleanly format the summary data into a Markdown Table.
@@ -534,6 +584,7 @@ class LLMService:
 5. **No Data Found:** If no matching records OR summary reports are found, return: {{"transactions": [], "message": "I could not find the requested information in the documents."}}
 
 **Response Guidelines:**
+- **CRITICAL: START EXTRACTING IMMEDIATELY. Do not summarize. Extract EVERY row.**
 - Extract EVERY SINGLE piece of valid data that matches the user's request - NO EXCEPTIONS
 - Return the COMPLETE dataset - do NOT summarize or provide a sample
 - **CREDIT TRANSACTIONS ARE MANDATORY**: Ensure you extract ALL credit transactions. If you see deposits, receipts, salary, interest, refunds, or any money coming IN, they MUST be included with `"direction": "CREDIT"`
@@ -630,7 +681,8 @@ class LLMService:
         question: str,
         context_chunks: List[str],
         source_documents: List[str],
-        batch_size: int = 15
+        batch_size: int = 15,
+        company_id: str = None
     ) -> Dict[str, Any]:
         """
         Iteratively extract information from batches of chunks.
@@ -645,18 +697,18 @@ class LLMService:
         print(f"[INFO] Starting parallel exhaustive extraction across {len(context_chunks)} chunks")
         
         # Step 1: Pre-scan for document metadata
-        doc_metadata = await self._extract_document_metadata(context_chunks, source_documents)
+        doc_metadata = await self._extract_document_metadata(context_chunks, source_documents, company_id=company_id)
 
         # If the user asked for a summary report (Balance Sheet / P&L / Computation),
         # aggressively focus on only those document types; otherwise the model will be
         # overwhelmed by irrelevant bank statement chunks and respond "not found".
         q_lower = (question or "").lower()
-        is_summary = any(kw in q_lower for kw in ["balance sheet", "p&l", "profit", "loss", "report", "summary", "computation"])
+        is_summary = any(kw in q_lower for kw in ["balance sheet", "p&l", "p & l", "profit", "loss", "report", "summary", "computation"])
         if is_summary and doc_metadata:
             wanted_types = set()
             if "balance sheet" in q_lower:
                 wanted_types.add("balance sheet")
-            if "p&l" in q_lower or "profit" in q_lower or "loss" in q_lower:
+            if "p&l" in q_lower or "p & l" in q_lower or "profit" in q_lower or "loss" in q_lower:
                 wanted_types.add("profit")
                 wanted_types.add("loss")
                 wanted_types.add("p&l")
@@ -678,7 +730,7 @@ class LLMService:
                     # Only match if the hint corresponds to the WANTED type
                     if "balance" in q_lower and any(h in name for h in ["balance", "bl.", "bl_", "-bl", "bs."]):
                         return True
-                    if ("p&l" in q_lower or "profit" in q_lower) and any(h in name for h in ["p&l", "pl.", "pl_", "-pl", "profit", "loss"]):
+                    if ("p&l" in q_lower or "p & l" in q_lower or "profit" in q_lower) and any(h in name for h in ["p&l", "pl.", "pl_", "-pl", "profit", "loss"]):
                         return True
                     if "computation" in q_lower and "computation" in name:
                         return True
@@ -713,7 +765,7 @@ class LLMService:
                 # Add overall retry to handle non-429 LLM failures
                 for attempt in range(2):
                     try:
-                        return await retry_with_backoff(self.generate_answer, question, batch, batch_source_docs, doc_metadata)
+                        return await retry_with_backoff(self.generate_answer, question, batch, batch_source_docs, doc_metadata, company_id)
                     except Exception as e:
                         if attempt == 1: raise e
                         print(f"[WARNING] Batch failed, retrying once... Error: {e}")
@@ -721,14 +773,19 @@ class LLMService:
 
         # Create tasks for each batch
         tasks = []
-        total_batches = (len(context_chunks) + batch_size - 1) // batch_size
-        print(f"[INFO] Splitting {len(context_chunks)} chunks into {total_batches} batches (batch_size={batch_size})")
+        # OVERLAP IMPLEMENTATION: Step size = batch_size - 1 (overlap of 1 chunk)
+        step = batch_size - 1 if batch_size > 1 else 1
         
-        for i in range(0, len(context_chunks), batch_size):
+        # Calculate approximate total batches for progress tracking
+        total_batches = (len(context_chunks) + step - 1) // step
+        print(f"[INFO] Splitting {len(context_chunks)} chunks into ~{total_batches} batches with overlap (step={step}, batch_size={batch_size})")
+        
+        batch_idx = 0
+        for i in range(0, len(context_chunks), step):
             batch = context_chunks[i:i + batch_size]
             batch_source_docs = source_documents[i:i + batch_size]
-            batch_num = (i // batch_size) + 1
-            print(f"[INFO] Batch {batch_num}/{total_batches}: Processing {len(batch)} chunks")
+            batch_idx += 1
+            print(f"[INFO] Batch {batch_idx}: Processing {len(batch)} chunks (start_idx={i})")
             tasks.append(process_batch_with_sem(batch, batch_source_docs))
 
         # Execute all batches
@@ -780,6 +837,7 @@ class LLMService:
                         date = str(t.get('date', ''))
                         direction = str(t.get('direction', '')).upper()
                         tx_id = str(t.get('transaction_id', '')).strip()
+                        ref_id = str(t.get('ref_id', '')).strip() # Capture Ref/Cheque ID
                         source_doc = str(t.get('source_document', '')).strip()
                         bank_name = str(t.get('bank_name', '')).strip()
                         
@@ -787,14 +845,21 @@ class LLMService:
                         if tx_id:
                             fp = f"{date}|{amt}|{direction}|{tx_id}"
                         else:
-                            # Include direction, source_document, and bank_name to distinguish similar transactions
-                            # Use first 100 chars of normalized description to handle variations
+                            # Enhanced Fingerprint for better differentiation
+                            # 1. Include Ref ID if available
+                            # 2. Increase normalized description length to 120 chars to capture unique details at end of string
                             desc_norm = re.sub(r'[^a-zA-Z0-9]', '', desc)
-                            fp = f"{date}|{amt}|{direction}|{desc_norm[:50]}|{source_doc}|{bank_name}"
+                            fp_parts = [date, amt, direction, desc_norm[:120], source_doc, bank_name]
+                            if ref_id:
+                                fp_parts.insert(3, ref_id) # Add ref_id to uniqueness check
+                                
+                            fp = "|".join(fp_parts)
                         
-                        # if fp not in seen_fingerprints:
-                        #     seen_fingerprints.add(fp)
-                        all_transactions.append(t)
+                        if fp not in seen_fingerprints:
+                            seen_fingerprints.add(fp)
+                            all_transactions.append(t)
+                        else:
+                            print(f"[DEBUG] Skipping duplicate transaction in sync exhaustive: {fp[:50]}...")
 
             except Exception as e:
                 print(f"[DEBUG] Error merging batch result: {str(e)}")
@@ -857,7 +922,7 @@ class LLMService:
         combined_context = "\n\n".join(context_chunks)
         sources = sorted(set([d for d in source_documents or [] if d and d.lower() != "unknown"]))
 
-        prompt = f"""You are a specialized financial analyst. Your task is to extract a structured Financial Report (Balance Sheet, Profit & Loss, or Computation of Income) from the provided document context.
+        prompt = f"""You are a specialized financial analyst. Your task is to extract a structured Financial Report (Balance Sheet, Profit & Loss (also known as p & l), or Computation of Income) from the provided document context.
 
 **USER REQUEST:** "{question}"
 
@@ -963,7 +1028,8 @@ class LLMService:
         question: str,
         context_chunks: List[str],
         source_documents: List[str],
-        batch_size: int = 10
+        batch_size: int = 10,
+        company_id: str = None
     ):
         """
         Stream extraction results as they are processed.
@@ -974,17 +1040,17 @@ class LLMService:
             return
 
         # Step 1: Pre-scan for document metadata
-        doc_metadata = await self._extract_document_metadata(context_chunks, source_documents)
+        doc_metadata = await self._extract_document_metadata(context_chunks, source_documents, company_id=company_id)
 
         # Summary focus: restrict to Balance Sheet / P&L / Computation docs.
         q_lower = (question or "").lower()
-        is_summary = any(kw in q_lower for kw in ["balance sheet", "p&l", "profit", "loss", "report", "summary", "computation"])
+        is_summary = any(kw in q_lower for kw in ["balance sheet", "p&l", "p & l", "profit", "loss", "report", "summary", "computation"])
         filtered_sources_for_summary = None
         if is_summary and doc_metadata:
             wanted_types = set()
             if "balance sheet" in q_lower:
                 wanted_types.add("balance sheet")
-            if "p&l" in q_lower or "profit" in q_lower or "loss" in q_lower:
+            if "p&l" in q_lower or "p & l" in q_lower or "profit" in q_lower or "loss" in q_lower:
                 wanted_types.add("profit")
                 wanted_types.add("loss")
                 wanted_types.add("p&l")
@@ -1003,7 +1069,7 @@ class LLMService:
                 # Rule 2: Match by filename hints
                 if "balance" in q_lower and any(h in name for h in ["balance", "bl.", "bl_", "-bl", "bs."]):
                     return True
-                if ("p&l" in q_lower or "profit" in q_lower) and any(h in name for h in ["p&l", "pl.", "pl_", "-pl", "profit", "loss"]):
+                if ("p&l" in q_lower or "p & l" in q_lower or "profit" in q_lower) and any(h in name for h in ["p&l", "pl.", "pl_", "-pl", "profit", "loss"]):
                     return True
                 if "computation" in q_lower and "computation" in name:
                     return True
@@ -1044,7 +1110,7 @@ class LLMService:
                 # Increased retries to 3 to handle flaky free-tier models
                 for attempt in range(3):
                     try:
-                        return await retry_with_backoff(self.generate_answer, question, batch, batch_source_docs, doc_metadata)
+                        return await retry_with_backoff(self.generate_answer, question, batch, batch_source_docs, doc_metadata, company_id)
                     except Exception as e:
                         if attempt == 2: 
                             print(f"[ERROR] Batch failed after 3 attempts. Last error: {e}")
@@ -1073,9 +1139,11 @@ class LLMService:
         full_answers = [] # Aggregated textual responses
 
         try:
-            for future in asyncio.as_completed(running_tasks):
+            # Parallel Processing for Faster Time-to-First-Byte
+            # Use as_completed to yield results as soon as ANY batch finishes
+            for task in asyncio.as_completed(running_tasks):
                 try:
-                    result = await future
+                    result = await task
                     completed_count += 1
                 
                     # yield progress
@@ -1140,20 +1208,20 @@ class LLMService:
                                     desc_short = desc[:100] if len(desc) > 100 else desc
                                     fp = f"{date}|{amt}|{direction}|{desc_short}|{source_doc}|{bank_name}"
                             
-                                # if fp not in seen_fingerprints:
+                                if fp not in seen_fingerprints:
                                     # Apply secondary hard-coded filter
-                                if self._should_filter_transaction(t, question):
-                                    print(f"[FILTER] Dropped non-matching transaction: {desc[:50]}")
-                                    continue
-                                
-                                # seen_fingerprints.add(fp)
-                                unique_txs.append(t)
-                                all_unique_transactions.append(t)  # Store for source extraction
-                                # else:
-                                #     # Log when a transaction is being skipped as duplicate
-                                #     skipped_direction = str(t.get('direction', '')).upper()
-                                #     if skipped_direction == 'CREDIT':
-                                #         print(f"[DEBUG] Skipping duplicate CREDIT transaction: {date}|{amt}|{desc[:50]}")
+                                    if self._should_filter_transaction(t, question):
+                                        print(f"[FILTER] Dropped non-matching transaction: {desc[:50]}")
+                                        continue
+                                    
+                                    seen_fingerprints.add(fp)
+                                    unique_txs.append(t)
+                                    all_unique_transactions.append(t)  # Store for source extraction
+                                else:
+                                    # Log when a transaction is being skipped as duplicate
+                                    skipped_direction = str(t.get('direction', '')).upper()
+                                    if skipped_direction == 'CREDIT':
+                                        print(f"[DEBUG] Skipping duplicate CREDIT transaction: {date}|{amt}|{desc[:50]}")
 
                             if unique_txs:
                                 count = len(unique_txs)

@@ -160,6 +160,7 @@ async def upload_document(
     background_tasks: BackgroundTasks,
     folder_name: str = Form(..., alias="folderName"),
     parent_id: Optional[str] = Form(None, alias="parentId"),
+    customer_id: Optional[str] = Form(None, alias="customerId"),
     file: UploadFile = File(...),
     user=Depends(get_current_user)
 ):
@@ -177,8 +178,12 @@ async def upload_document(
         # Sanitize parent_id: "null" string or empty string should be None
         if parent_id and (parent_id.lower() == "null" or parent_id.strip() == ""):
             parent_id = None
+        
+        # Sanitize customer_id
+        if customer_id and (customer_id.lower() == "null" or customer_id.strip() == ""):
+            customer_id = None
 
-        print(f"[INFO] Received upload request: file={file.filename}, folder={folder_name}, company_id={company_id}")
+        print(f"[INFO] Received upload request: file={file.filename}, folder={folder_name}, customer={customer_id}, company_id={company_id}")
         
         # Validate file extension
         if not file.filename:
@@ -197,7 +202,7 @@ async def upload_document(
         file_obj = io.BytesIO(file_content)
         
         # Step 1: Resolve Folder
-        print(f"[INFO] Step 1: Resolving folder '{folder_name}' (parent_id: {parent_id})...")
+        print(f"[INFO] Step 1: Resolving folder '{folder_name}' (parent_id: {parent_id}, customer_id: {customer_id})...")
         
         target_folder_id = None
         
@@ -218,6 +223,12 @@ async def upload_document(
             else:
                 query = query.is_("parent_id", "null")
             
+            # Filter by customer_id if provided
+            if customer_id:
+                query = query.eq("customer_id", customer_id)
+            else:
+                query = query.is_("customer_id", "null")
+            
             check_folder = query.execute()
             
             if check_folder.data:
@@ -230,6 +241,7 @@ async def upload_document(
                     "name": folder_name,
                     "company_id": company_id,
                     "parent_id": parent_id,
+                    "customer_id": customer_id,
                     "created_by": user.id if hasattr(user, 'id') else None
                 }
                 new_folder = supabase_admin.table("folders").insert(new_folder_data).execute()

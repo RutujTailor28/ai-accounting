@@ -94,6 +94,25 @@ async def accounting_query(request_body: ChatQueryRequest, request: Request, use
             metadatas = all_results.get('metadatas', [])
             print(f"[INFO] Accounting endpoint: Retrieved {len(chunks)} chunks (ALL chunks from documents) for accounting synthesis")
             
+            # Deterministic Sorting
+            # Ensure chunks are processed in a stable order across runs
+            combined = []
+            for i in range(len(chunks)):
+                meta = metadatas[i] or {}
+                # Tie-breaker: content snippet
+                sort_key = (
+                    meta.get('document_name', ''),
+                    int(meta.get('chunk_index', 0)),
+                    chunks[i][:20]
+                )
+                combined.append((sort_key, chunks[i], meta))
+            
+            combined.sort(key=lambda x: x[0])
+            
+            chunks = [x[1] for x in combined]
+            metadatas = [x[2] for x in combined]
+            print(f"[INFO] Accounting endpoint: Sorted {len(chunks)} chunks for deterministic processing")
+
             # Filter out header/footer chunks that don't contain transaction-like patterns
             transaction_keywords = ['CASH', 'WDL', 'ATM', 'WITHDRAWAL', 'SELF', 'UPI', 'NEFT', 'IMPS', 'RTGS', 
                                   'PAYMENT', 'RECEIVED', 'TRANSFER', 'DEBIT', 'CREDIT', 
@@ -175,6 +194,28 @@ async def accounting_query(request_body: ChatQueryRequest, request: Request, use
             else:
                 print(f"[DEBUG] Accounting endpoint: First chunk preview (200 chars): {chunks[0][:200]}...")
 
+
+        previous_context = None
+        try:
+            # Fetch the last message from this session (assistant role)
+            last_msg_res = supabase.table("chat_messages") \
+                .select("content, data") \
+                .eq("session_id", str(request_body.session_id)) \
+                .eq("role", "assistant") \
+                .order("created_at", desc=True) \
+                .limit(1) \
+                .execute()
+            
+            if last_msg_res.data:
+                last_msg = last_msg_res.data[0]
+                # Check if it looks like a report (contains tables or report keywords)
+                content = last_msg.get("content", "")
+                if "Balance Sheet" in content or "Profit & Loss" in content or "|---|" in content:
+                    previous_context = content
+                    print(f"[INFO] Found previous report context for iteration (length: {len(previous_context)})")
+        except Exception as e:
+            print(f"[WARNING] Failed to retrieve previous context: {e}")
+
         # Step 3: Define Streaming Generator
         async def stream_generator():
             # Check if client disconnected before starting
@@ -184,7 +225,14 @@ async def accounting_query(request_body: ChatQueryRequest, request: Request, use
             
             full_response = ""
             # Prepare streaming from AccountingService
-            async for token in accounting_service.stream_accounting_synthesis(request_body.question, chunks, metadatas):
+            # Pass previous_context to enable refinement mode
+            async for token in accounting_service.stream_accounting_synthesis(
+                request_body.question, 
+                chunks, 
+                metadatas, 
+                company_id=company_id,
+                previous_context=previous_context
+            ):
                 # Check if client disconnected before yielding each token
                 if await request.is_disconnected():
                     print("[INFO] ✅ Client disconnected during accounting streaming, stopping processing")

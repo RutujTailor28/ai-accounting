@@ -19,6 +19,12 @@ class VectorStore:
             name="accounting_documents",
             metadata={"description": "RAG system for accounting documents"}
         )
+
+        # Create or get feedback collection
+        self.feedback_collection = self.client.get_or_create_collection(
+            name="accounting_feedback",
+            metadata={"description": "User corrections and feedback rules"}
+        )
         
         # --- DIMENSION SAFETY CHECK ---
         # If collection exists and has data, check if dimension matches
@@ -269,6 +275,73 @@ class VectorStore:
             print(f"[ERROR] Error resetting vector store: {str(e)}")
             return False
 
+
+    
+    def add_feedback(
+        self,
+        text: str,
+        embedding: List[float],
+        metadata: Dict[str, Any]
+    ) -> None:
+        """
+        Add a user correction (feedback) to the vector store.
+        """
+        try:
+            # Create a unique ID for the feedback rule
+            import uuid
+            feedback_id = str(uuid.uuid4())
+            
+            self.feedback_collection.add(
+                documents=[text],
+                embeddings=[embedding],
+                metadatas=[metadata],
+                ids=[feedback_id]
+            )
+            print(f"[INFO] Added feedback rule to vector store: {text[:50]}...")
+        except Exception as e:
+            print(f"[ERROR] Error adding feedback to vector store: {str(e)}")
+            raise
+
+    def query_feedback(
+        self,
+        query_embedding: List[float],
+        company_id: str,
+        n_results: int = 3
+    ) -> List[str]:
+        """
+        Find relevant past corrections for a given query/transaction.
+        """
+        try:
+            results = self.feedback_collection.query(
+                query_embeddings=[query_embedding],
+                n_results=n_results,
+                where={"company_id": company_id}
+            )
+            
+            # Extract the actual text rules (documents)
+            if results and results.get('documents'):
+                rules = results['documents'][0] if results['documents'] else []
+                print(f"[INFO] Found {len(rules)} relevant past corrections.")
+                return rules
+            
+            return []
+        except Exception as e:
+            print(f"[ERROR] Error querying feedback: {str(e)}")
+            return []
+    
+    def clear_company_feedback(self, company_id: str) -> bool:
+        """
+        Delete all feedback/corrections for a specific company.
+        """
+        try:
+            print(f"[INFO] Clearing all feedback for company {company_id}")
+            self.feedback_collection.delete(
+                where={"company_id": company_id}
+            )
+            return True
+        except Exception as e:
+            print(f"[ERROR] Error clearing feedback: {str(e)}")
+            return False
 
 # Global VectorStore instance
 vector_store = VectorStore()

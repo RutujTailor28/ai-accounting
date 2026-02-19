@@ -5,6 +5,7 @@ import hashlib
 from langchain_openai import ChatOpenAI
 from app.core.config import settings
 from app.services.ai_service import LLMService
+from app.ai.rag.retriever import vector_store
 
 class AccountingService:
     """Specialized service for accounting report generation (Journal Entries, Balance Sheets)."""
@@ -49,7 +50,7 @@ class AccountingService:
         normalized = re.sub(r'[^a-zA-Z0-9]', '', narration).lower()
         return normalized
 
-    async def _extract_transactions_from_batch(self, batch_chunks: List[str], context_query: str = None) -> List[Dict]:
+    async def _extract_transactions_from_batch(self, batch_chunks: List[str], context_query: str = None, company_id: str = None) -> List[Dict]:
         """
         Extract structured transaction data from a small batch of chunks.
         Uses content-based caching to ensure identical chunks produce identical results.
@@ -68,6 +69,8 @@ class AccountingService:
         known_accounts_str = ", ".join(list(self.shared_accounts)[:50]) if self.shared_accounts else "None yet"
         
         query_instruction = ""
+        feedback_context = ""
+
         if context_query:
             query_instruction = f"""
         USER INTENT: "{context_query}"
@@ -80,10 +83,26 @@ class AccountingService:
         3. CASH SEARCH: Exclude any line containing UPI, VPA, NEFT, or @ markers.
         4. UPI SEARCH: Exclude any line containing CASH, ATM, or WITHDRAWAL markers.
         """
+            # Agentic Feedback Injection
+            if company_id:
+                try:
+                    # Generate embedding for the query to find similar past mistakes
+                    from app.services.deps import embedding_service
+                    q_emb = embedding_service.generate_embedding(context_query)
+                    
+                    relevant_feedback = vector_store.query_feedback(q_emb, company_id)
+                    if relevant_feedback:
+                        feedback_context = "\n**LESSONS LEARNED (PAST USER CORRECTIONS):**\n"
+                        for i, fb in enumerate(relevant_feedback):
+                            feedback_context += f"- {fb}\n"
+                        print(f"[INFO] AccountingService: Injected {len(relevant_feedback)} past corrections into prompt for company {company_id}")
+                except Exception as e:
+                    print(f"[WARNING] AccountingService: Failed to retrieve feedback: {e}")
 
         prompt = f"""
         You are an expert Data Entry Clerk. Your task is to extract accounting transactions from the text below.
         {query_instruction}
+        {feedback_context}
 
         INPUT TEXT:
         {context}
@@ -160,12 +179,56 @@ class AccountingService:
         self,
         question: str,
         context_chunks: List[str],
-        context_metadatas: List[Dict[str, Any]] = None
+        context_metadatas: List[Dict[str, Any]] = None,
+        company_id: str = None,
+        previous_context: str = None
     ) -> AsyncGenerator[Union[str, Dict[str, str]], None]:
         """
         Stream the financial synthesis using a Map-Reduce strategy (Batch Extraction -> Final Report).
+        If previous_context is provided, it refines the existing report instead of starting from scratch.
         """
         
+        # --- REFINEMENT MODE (ITERATION) ---
+        if previous_context:
+            yield {"status": "Refining previous report based on feedback..."}
+            print(f"[INFO] Starting report refinement mode. Context length: {len(previous_context)}")
+            
+            refinement_prompt = f"""
+            You are an expert Senior Chartered Accountant. 
+            You previously generated a financial report (Balance Sheet / P&L) for the user.
+            The user has provided feedback or requested a change.
+            
+            YOUR TASK:
+            1. Update the report based on the USER FEEDBACK below.
+            2. **CRITICAL**: You MUST RECALCULATE all sub-totals and grand totals (Total Assets, Total Liabilities, Net Profit) to reflect the changes.
+            3. Maintain the exact same Markdown table structure.
+            4. Do NOT output any bolding (**) or headers (#) inside the tables, keep it plain text as before.
+            
+            ---
+            PREVIOUS REPORT:
+            {previous_context}
+            
+            ---
+            USER FEEDBACK / REQUEST:
+            "{question}"
+            
+            ---
+            UPDATED REPORT:
+            """
+            
+            try:
+                # Stream the refined report
+                async for chunk in self.llm.astream(refinement_prompt):
+                    if chunk.content:
+                        yield chunk.content
+            except Exception as e:
+                print(f"[ERROR] Refinement failed: {str(e)}")
+                yield f"\n[ERROR] Refinement failed: {str(e)}"
+            
+            return # Exit after refinement, do not proceed to extraction
+
+        # --- STANDARD GENERATION MODE ---
+
         if not context_chunks:
             yield "[ERROR] No context data provided."
             return
@@ -193,7 +256,7 @@ class AccountingService:
             async with sem:
                 # Add a small stagger to prevent all requests hitting exactly at t=0
                 await asyncio.sleep(index * 0.1) 
-                transactions = await self._extract_transactions_from_batch(batch_data, context_query=question)
+                transactions = await self._extract_transactions_from_batch(batch_data, context_query=question, company_id=company_id)
                 
                 # Tag transactions with source metadata for robust deduplication
                 if transactions and batch_metas:
@@ -474,10 +537,6 @@ class AccountingService:
 
         yield {"status": "Synthesizing Final Balance Sheet with AI..."}
 
-        
-        # PHASE 3: REPORT GENERATION (AI-Led Synthesis)
-        # We provide the AI with the clean Trial Balance and strict accounting rules.
-        # AI manages all calculations (P&L, Net Profit, BS Tally).
         
         prompt = f"""
 You are an expert Senior Chartered Accountant. Your task is to prepare finalized financial statements (Profit & Loss Account and Balance Sheet) based on the provided Trial Balance for Harsh Tailor.

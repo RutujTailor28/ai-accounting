@@ -65,6 +65,13 @@ async def stream_query_documents(request_body: QueryRequest, request: Request, u
     Stream query results for real-time updates (NDJSON format).
     """
     try:
+        # Step 0: Get user's verified company_id from profile
+        profile_res = supabase.table("profiles").select("company_id").eq("id", user.id).single().execute()
+        company_id = profile_res.data["company_id"]
+        
+        # Override the request body's company_id to ensure consistency
+        request_body.company_id = company_id
+
         print(f"[INFO] Received STREAM query request: question='{request_body.question}', company_id={request_body.company_id}")
         print(f"[INFO] Filters - file_types: {request_body.file_types}, folder_ids: {request_body.folder_ids}, uploaded_by: {request_body.uploaded_by}, tags: {request_body.tags}")
         
@@ -129,15 +136,50 @@ async def stream_query_documents(request_body: QueryRequest, request: Request, u
 
         # Retrieval logic
         q_lower = request_body.question.lower()
-        is_exhaustive = any(kw in q_lower for kw in [
+        
+        # 1. Check for explicit limit (e.g. "10 records", "top 5 transactions")
+        import re
+        limit_match = re.search(r'\b(\d+)\s*(?:records|rows|transactions|items|results|entries)\b', q_lower)
+        explicit_limit = int(limit_match.group(1)) if limit_match else None
+
+        # 2. Check for keywords that imply "ALL"
+        has_exhaustive_keywords = any(kw in q_lower for kw in [
             "all", "every", "sum", "total", "exhaustive", "upi", "cheque", "chq", "instrument",
             "cash", "atm", "self", "withdrawal"
         ])
-        # Summary/report questions should also scan broadly; otherwise top-k may miss the table.
-        is_summary = any(kw in q_lower for kw in ["balance sheet", "p&l", "profit", "loss", "report", "summary", "computation"])
         
-        if is_exhaustive or is_summary:
-            print(f"[INFO] Streaming exhaustive extraction for ALL chunks (is_exhaustive={is_exhaustive}, is_summary={is_summary})")
+        # 3. Check for summary/report keywords (Balance Sheet, P&L, etc.)
+        has_summary_keywords = any(kw in q_lower for kw in [
+            "balance sheet", "p&l", "p & l", "profit", "loss", "report", "summary", "computation"
+        ])
+
+        # 4. Check for active filters
+        # If specific folders, date range, file types, or tags are provided, user expects ALL matching data
+        has_active_filters = bool(
+            (request_body.start_date and request_body.end_date) or 
+            request_body.folder_ids or 
+            request_body.file_types or 
+            request_body.tags or
+            request_body.uploaded_by
+        )
+
+        # Decision Logic
+        if explicit_limit:
+            # Case A: User asked for a specific number. Honor it strictly.
+            is_exhaustive = False
+            is_summary = False
+            n_results = explicit_limit
+            print(f"[INFO] Explicit limit detected: {n_results}. Mode: Standard (Limited)")
+            
+        else:
+            # Case B: Default (Filters, Keywords, or General). Exhaustive Search.
+            # User wants "all records" by default unless a specific number is requested.
+            is_exhaustive = True
+            is_summary = has_summary_keywords
+            print(f"[INFO] Defaulting to Exhaustive Search (All Records). keywords={has_exhaustive_keywords}, filters={has_active_filters}")
+        
+        if is_exhaustive:
+            print(f"[INFO] Streaming exhaustive extraction for ALL chunks (is_summary={is_summary})")
             
             # Manual Pagination Loop to fetch ALL chunks safely
             all_chunks = []
@@ -205,7 +247,7 @@ async def stream_query_documents(request_body: QueryRequest, request: Request, u
                 'metadatas': [sorted_metas]
             }
         else:
-            n_results = 10
+            # n_results is already set in the Decision Logic block
             print(f"[INFO] Standard answer mode triggered (n_results={n_results})")
             results = vector_store.query(
                 query_embedding, 
@@ -295,7 +337,8 @@ async def stream_query_documents(request_body: QueryRequest, request: Request, u
                         question=effective_question,
                         context_chunks=documents,
                         source_documents=source_documents,
-                        batch_size=15 # Increased for efficiency and consistency with LLMService defaults
+                        batch_size=5, # Reduced for faster initial response
+                        company_id=request_body.company_id
                     ):
                         # Check if client disconnected before yielding each chunk
                         if await request.is_disconnected():
@@ -308,7 +351,8 @@ async def stream_query_documents(request_body: QueryRequest, request: Request, u
                     result = await llm_service.generate_answer(
                         question=effective_question,
                         context_chunks=documents,
-                        source_documents=source_documents
+                        source_documents=source_documents,
+                        company_id=request_body.company_id
                     )
                     
                     # Check disconnection before processing result
@@ -350,6 +394,13 @@ async def query_documents(request: QueryRequest, user=Depends(get_current_user))
     Query the RAG system and generate an answer.
     """
     try:
+        # Step 0: Get user's verified company_id from profile
+        profile_res = supabase.table("profiles").select("company_id").eq("id", user.id).single().execute()
+        company_id = profile_res.data["company_id"]
+        
+        # Override
+        request.company_id = company_id
+        
         print(f"[INFO] Received query request: question='{request.question}', company_id={request.company_id}")
         print(f"[INFO] Filters - file_types: {request.file_types}, folder_ids: {request.folder_ids}, uploaded_by: {request.uploaded_by}, tags: {request.tags}")
         
@@ -416,14 +467,46 @@ async def query_documents(request: QueryRequest, user=Depends(get_current_user))
             )
             
         # Retrieval logic based on question intent
-        # Added more keywords to ensure financial queries trigger exhaustive search
-        is_exhaustive = any(kw in request.question.lower() for kw in [
+        q_lower = request.question.lower()
+        
+        # 1. Check for explicit limit
+        import re
+        limit_match = re.search(r'\b(\d+)\s*(?:records|rows|transactions|items|results|entries)\b', q_lower)
+        explicit_limit = int(limit_match.group(1)) if limit_match else None
+
+        # 2. Check for keywords that imply "ALL"
+        has_exhaustive_keywords = any(kw in q_lower for kw in [
             "all", "every", "sum", "total", "exhaustive", "upi", "cheque", "chq", "instrument",
             "cash", "atm", "self", "withdrawal"
         ])
         
+        # 3. Check for summary/report keywords (Balance Sheet, P&L, etc.)
+        has_summary_keywords = any(kw in q_lower for kw in [
+            "balance sheet", "p&l", "p & l", "profit", "loss", "report", "summary", "computation"
+        ])
+
+        # 4. Check for active filters
+        has_active_filters = bool(
+            (request.start_date and request.end_date) or 
+            request.folder_ids or 
+            request.file_types or 
+            request.tags or
+            request.uploaded_by
+        )
+
+        # Decision Logic - Identical to streaming endpoint
+        if explicit_limit:
+            is_exhaustive = False
+            n_results = explicit_limit
+            print(f"[INFO] Explicit limit detected: {n_results}. Mode: Standard (Limited)")
+            
+        else:
+            # Default to Exhaustive
+            is_exhaustive = True
+            print(f"[INFO] Defaulting to Exhaustive Search (All Records). keywords={has_exhaustive_keywords}, filters={has_active_filters}")
+        
         if is_exhaustive:
-            print(f"[INFO] Exhaustive extraction mode triggered due to keywords in question")
+            print(f"[INFO] Exhaustive extraction mode triggered")
             # User has paid plan: Retrieve ALL chunks to ensure we don't miss transaction data
             print(f"[INFO] Retrieving ALL chunks for exhaustive extraction (Paid Plan Enabled) - Pagination & Sort")
             
@@ -487,16 +570,14 @@ async def query_documents(request: QueryRequest, user=Depends(get_current_user))
                 'metadatas': [sorted_metas]
             }
         else:
-            # For summary reports, increase chunk count to ensure we find the report table
-            is_summary = any(kw in request.question.lower() for kw in ["balance sheet", "p&l", "profit", "loss", "report", "summary", "computation"])
-            n_results = 100 if is_summary else 10
-            print(f"[INFO] Standard answer mode triggered (n_results={n_results}, is_summary={is_summary})")
+            # n_results is already set in the Decision Logic block
+            print(f"[INFO] Standard answer mode triggered (n_results={n_results})")
             results = vector_store.query(
                 query_embedding, 
                 company_id=request.company_id, 
                 n_results=n_results,
                 file_types=request.file_types,
-                folder_ids=folder_ids,
+                folder_ids=folder_ids, 
                 document_names=target_document_names if target_document_names else None,
                 uploaded_by=request.uploaded_by,
                 tags=request.tags
@@ -526,14 +607,16 @@ async def query_documents(request: QueryRequest, user=Depends(get_current_user))
             result = await llm_service.generate_exhaustive_answer(
                 question=effective_question,
                 context_chunks=documents,
-                source_documents=source_documents
+                source_documents=source_documents,
+                company_id=request.company_id
             )
         else:
             print(f"[INFO] Standard answer mode triggered")
             result = await llm_service.generate_answer(
                 question=effective_question,
                 context_chunks=documents,
-                source_documents=source_documents
+                source_documents=source_documents,
+                company_id=request.company_id
             )
         
         print(f"[INFO] Successfully generated answer for companyId={request.company_id} with {len(result['sources'])} sources")
