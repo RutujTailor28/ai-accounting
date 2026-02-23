@@ -22,29 +22,30 @@ async def signup(data: UserRegister):
         company_id = f"comp-{str(uuid.uuid4())[:8]}"
         print(f"[DEBUG] Generated company_id: {company_id}")
 
-        # Step 3: Register user in Supabase Auth using Admin Client
-        # Using Admin Client is more reliable for testing as it confirms the email automatically
+        # Step 3: Register user in Supabase Auth
+        # Using the standard sign_up client to trigger the automatic confirmation email
         try:
-            auth_res = supabase_admin.auth.admin.create_user({
+            auth_res = supabase.auth.sign_up({
                 "email": email,
                 "password": data.password,
-                "email_confirm": True,
-                "user_metadata": {
-                    "full_name": f"{data.first_name} {data.last_name}",
-                    "first_name": data.first_name,
-                    "last_name": data.last_name,
-                    "company_name": data.company_name,
-                    "company_id": company_id
+                "options": {
+                    "data": {
+                        "full_name": f"{data.first_name} {data.last_name}",
+                        "first_name": data.first_name,
+                        "last_name": data.last_name,
+                        "company_name": data.company_name,
+                        "company_id": company_id
+                    }
                 }
             })
         except Exception as auth_e:
             err_msg = str(auth_e).lower()
-            print(f"[ERROR] Supabase admin.create_user failed: {str(auth_e)}")
+            print(f"[ERROR] Supabase sign_up failed: {str(auth_e)}")
             
             if "already been registered" in err_msg or "already exists" in err_msg:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="User is already registered in Supabase Auth. Please delete the user from the Supabase Console (Authentication > Users) or use a different email."
+                    detail="User is already registered. Please check your email to confirm or try logging in."
                 )
             
             raise HTTPException(
@@ -57,6 +58,14 @@ async def signup(data: UserRegister):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Failed to create user account"
+            )
+
+        # In Supabase, if the user already exists, it returns a fake user with empty identities
+        # to prevent email enumeration. We can check for this to prevent FK constraint failures.
+        if getattr(auth_res.user, "identities", None) is not None and len(auth_res.user.identities) == 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="User is already registered. Please login or check your email for a confirmation link."
             )
 
         user_id = auth_res.user.id
@@ -79,7 +88,17 @@ async def signup(data: UserRegister):
         }
         
         # Using upsert to handle case where profile might already exist (e.g. from previous failed attempt)
-        profile_res = supabase_admin.table("profiles").upsert(profile_data).execute()
+        try:
+            profile_res = supabase_admin.table("profiles").upsert(profile_data).execute()
+        except Exception as profile_e:
+            err_msg = str(profile_e).lower()
+            if "profiles_id_fkey" in err_msg and "is not present in table" in err_msg:
+                # Fallback check if the empty identities trick missed the fake user
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="User is already registered. Please login or check your email for a confirmation link."
+                )
+            raise profile_e
 
         # Step 6: Assign 'admin' role to the first user
         try:
