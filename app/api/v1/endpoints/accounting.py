@@ -4,6 +4,7 @@ from typing import List, Dict, Any
 from uuid import UUID
 import json
 import re
+import uuid
 from app.schemas.chat import ChatQueryRequest, ChatMessageResponse
 from app.api.deps import get_current_user
 from app.core.supabase import supabase, supabase_admin
@@ -26,27 +27,82 @@ async def accounting_query(request_body: ChatQueryRequest, request: Request, use
         profile_res = supabase.table("profiles").select("company_id").eq("id", user.id).single().execute()
         company_id = profile_res.data["company_id"]
 
-        # Step 1: Resolve Workspace and its documents (High Context)
-        ws_res = supabase.table("workspaces").select("*").eq("id", str(request_body.workspace_id)).single().execute()
-        if not ws_res.data:
-            raise HTTPException(status_code=404, detail="Workspace not found")
-            
-        file_ids = ws_res.data.get("file_ids", [])
-        folder_ids = ws_res.data.get("folder_ids", [])
-
-        # Fetch all filenames
+        # Step 1: Resolve documents to query
         doc_names = []
-        if file_ids:
-            files_res = supabase.table("files").select("name").in_("id", file_ids).execute()
-            doc_names.extend([f["name"] for f in files_res.data])
-        if folder_ids:
-            folder_files_res = supabase.table("files").select("name").in_("folder_id", folder_ids).execute()
-            doc_names.extend([f["name"] for f in folder_files_res.data])
-        
-        doc_names = list(set(doc_names))
+        effective_workspace_id = str(request_body.workspace_id) if request_body.workspace_id else None
+        effective_customer_id = str(request_body.customer_id) if request_body.customer_id else None
 
-        if not doc_names:
-            raise HTTPException(status_code=400, detail="Workspace has no documents.")
+        if effective_customer_id:
+            # Get all folders for this customer
+            folders_res = supabase.table("folders") \
+                .select("id") \
+                .eq("customer_id", effective_customer_id) \
+                .is_("deleted_at", "null") \
+                .execute()
+            
+            customer_folder_ids = [f["id"] for f in folders_res.data]
+
+            if not customer_folder_ids:
+                raise HTTPException(status_code=400, detail="No folders found for this customer.")
+
+            query = supabase.table("files") \
+                .select("name") \
+                .in_("folder_id", customer_folder_ids) \
+                .is_("deleted_at", "null")
+            
+            if request_body.file_ids or request_body.folder_ids:
+                or_conditions = []
+                if request_body.file_ids:
+                    uuids = []
+                    names = []
+                    for fid in request_body.file_ids:
+                        fid_str = str(fid)
+                        try:
+                            uuid.UUID(fid_str)
+                            uuids.append(f'"{fid_str}"')
+                        except ValueError:
+                            names.append(f'"{fid_str}"')
+                    
+                    if uuids:
+                        or_conditions.append(f"id.in.({','.join(uuids)})")
+                    if names:
+                        or_conditions.append(f"name.in.({','.join(names)})")
+                        
+                if request_body.folder_ids:
+                    # Folder IDs are expected to be UUIDs in the database schema
+                    quoted_folder_ids = [f'"{str(foid)}"' for foid in request_body.folder_ids]
+                    or_conditions.append(f"folder_id.in.({','.join(quoted_folder_ids)})")
+                
+                if or_conditions:
+                    query = query.or_(",".join(or_conditions))
+            
+            files_res = query.execute()
+            doc_names.extend([f["name"] for f in files_res.data])
+
+            if not doc_names:
+                raise HTTPException(status_code=400, detail="No documents found for the selected customer context.")
+        else:
+            if not effective_workspace_id:
+                raise HTTPException(status_code=400, detail="Either workspace_id or customer_id must be provided")
+
+            ws_res = supabase.table("workspaces").select("*").eq("id", effective_workspace_id).single().execute()
+            if not ws_res.data:
+                raise HTTPException(status_code=404, detail="Workspace not found")
+                
+            file_ids = ws_res.data.get("file_ids", [])
+            folder_ids = ws_res.data.get("folder_ids", [])
+
+            if file_ids:
+                files_res = supabase.table("files").select("name").in_("id", file_ids).execute()
+                doc_names.extend([f["name"] for f in files_res.data])
+            if folder_ids:
+                folder_files_res = supabase.table("files").select("name").in_("folder_id", folder_ids).execute()
+                doc_names.extend([f["name"] for f in folder_files_res.data])
+            
+            doc_names = list(set(doc_names))
+
+            if not doc_names:
+                raise HTTPException(status_code=400, detail="Workspace has no documents.")
 
         # Step 2: Retrieve ALL Chunks (High Context for Reports)
         # For accounting reports, we often need the full story, so we pull more results than usual
@@ -262,11 +318,13 @@ async def accounting_query(request_body: ChatQueryRequest, request: Request, use
                 # Save User Question
                 user_msg_data = {
                     "session_id": str(request_body.session_id),
-                    "workspace_id": str(request_body.workspace_id),
+                    "workspace_id": effective_workspace_id,
+                    "customer_id": effective_customer_id,
                     "role": "user",
                     "content": request_body.question,
                     "company_id": company_id,
-                    "created_by": user.id
+                    "created_by": user.id,
+                    "file_names": doc_names
                 }
                 if session_title:
                     user_msg_data["session_title"] = session_title
@@ -279,12 +337,14 @@ async def accounting_query(request_body: ChatQueryRequest, request: Request, use
                 
                 msg_data = {
                     "session_id": str(request_body.session_id),
-                    "workspace_id": str(request_body.workspace_id),
+                    "workspace_id": effective_workspace_id,
+                    "customer_id": effective_customer_id,
                     "role": "assistant",
                     "content": full_response,
                     "company_id": company_id,
                     "created_by": user.id,
-                    "data": {"tables": structured_tables}
+                    "data": {"tables": structured_tables},
+                    "file_names": doc_names
                 }
                 if session_title:
                     msg_data["session_title"] = session_title

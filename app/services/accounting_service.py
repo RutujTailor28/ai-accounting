@@ -275,29 +275,28 @@ class AccountingService:
             batch_metas = context_metadatas[i*BATCH_SIZE : (i+1)*BATCH_SIZE] if context_metadatas else None
             tasks.append(process_batch(i, batch, batch_metas))
         
-        # Process batches in parallel but collect results in DETERMINISTIC ORDER
-        # This ensures the same chunks always produce results in the same sequence
-        batch_results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        # Process results in order
-        for i, result in enumerate(batch_results):
-            # Update progress
-            yield {"status": f"Extracting transactions (Batch {i+1}/{total_batches} complete)..."}
-            
-            # Handle exceptions
-            if isinstance(result, Exception):
-                print(f"[WARNING] Batch {i} extraction failed: {result}")
-                continue
-            
-            transactions = result
-            if transactions:
-                # Add to shared accounts to help next batches stay consistent
-                for t in transactions:
-                    for e in t.get('entries', []):
-                        self.shared_accounts.add(str(e.get('account')).strip().title())
+        # Process batches concurrently and stream status as each finishes
+        completed_batches = 0
+        for task in asyncio.as_completed(tasks):
+            try:
+                result = await task
+                completed_batches += 1
+                yield {"status": f"Extracting transactions (Batch {completed_batches}/{total_batches} complete)..."}
                 
-                all_transactions.extend(transactions)
-                print(f"[INFO] Batch {i} completed: Extracted {len(transactions)} transactions")
+                transactions = result
+                if transactions:
+                    # Add to shared accounts to help next batches stay consistent
+                    for t in transactions:
+                        for e in t.get('entries', []):
+                            self.shared_accounts.add(str(e.get('account')).strip().title())
+                    
+                    all_transactions.extend(transactions)
+                    print(f"[INFO] Batch completed: Extracted {len(transactions)} transactions")
+            
+            except Exception as e:
+                completed_batches += 1
+                yield {"status": f"Extracting transactions (Batch {completed_batches}/{total_batches} complete)..."}
+                print(f"[WARNING] Batch extraction failed: {e}")
 
         if not all_transactions:
             print("[WARNING] No transactions could be extracted from the documents.")
@@ -535,127 +534,58 @@ class AccountingService:
         if abs(total_debits - total_credits) > 0.01:
             yield f"\n IMBALANCE DETECTED: A mismatch of ₹ {abs(total_debits - total_credits):,.2f} was found in the data extraction. A Suspense Account has been added to balance the books.\n"
 
+        yield "\n3. Financial Statements (Profit & Loss and Balance Sheet)\n\n"
         yield {"status": "Synthesizing Final Balance Sheet with AI..."}
 
-        
         prompt = f"""
-You are an expert Senior Chartered Accountant. Your task is to prepare finalized financial statements (Profit & Loss Account and Balance Sheet) based on the provided Trial Balance for Harsh Tailor.
+You are an expert Senior Chartered Accountant. Prepare finalized financial statements (Profit & Loss and Balance Sheet) for Harsh Tailor using the provided Trial Balance.
 
-### STRICT FORMATTING RULE (CRITICAL)
-- DO NOT USE ANY MARKDOWN BOLDING (DOUBLE ASTERISKS **).
-- DO NOT USE MARKDOWN HEADERS (#, ##, etc.).
-- ALL TEXT MUST BE CLEAN, PLAIN TEXT WITHOUT BOLD FORMATTING OR HEADERS.
-- THIS APPLIES TO HEADERS, ACCOUNT NAMES, AND NUMBERS.
+### STRICT PRESENTATION RULES (MANDATORY)
+1. **SIDE-BY-SIDE T-ACCOUNT**: You MUST present both the P&L and Balance Sheet in a 4-column layout exactly as shown in the template.
+   - Column 1: Particulars (Dr Side) | Column 2: Amount | Column 3: Particulars (Cr Side) | Column 4: Amount
+2. **GROUPING**: DO NOT list every single transaction/account. GROUP similar accounts into meaningful categories:
+   - e.g., Group all "Upi/..." or "Bank..." transactions into "Sundry Payments" or "General Expenses".
+   - e.g., Group all "Bardoli/..." or "Cash..." into "Cash Sales" or "Receipts".
+3. **NO BOLDING**: Do NOT use markdown bolding (`**`).
+4. **NO HEADERS**: Do NOT use markdown headers (`#`).
+5. **DR/CR**: Include "Dr" and "Cr" on the line immediately above the P&L table.
 
----
-
-### ACCOUNTING RULES (IND AS & COMPANIES ACT 2013)
-
-1. CORE STRUCTURE (SCHEDULE III):
-   - Balance Sheet Equation: Assets = Liabilities + Equity.
-   - Classification: Must classify into Current and Non-Current.
-     - Current: Expected to be realized/settled within 12 months or operating cycle.
-     - Non-Current: Held for long-term use (> 12 months).
-
-2. VALUATION RULES:
-   - Cash and Bank: Face value.
-   - Accounts Receivable: Net Realizable Value (Gross - Allowance for doubtful debts).
-   - Inventory: Lower of Cost or Net Realisable Value (Ind AS 2).
-   - PPE (Property, Plant & Equipment): Cost less accumulated depreciation (Ind AS 16).
-   - Intangible Assets: Cost less accumulated amortization (Ind AS 38).
-   - Investments: Fair value or cost (Ind AS 109).
-   - Provisions: Recognized when there is a present obligation (Ind AS 37).
-
-3. DEPRECIATION & AMORTIZATION:
-   - Apply depreciation to tangible assets (PPE) and amortization to intangible assets (Ind AS 16/38).
-
-4. IMPAIRMENT (Ind AS 36):
-   - If recoverable amount < carrying amount, recognize impairment loss in P&L.
-
-5. DISCLOSURE REQUIREMENTS:
-   - Disclose Contingent Liabilities, Commitments, and Related Party Transactions in notes if applicable.
-
-6. PROFIT & LOSS (P&L) CALCULATION:
-   - Net Profit = (Total Revenue) - (Total Expenses). Use this to update Reserves & Surplus in Equity.
-
-7. SELF-AUDIT VERIFICATION:
-   - Perform math check: Total Assets MUST equal Total Liabilities + Equity.
-
----
-
-### INPUT DATA (TRIAL BALANCE)
+### TRIAL BALANCE DATA
 {trial_balance_summary}
 
 ---
 
-### REQUIRED OUTPUT FORMAT (SCHEDULE III COMPLIANT)
+Trading and Profit and Loss Account for the year ended 31st March 2024
+Dr Cr
+| Particulars | Amount (₹) | Particulars | Amount (₹) |
+|---|---|---|---|
+| To Opening Stock | [Amount] | By Sales | [Amount] |
+| To Purchases | [Amount] | By Closing Stock | [Amount] |
+| To Gross Profit c/d | [Amount] | | |
+| TOTAL | [Total] | TOTAL | [Total] |
+| | | By Gross Profit b/d | [Amount] |
+| To Indirect Expenses (Grouped) | [Amount] | By Indirect Income | [Amount] |
+| To Net Profit | [Amount] | | |
+| TOTAL | [Total] | TOTAL | [Total] |
 
-1. Profit & Loss Account
-| Particulars | Amount (₹) |
-|---|---|
-| Revenue/Sales | [Amount] |
-| (-) Cost of Goods Sold (COGS) | [Amount] |
-| Gross Profit | [Amount] |
-| (-) Operating Expenses: | |
-| - Salaries & Wages | [Amount] |
-| - Rent | [Amount] |
-| - Utilities | [Amount] |
-| - Depreciation & Amortization | [Amount] |
-| - Marketing & Advertising | [Amount] |
-| - Repairs & Maintenance | [Amount] |
-| - Administrative Expenses | [Amount] |
-| - Interest Expenses | [Amount] |
-| Operating Profit | [Amount] |
-| (+) Other Income | [Amount] |
-| (-) Tax Expenses | [Amount] |
-| Net Profit/Loss | [Amount] |
+Balance Sheet as at 31st March 2024
+Dr Cr
+| Liabilities | Amount (₹) | Assets | Amount (₹) |
+|---|---|---|---|
+| Capital Account | [Amount] | Fixed Assets | [Amount] |
+| Loans (Liabilities) | [Amount] | Investments | [Amount] |
+| Current Liabilities | [Amount] | Current Assets (Grouped) | [Amount] |
+| | | Cash & Bank Balances | [Amount] |
+| TOTAL | [Total] | TOTAL | [Total] |
 
-2. Balance Sheet
-ASSETS
-| Particulars | Amount (₹) |
-|---|---|
-| Non-Current Assets: | |
-| Property, Plant & Equipment | [Amount] |
-| Intangible Assets | [Amount] |
-| Long-Term Investments | [Amount] |
-| Deferred Tax Assets | [Amount] |
-| Current Assets: | |
-| Inventories | [Amount] |
-| Trade Receivables | [Amount] |
-| Cash & Bank Balances | [Amount] |
-| Prepaid Expenses | [Amount] |
-| Other Current Assets | [Amount] |
-| Total Assets | [Amount] |
+Notes & Disclosures:
+- [Add summary notes]
 
-EQUITY AND LIABILITIES
-| Particulars | Amount (₹) |
-|---|---|
-| Shareholders' Equity: | |
-| Share Capital | [Amount] |
-| Reserves & Surplus | [Amount] |
-| Non-Current Liabilities: | |
-| Long-Term Borrowings | [Amount] |
-| Deferred Tax Liabilities | [Amount] |
-| Current Liabilities: | |
-| Trade Payables | [Amount] |
-| Short-Term Borrowings | [Amount] |
-| Other Current Liabilities | [Amount] |
-| Total Equity and Liabilities | [Amount] |
+Validation:
+- Status: [TALLIED]
 
-3. Notes & Disclosures
-- Contingent Liabilities: [Details and Amount]
-- Related Party Transactions: [Details and Amount]
-- Impairment of Assets: [Details and Amount]
-
-4. Validation Summary:
-- Total Assets: ₹ [Amount]
-- Total Equity and Liabilities: ₹ [Amount]
-- Status: TALLIED (or "NOT TALLIED - ERROR: [Reason]")
-
----
-GO! Perform every calculation accurately and ensure the Balance Sheet side totals are identical. REMEMBER: NO BOLDING OR HEADERS.
+GO! Calculate accurately. Use T-ACCOUNT (4 COLUMNS). Group transactions. NO BOLDING.
 """
-
         try:
             async for chunk in self.llm.astream(prompt):
                 if chunk.content:
