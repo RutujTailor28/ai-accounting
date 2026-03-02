@@ -75,13 +75,14 @@ class AccountingService:
             query_instruction = f"""
         USER INTENT: "{context_query}"
         
-        STRICT PRE-FILTERING (MANDATORY):
-        1. Identify if the user is asking for a SPECIFIC transaction type (Cash, UPI, etc.).
-        2. FOR EACH TRANSACTION in the text:
-           - If it does NOT match the requested type, STOP and SKIP it.
-           - If it IS AMBIGUOUS, SKIP IT.
-        3. CASH SEARCH: Exclude any line containing UPI, VPA, NEFT, or @ markers.
-        4. UPI SEARCH: Exclude any line containing CASH, ATM, or WITHDRAWAL markers.
+        STRICT PRE-FILTERING RULES:
+        1. Identify if the user is asking for a SPECIFIC transaction filter (e.g., "only cash", "only UPI").
+        2. If the user is asking for a general report (e.g., "Balance Sheet", "P&L", "summary", "journal"):
+           - DO NOT SKIP ANY VALID BANK TRANSACTIONS. Extract everything.
+        3. ONLY if the user explicitly requested a specific filter:
+           - Skip transactions that DO NOT match the requested type.
+           - CASH SEARCH: Exclude any line containing UPI, VPA, NEFT, or @ markers.
+           - UPI SEARCH: Exclude any line containing CASH, ATM, or WITHDRAWAL markers.
         """
             # Agentic Feedback Injection
             if company_id:
@@ -100,7 +101,7 @@ class AccountingService:
                     print(f"[WARNING] AccountingService: Failed to retrieve feedback: {e}")
 
         prompt = f"""
-        You are an expert Data Entry Clerk. Your task is to extract accounting transactions from the text below.
+        You are an expert Professional Accountant and Data Entry Clerk. Your task is to extract accounting transactions from the text below.
         {query_instruction}
         {feedback_context}
 
@@ -120,6 +121,83 @@ class AccountingService:
         5. **CLASSIFICATION RULE (Ind AS)**:
            - **Current**: Expected to be settled/realized within 12 months.
            - **Non-Current**: Held for long-term use (> 12 months).
+
+        ### TRANSACTION INTERPRETATION RULE (MANDATORY)
+        The AI must read bank narration and determine:
+        1) Why the transaction happened
+        2) Which accounting head it belongs to
+        3) Which category it belongs to
+        The AI must behave like an experienced accountant.
+        The AI must interpret narration intelligently.
+        The AI must determine business purpose from narration.
+
+        ### ACCOUNT HEAD IDENTIFICATION RULE
+        For every transaction the AI must determine:
+        - Account Head
+        - Category
+        Example:
+        Narration: UPI PAYMENT AMAZON
+        Account Head: Purchase Expense
+        Category: Indirect Expense
+
+        ### ACCOUNT CATEGORY RULE (MANDATORY)
+        Every transaction must be assigned one of the following categories ONLY:
+        Direct Income
+        Indirect Income
+        Direct Expense
+        Indirect Expense
+        Current Assets
+        Current Liabilities
+        Equity
+
+        No other category names are allowed.
+        Income must be classified as: Direct Income or Indirect Income
+        Expenses must be classified as: Direct Expense or Indirect Expense
+        This fixes your Profit Loss = 0 problem.
+
+        ### INCOME DETECTION RULE
+        Credit transactions usually represent Income.
+        If narration contains:
+        UPI CR
+        NEFT CR
+        IMPS CR
+        RTGS CR
+        RECEIVED
+        BY TRANSFER
+        PAYMENT RECEIVED
+        Then classify as:
+        Account Head: Sales Income
+        Category: Direct Income
+
+        ### EXPENSE DETECTION RULE
+        Debit transactions usually represent Expenses.
+        If narration contains:
+        UPI DR
+        POS
+        ATM
+        PURCHASE
+        PAYMENT
+        FUEL
+        PETROL
+        ELECTRICITY
+        BILL
+        RECHARGE
+        BANK CHARGES
+        Then classify as:
+        Category: Indirect Expense
+
+        ### INTELLIGENT ACCOUNTING RULE
+        The AI must NOT classify most transactions as Transfer.
+        Transfer classification must be used ONLY if narration contains:
+        SELF TRANSFER
+        OWN ACCOUNT
+        ACCOUNT TRANSFER
+        Otherwise treat as business transaction.
+
+        ### MANDATORY TRANSACTION CLASSIFICATION
+        Every transaction must be classified.
+        No transaction should remain uncategorized.
+        Each transaction must belong to one category.
         
         REQUIRED JSON FORMAT:
         {{
@@ -135,33 +213,55 @@ class AccountingService:
             ]
         }}
         
-        VALID CATEGORIES (Ind AS / Schedule III):
-        - "Non-Current Assets" (PPE, Intangibles, Long-term Investments)
-        - "Current Assets" (Inventory, Receivables, Cash, Bank, Prepaid)
-        - "Equity" (Share Capital, Reserves & Surplus)
-        - "Non-Current Liabilities" (Long-term Borrowings, Deferred Tax)
-        - "Current Liabilities" (Payables, Short-term Borrowings, Accrued Expenses)
-        - "Direct Income"
-        - "Indirect Income"
-        - "Direct Expense"
-        - "Indirect Expense"
-        
         OUTPUT JSON ONLY:
         """
-        try:
-            # We use non-streaming call here for simpler parsing
-            response = await self.llm.ainvoke(prompt)
-            data = self.ai_service._extract_json(response.content)
-            transactions = data.get("transactions", [])
-            
-            # Cache the result for future use
-            self.extraction_cache[content_hash] = transactions
-            print(f"[CACHE STORE] Cached {len(transactions)} transactions for batch (hash: {content_hash[:8]}...)")
-            
-            return transactions
-        except Exception as e:
-            print(f"[WARNING] Batch extraction failed: {e}")
-            return []
+        max_retries = 5
+        base_delay = 10.0
+
+        for attempt in range(max_retries):
+            try:
+                # We use non-streaming call here for simpler parsing
+                response = await self.llm.ainvoke(prompt)
+                data = self.ai_service._extract_json(response.content)
+                transactions = data.get("transactions", [])
+                
+                # Cache the result for future use
+                self.extraction_cache[content_hash] = transactions
+                print(f"[CACHE STORE] Cached {len(transactions)} transactions for batch (hash: {content_hash[:8]}...)")
+                
+                return transactions
+            except Exception as e:
+                import traceback
+                error_msg = str(e).lower()
+                is_rate_limit = False
+                delay = base_delay * (2 ** attempt)
+
+                # Check if it's the exact openai RateLimitError
+                if type(e).__name__ == "RateLimitError" or "429" in error_msg or "rate limit" in error_msg:
+                    is_rate_limit = True
+                    # Try to extract the reset header if present in the error string
+                    import time
+                    try:
+                        if hasattr(e, 'response') and e.response is not None:
+                            reset_val = e.response.headers.get('x-ratelimit-reset')
+                            if reset_val:
+                                reset_timestamp = int(reset_val) / 1000.0  # MS to Sec
+                                current_timestamp = time.time()
+                                delay = max(delay, (reset_timestamp - current_timestamp) + 1.0)
+                    except Exception:
+                        pass # Fallback to standard exponential backoff
+                                
+                if is_rate_limit:
+                    if attempt < max_retries - 1:
+                        print(f"[RATE LIMIT] OpenRouter rate limit hit. Retrying in {delay:0.1f}s (Attempt {attempt+1}/{max_retries})...")
+                        await asyncio.sleep(delay)
+                        continue
+                
+                print(f"[WARNING] Batch extraction failed after {attempt + 1} attempts: {e}")
+                traceback.print_exc()
+                return []
+        
+        return []
 
     async def _get_broad_type(self, acc_name: str, cat_name: str, balance: float) -> str:
         """Helper to categorize account nature based on AI category and balance sign."""
@@ -249,13 +349,19 @@ class AccountingService:
         total_batches = len(batches)
         
         # Parallel Processing Setup
-        sem = asyncio.Semaphore(10) # Allow 10 concurrent batch requests for faster extraction
+        # Only allow 1 concurrent request to strictly align with 8 RPM limiting.
+        # OpenRouter's "free" tier is highly aggressive about concurrency.
+        sem = asyncio.Semaphore(1) 
         tasks = []
 
         async def process_batch(index, batch_data, batch_metas):
             async with sem:
-                # Add a small stagger to prevent all requests hitting exactly at t=0
-                await asyncio.sleep(index * 0.1) 
+                # We enforce sequential pacing of exactly ~8.0 seconds of sleep between consecutive calls
+                # to guarantee we never exceed 8 tokens/minute (60/8 = 7.5s).
+                if index > 0:
+                    print(f"[INFO] Sequential pacing: waiting 8.0 seconds before starting batch {index + 1}...")
+                    await asyncio.sleep(8.0)
+                    
                 transactions = await self._extract_transactions_from_batch(batch_data, context_query=question, company_id=company_id)
                 
                 # Tag transactions with source metadata for robust deduplication
@@ -365,10 +471,6 @@ class AccountingService:
         
         from datetime import date
         today = date.today().strftime("%Y-%m-%d")
-        yield "📒 FINANCIAL STATEMENTS (DRAFT)\n\n"
-        yield "STATUS: DRAFT / UNAUDITED\n"
-        yield "GENERATED BY: AI Assistant (Automated)\n"
-        yield f"DATE: {today}\n\n"
 
         yield "1. Professional Journal Book\n\n"
         yield "| Date | Particulars (Account) | L.F. | Debit (₹) | Credit (₹) | Narration |\n"
@@ -538,53 +640,144 @@ class AccountingService:
         yield {"status": "Synthesizing Final Balance Sheet with AI..."}
 
         prompt = f"""
-You are an expert Senior Chartered Accountant. Prepare finalized financial statements (Profit & Loss and Balance Sheet) for Harsh Tailor using the provided Trial Balance.
+You are a Professional Accountant with 10+ years of experience. You only process bank statements as your primary book of accounts.
+Prepare finalized financial statements for Harsh Tailor using the provided Trial Balance data.
 
-### STRICT PRESENTATION RULES (MANDATORY)
-1. **SIDE-BY-SIDE T-ACCOUNT**: You MUST present both the P&L and Balance Sheet in a 4-column layout exactly as shown in the template.
-   - Column 1: Particulars (Dr Side) | Column 2: Amount | Column 3: Particulars (Cr Side) | Column 4: Amount
-2. **GROUPING**: DO NOT list every single transaction/account. GROUP similar accounts into meaningful categories:
-   - e.g., Group all "Upi/..." or "Bank..." transactions into "Sundry Payments" or "General Expenses".
-   - e.g., Group all "Bardoli/..." or "Cash..." into "Cash Sales" or "Receipts".
-3. **NO BOLDING**: Do NOT use markdown bolding (`**`).
-4. **NO HEADERS**: Do NOT use markdown headers (`#`).
-5. **DR/CR**: Include "Dr" and "Cr" on the line immediately above the P&L table.
+### BANK STATEMENT ACCOUNTING MODE (MANDATORY)
+The system will receive only bank statements.
+The AI must behave like a professional accountant and prepare:
+- Opening Balance
+- Profit & Loss Statement
+- Balance Sheet
+- Closing Balance
+- Balance Verification
+All accounting must be derived strictly from bank transactions.
+No external data will be provided.
+The bank statement is the primary book of accounts.
+
+### OPENING BALANCE RULE (CRITICAL)
+Opening Balance must always be extracted from the bank statement.
+Opening Balance = First available balance value.
+The first balance value must always be treated as Opening Balance.
+Opening Balance must NOT be included in Profit & Loss.
+Opening Balance must be stored as:
+Assets:
+Bank Account = Opening Balance
+
+### CLOSING BALANCE RULE (CRITICAL)
+Closing Balance must be extracted from the bank statement.
+Closing Balance = Last available balance value.
+The last balance value must be used as Bank Balance in Balance Sheet.
+
+### PROFIT AND LOSS RULE (MANDATORY)
+Profit & Loss must always be generated from transactions.
+If transactions exist, Profit & Loss must NEVER be zero.
+Total Income = Sum of Direct Income + Indirect Income
+Total Expenses = Sum of Direct Expense + Indirect Expense
+Net Profit = Income - Expense
+Opening Balance must NOT be included.
+
+### BALANCE SHEET CALCULATION RULE (CRITICAL)
+The Balance Sheet must always satisfy:
+Total Assets = Total Liabilities + Total Equity
+If totals do not match, the AI must recalculate values.
+Balance Sheet must never be returned with mismatched totals.
+
+### BANK BALANCE RULE (MANDATORY)
+Bank Balance in Balance Sheet must always equal:
+Closing Balance from bank statement.
+Bank Balance must NEVER be calculated manually.
+Bank Balance = Last balance value in statement.
+This fixes 40% mismatch issues.
+
+### EQUITY CALCULATION RULE (CRITICAL)
+Equity must always be calculated as:
+Equity = Opening Balance + Net Profit - Drawings
+Where:
+Opening Balance = First balance value in bank statement
+Net Profit = Profit & Loss result
+Drawings = Owner withdrawals if detected
+Most systems forget Net Profit addition.
+
+### ASSET RULE
+Assets must include:
+Bank Balance
+Cash Withdrawals (if ATM withdrawals exist)
+Total Assets = Sum of all Assets.
+
+### LIABILITY RULE
+Liabilities must include:
+Loans detected from narration such as:
+LOAN CREDIT
+EMI
+FINANCE
+NBFC
+BANK LOAN
+Loan credits increase liabilities.
+EMI reduces liabilities.
+
+### BALANCE VERIFICATION RULE (MANDATORY)
+The AI must verify:
+Total Assets
+=
+Total Liabilities + Total Equity
+
+If mismatch occurs, AI must adjust Equity so that balance matches.
+If Total Assets ≠ Total Liabilities + Equity, Equity must be recalculated as:
+Equity = Total Assets - Total Liabilities
+
+### CRITICAL FINAL REMINDER
+If transactions exist, Profit & Loss must never return zero values.
+CRITICAL: You MUST list EVERY account marked as 'Expense' (e.g., Direct Expense, Indirect Expense, etc.) from the Trial Balance in the "Particulars (Dr)" column of the P&L Statement. Do not combine them into zero!
+If the Trial Balance contains ONLY Expenses and ZERO Income, you MUST still list every Expense in the P&L table, leave Income blank (or 0.00), and calculate a Net Loss.
+Net Profit / (Net Loss) = Total Income - Total Expenses
+If Total Expenses > Total Income, it is a NET LOSS. Show it clearly in the P&L table (By Net Loss) and subtract it from Equity.
+Returning a blank or "0.00" P&L table when Expenses or Income exist in the Trial Balance is STRICTLY FORBIDDEN.
+
+### TRANSACTION ACCOUNTING RULE
+Every transaction must affect either: Income, Expense, Asset, Liability, Equity. 
+No transaction should remain unclassified.
+
+### DEBUG OUTPUT RULE
+Before generating Profit & Loss, you must internally calculate:
+Total Credits, Total Debits, Income Amount, Expense Amount.
+If Income > 0 or Expense > 0, Profit & Loss must not be zero.
 
 ### TRIAL BALANCE DATA
 {trial_balance_summary}
 
 ---
 
-Trading and Profit and Loss Account for the year ended 31st March 2024
-Dr Cr
-| Particulars | Amount (₹) | Particulars | Amount (₹) |
+### REQUIRED OUTPUT FORMAT (MANDATORY)
+You MUST return the results EXACTLY in this 5-part structure, including the numbers. DO NOT output anything else.
+
+1) Opening Balance
+
+Opening Balance: [Opening Balance Amount]
+
+
+2) Profit & Loss Statement
+
+| Particulars (Dr) | Amount (₹) | Particulars (Cr) | Amount (₹) |
 |---|---|---|---|
-| To Opening Stock | [Amount] | By Sales | [Amount] |
-| To Purchases | [Amount] | By Closing Stock | [Amount] |
-| To Gross Profit c/d | [Amount] | | |
-| TOTAL | [Total] | TOTAL | [Total] |
-| | | By Gross Profit b/d | [Amount] |
-| To Indirect Expenses (Grouped) | [Amount] | By Indirect Income | [Amount] |
-| To Net Profit | [Amount] | | |
+| To [Specific Expense Account 1] | [Amount] | By [Specific Income Account 1] | [Amount] |
+| To [Specific Expense Account 2] | [Amount] | By [Specific Income Account 2] | [Amount] |
+| To [List ALL trial balance expenses!]| [Amount] | | |
+| To Net Profit (if Income > Expenses) | [Amount] | By Net Loss (if Expenses > Income) | [Amount] |
 | TOTAL | [Total] | TOTAL | [Total] |
 
-Balance Sheet as at 31st March 2024
-Dr Cr
-| Liabilities | Amount (₹) | Assets | Amount (₹) |
+
+3) Balance Sheet
+
+| Liabilities & Equity | Amount (₹) | Assets | Amount (₹) |
 |---|---|---|---|
-| Capital Account | [Amount] | Fixed Assets | [Amount] |
-| Loans (Liabilities) | [Amount] | Investments | [Amount] |
-| Current Liabilities | [Amount] | Current Assets (Grouped) | [Amount] |
-| | | Cash & Bank Balances | [Amount] |
+| Equity (Opening Bal) | [Amount] | Bank Balance | [Closing Balance Amount] |
+| Add: Net Profit | [Amount] | [Other Asset Accounts] | [Amount] |
+| Less: Net Loss | [Amount] | | |
+| Less: Drawings | [Amount] | | |
+| Add: Capital Intro | [Amount] | | |
+| Loans (Liabilities) | [Amount] | | |
 | TOTAL | [Total] | TOTAL | [Total] |
-
-Notes & Disclosures:
-- [Add summary notes]
-
-Validation:
-- Status: [TALLIED]
-
-GO! Calculate accurately. Use T-ACCOUNT (4 COLUMNS). Group transactions. NO BOLDING.
 """
         try:
             async for chunk in self.llm.astream(prompt):
@@ -594,9 +787,7 @@ GO! Calculate accurately. Use T-ACCOUNT (4 COLUMNS). Group transactions. NO BOLD
             print(f"[ERROR] Final Synthesis failed: {str(e)}")
             yield f"\n[ERROR] Final Synthesis failed: {str(e)}"
             
-        # FINAL DISCLAIMER
-        yield "\n---\n"
-        yield "DISCLAIMER: This report is a computer-generated DRAFT. It adheres to Indian Accounting Standards but strictly requires human verification before filing."
+            yield f"\n[ERROR] Final Synthesis failed: {str(e)}"
 
     async def _parse_markdown_tables(self, text: str) -> List[Dict[str, Any]]:
         """Extract structured data from markdown tables in text."""

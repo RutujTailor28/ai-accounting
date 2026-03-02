@@ -57,3 +57,7 @@ class ChatFeedbackCreate(CamelModel):
     feedback_text: Optional[str] = None
 class ChatUpdateTitleRequest(CamelModel):
     session_title: str = Field(..., min_length=1, max_length=255)
+
+class ChatMessageUpdateRequest(CamelModel):
+    content: Optional[str] = None
+    data: Optional[Any] = None

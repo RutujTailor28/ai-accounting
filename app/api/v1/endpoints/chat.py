@@ -3,7 +3,7 @@ from typing import List, Dict, Any, Optional
 from uuid import UUID
 import json
 import uuid
-from app.schemas.chat import ChatQueryRequest, ChatMessageResponse, ChatHistoryItem, ChatFeedbackCreate, ChatSaveRequest, ChatUpdateTitleRequest
+from app.schemas.chat import ChatQueryRequest, ChatMessageResponse, ChatHistoryItem, ChatFeedbackCreate, ChatSaveRequest, ChatUpdateTitleRequest, ChatMessageUpdateRequest
 from app.api.deps import get_current_user
 from app.core.supabase import supabase, supabase_admin
 from app.services.embedding_service import EmbeddingService
@@ -347,3 +347,30 @@ async def update_chat_session_title(session_id: UUID, request: ChatUpdateTitleRe
     except Exception as e:
         print(f"[ERROR] Error updating chat title: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@router.patch("/messages/{message_id}")
+async def update_chat_message(message_id: UUID, request: ChatMessageUpdateRequest, user=Depends(get_current_user)):
+    """Update a specific chat message's content or data."""
+    try:
+        update_data = {}
+        if request.content is not None:
+            update_data["content"] = request.content
+        if request.data is not None:
+            update_data["data"] = request.data
+            
+        if not update_data:
+            return {"status": "success", "message": "No fields to update"}
+            
+        result = supabase.table("chat_messages") \
+            .update(update_data) \
+            .eq("id", str(message_id)) \
+            .execute()
+            
+        if not result.data:
+            raise HTTPException(status_code=404, detail="Chat message not found")
+            
+        return {"status": "success"}
+    except Exception as e:
+        print(f"[ERROR] Error updating chat message: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+

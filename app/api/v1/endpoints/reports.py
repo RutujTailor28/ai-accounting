@@ -115,7 +115,7 @@ async def stream_query_documents(request_body: QueryRequest, request: Request, u
                         .execute()
                     
                     if customer_files.data:
-                        target_document_names = [f["name"] for f in customer_files.data]
+                        target_document_names = list(set([f["name"] for f in customer_files.data]))
                         print(f"[INFO] Resolved {len(target_document_names)} documents for customer {request_body.customer_id} in {len(effective_folder_ids)} folders")
                 
                 folder_ids = effective_folder_ids
@@ -192,8 +192,8 @@ async def stream_query_documents(request_body: QueryRequest, request: Request, u
                  company_id=request_body.company_id,
                  document_names=target_document_names if target_document_names else None,
                  file_types=request_body.file_types,
-                 # Strict folder filter: always apply if provided
-                 folder_ids=folder_ids,
+                 # Strict folder filter: always apply if provided, unless document names are successfully resolved
+                 folder_ids=folder_ids if not target_document_names else None,
                  uploaded_by=request_body.uploaded_by,
                  tags=request_body.tags
             )
@@ -254,7 +254,7 @@ async def stream_query_documents(request_body: QueryRequest, request: Request, u
                 company_id=request_body.company_id, 
                 n_results=n_results,
                 file_types=request_body.file_types,
-                folder_ids=folder_ids, 
+                folder_ids=folder_ids if not target_document_names else None, 
                 document_names=target_document_names if target_document_names else None,
                 uploaded_by=request_body.uploaded_by,
                 tags=request_body.tags
@@ -444,7 +444,7 @@ async def query_documents(request: QueryRequest, user=Depends(get_current_user))
                         .execute()
                     
                     if customer_files.data:
-                        target_document_names = [f["name"] for f in customer_files.data]
+                        target_document_names = list(set([f["name"] for f in customer_files.data]))
                         print(f"[INFO] Resolved {len(target_document_names)} documents for customer {request.customer_id} in {len(effective_folder_ids)} folders")
 
                 folder_ids = effective_folder_ids
@@ -521,7 +521,7 @@ async def query_documents(request: QueryRequest, user=Depends(get_current_user))
                  document_names=target_document_names if target_document_names else None,
                  file_types=request.file_types,
                  # Strict folder filter: always apply if provided
-                 folder_ids=folder_ids,
+                 folder_ids=folder_ids if not target_document_names else None,
                  uploaded_by=request.uploaded_by,
                  tags=request.tags
             )
@@ -577,7 +577,7 @@ async def query_documents(request: QueryRequest, user=Depends(get_current_user))
                 company_id=request.company_id, 
                 n_results=n_results,
                 file_types=request.file_types,
-                folder_ids=folder_ids, 
+                folder_ids=folder_ids if not target_document_names else None, 
                 document_names=target_document_names if target_document_names else None,
                 uploaded_by=request.uploaded_by,
                 tags=request.tags
