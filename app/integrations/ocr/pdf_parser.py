@@ -54,45 +54,48 @@ class DocumentParser:
     def _parse_pdf(file_content: BinaryIO) -> str:
         """
         Extract text from PDF file using hybrid approach:
-        1. Try native extraction (PyPDF2)
+        1. Try native extraction (pdfplumber)
         2. If text is insufficient/empty, fall back to OCR (pdf2image + pytesseract)
         """
-        # Create a copy of file_content for OCR if needed, as PyPDF2 might consume it
-        # We need bytes for pdf2image, so we read it all
+        # Create a copy of file_content for OCR if needed
         start_pos = file_content.tell()
         file_content.seek(0)
         file_bytes = file_content.read()
-        file_content.seek(start_pos) # Reset for safety if needed elsewhere, though we use bytes below
+        file_content.seek(start_pos) # Reset for safety
         
-        file_content_for_pypdf = io.BytesIO(file_bytes)
+        file_content_for_plumber = io.BytesIO(file_bytes)
         
-        # Method 1: Native Extraction
-        pdf_reader = PyPDF2.PdfReader(file_content_for_pypdf)
-        text_parts = []
-        
-        for page_num, page in enumerate(pdf_reader.pages):
-            text = page.extract_text()
-            if text and text.strip():
-                text_parts.append(text)
-        
-        full_text = '\n\n'.join(text_parts)
-        
+        # Method 1: Native Extraction with pdfplumber
+        try:
+            import pdfplumber
+            text_parts = []
+            
+            with pdfplumber.open(file_content_for_plumber) as pdf:
+                total_pages = len(pdf.pages)
+                for page in pdf.pages:
+                    # layout=True preserves visual spacing (columns/tables)
+                    text = page.extract_text(layout=True)
+                    if text and text.strip():
+                        text_parts.append(text)
+            
+            full_text = '\n\n'.join(text_parts)
+        except Exception as e:
+            print(f"[ERROR] pdfplumber native extraction failed: {str(e)}")
+            full_text = ""
+            total_pages = 0
+            
         # Heuristic: If we extracted very little text per page, it's likely a scanned document
-        # Threshold: < 50 characters average per page generally indicates a scan or image-heavy PDF
-        total_pages = len(pdf_reader.pages)
         avg_chars_per_page = len(full_text) / total_pages if total_pages > 0 else 0
         
         if len(full_text.strip()) < 100 or avg_chars_per_page < 50:
             print(f"[INFO] PDF text extraction insufficient ({len(full_text)} chars, avg {avg_chars_per_page:.1f}/page). Falling back to OCR.")
             try:
                 # Method 2: OCR with Tesseract
-                # Convert PDF to images
                 images = pdf2image.convert_from_bytes(file_bytes)
                 ocr_text_parts = []
                 
                 print(f"[INFO] OCR Processing {len(images)} pages...")
                 for i, image in enumerate(images):
-                    # Extract text from image
                     text = pytesseract.image_to_string(image)
                     if text.strip():
                         ocr_text_parts.append(text)
@@ -112,7 +115,7 @@ class DocumentParser:
                 print(f"[ERROR] OCR failed: {str(e)}. Returning natively extracted text.")
                 return full_text
         
-        print(f"[INFO] Extracted {len(full_text)} characters from PDF ({len(pdf_reader.pages)} pages) using native extraction")
+        print(f"[INFO] Extracted {len(full_text)} characters from PDF ({total_pages} pages) using native extraction")
         return full_text
     
     @staticmethod

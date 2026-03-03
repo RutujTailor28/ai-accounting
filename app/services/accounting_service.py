@@ -411,9 +411,11 @@ class AccountingService:
 
         print(f"[INFO] Total extracted transactions: {len(all_transactions)}")
         
-        # --- NO DEDUPLICATION ---
-        # Keep ALL transactions extracted by the AI, including any duplicates.
-        # Sort for deterministic ordering only.
+        # --- DEDUPLICATION ---
+        # Keep ONLY unique transactions to avoid double-counting due to overlapping text chunks.
+        
+        unique_transactions = []
+        seen_fingerprints = set()
         
         # Sort by date, then by total amount, then by narration for consistent processing
         def get_sort_key(t):
@@ -435,10 +437,32 @@ class AccountingService:
         
         all_transactions.sort(key=get_sort_key)
         print(f"[DEBUG] Transactions sorted for deterministic ordering")
-        print(f"[INFO] Keeping ALL {len(all_transactions)} transactions (deduplication disabled)")
         
-        # No deduplication - use all transactions as-is
-        print(f"[INFO] Total transactions after sorting: {len(all_transactions)} (no deduplication applied)")
+        for t in all_transactions:
+            date_str = str(t.get('date', '')).strip()
+            narration = str(t.get('narration', '')).strip()
+            
+            raw_entries = t.get('entries', [])
+            total_amount = sum(float(e.get('amount', 0)) for e in raw_entries if str(e.get('type')).upper() == "DEBIT")
+            if total_amount == 0 and raw_entries:
+                total_amount = sum(float(e.get('amount', 0)) for e in raw_entries if str(e.get('type')).upper() == "CREDIT")
+                
+            # Normalize narration for deduplication
+            import re
+            norm_narration = re.sub(r'[^a-zA-Z0-9]', '', narration).lower()
+            
+            # Simple fingerprint: Date + Amount + Alphanumeric Narration
+            # This is robust to slight LLM variation in narration capitalization or spaces
+            fingerprint = f"{date_str}_{total_amount:.2f}_{norm_narration}"
+            
+            if fingerprint not in seen_fingerprints:
+                seen_fingerprints.add(fingerprint)
+                unique_transactions.append(t)
+            else:
+                pass # Extracted duplicate dropped
+                
+        all_transactions = unique_transactions
+        print(f"[INFO] Total transactions after deduplication: {len(all_transactions)}")
         
         # --- VALIDATION: Calculate total debits and credits for consistency check ---
         total_validation_dr = 0.0
@@ -779,15 +803,24 @@ Opening Balance: [Opening Balance Amount]
 | Loans (Liabilities) | [Amount] | | |
 | TOTAL | [Total] | TOTAL | [Total] |
 """
-        try:
-            async for chunk in self.llm.astream(prompt):
-                if chunk.content:
-                    yield chunk.content
-        except Exception as e:
-            print(f"[ERROR] Final Synthesis failed: {str(e)}")
-            yield f"\n[ERROR] Final Synthesis failed: {str(e)}"
-            
-            yield f"\n[ERROR] Final Synthesis failed: {str(e)}"
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                if attempt > 0:
+                    yield f"\n\n[INFO] Connection dropped. Retrying synthesis (Attempt {attempt + 1}/{max_retries})...\n\n"
+                    
+                async for chunk in self.llm.astream(prompt):
+                    if chunk.content:
+                        yield chunk.content
+                # If we complete the stream without exception, we're done
+                break
+            except Exception as e:
+                print(f"[WARNING] Final Synthesis failed on attempt {attempt + 1}: {str(e)}")
+                if attempt == max_retries - 1:
+                    print(f"[ERROR] Final Synthesis failed after {max_retries} attempts: {str(e)}")
+                    yield f"\n[ERROR] Final Synthesis failed: {str(e)}"
+                else:
+                    await asyncio.sleep(3.0 * (attempt + 1))
 
     async def _parse_markdown_tables(self, text: str) -> List[Dict[str, Any]]:
         """Extract structured data from markdown tables in text."""

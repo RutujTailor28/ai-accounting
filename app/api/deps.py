@@ -85,11 +85,6 @@ def require_role(allowed_roles: List[str]):
             user_roles_data = response.data
             user_role_names = [item['roles']['name'] for item in user_roles_data if item.get('roles')]
             
-            # Check if any of the user's roles are in the allowed list
-            # We also check for 'superadmin' which often matches 'super_admin' based on user's request
-            # But the user specifically said "super admin", "admin", "user".
-            # The code was using "superadmin" and "admin".
-            
             if not any(role in allowed_roles for role in user_role_names):
                 # If the user is a superadmin, they should have access anyway for most things
                 if "superadmin" in user_role_names:
