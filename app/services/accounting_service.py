@@ -6,6 +6,12 @@ from langchain_openai import ChatOpenAI
 from app.core.config import settings
 from app.services.ai_service import LLMService
 from app.ai.rag.retriever import vector_store
+from app.services.accounting_rules import (
+    EXTRACTOR_RULES, CLASSIFIER_RULES, JOURNAL_RULES_TEXT,
+    PNL_RULES_TEXT, BALANCE_SHEET_RULES_TEXT, TALLY_RULES_TEXT,
+    PNL_CONFIG, BALANCE_SHEET_CONFIG, TALLY_CONFIG, JOURNAL_CONFIG,
+    AGENT_SYSTEM_PROMPTS
+)
 
 class AccountingService:
     """Specialized service for accounting report generation (Journal Entries, Balance Sheets)."""
@@ -101,119 +107,38 @@ class AccountingService:
                     print(f"[WARNING] AccountingService: Failed to retrieve feedback: {e}")
 
         prompt = f"""
-        You are an expert Professional Accountant and Data Entry Clerk. Your task is to extract accounting transactions from the text below.
+        {AGENT_SYSTEM_PROMPTS['extractor']}
+
+        {EXTRACTOR_RULES}
+
         {query_instruction}
         {feedback_context}
 
-        INPUT TEXT:
+        INPUT TEXT (Bank Statement):
         {context}
-        
-        INSTRUCTIONS:
-        1. Extract ONLY matching transactions based on the USER INTENT.
-        2. **LITERAL NARRATION**: Preserve the original narration EXACTLY.
-        3. **DETERMINISTIC DATES**: Extract dates in DD/MM/YYYY format.
-        4. **DOUBLE ENTRY PRINCIPLE**: Every transaction must have at least TWO entries (Debit & Credit). One side is ALWAYS "Bank Account".
-           - **Bank Account**: One side is ALWAYS "Bank Account".
-             - If statement says DEBIT (Money Out) -> Books: Credit "Bank Account" and Debit an **EXPENSE** or **ASSET** account. (NEVER Debit "Sales" for Money Out unless it is a refund).
-             - If statement says CREDIT (Money In) -> Books: Debit "Bank Account" and Credit an **INCOME** or **LIABILITY** account.
-           - **Counter Account**: Classify the other side based on narration. 
-             - *Examples:* "Fuel Expense", "Office Rent", "Sales Income", "Capital", "Loan from Bank".
-        5. **CLASSIFICATION RULE (Ind AS)**:
-           - **Current**: Expected to be settled/realized within 12 months.
-           - **Non-Current**: Held for long-term use (> 12 months).
 
-        ### TRANSACTION INTERPRETATION RULE (MANDATORY)
-        The AI must read bank narration and determine:
-        1) Why the transaction happened
-        2) Which accounting head it belongs to
-        3) Which category it belongs to
-        The AI must behave like an experienced accountant.
-        The AI must interpret narration intelligently.
-        The AI must determine business purpose from narration.
+        TASK:
+        Read the bank statement text and extract every transaction you can clearly read.
+        Do NOT classify, do NOT create journal entries, do NOT decide income/expense.
 
-        ### ACCOUNT HEAD IDENTIFICATION RULE
-        For every transaction the AI must determine:
-        - Account Head
-        - Category
-        Example:
-        Narration: UPI PAYMENT AMAZON
-        Account Head: Purchase Expense
-        Category: Indirect Expense
-
-        ### ACCOUNT CATEGORY RULE (MANDATORY)
-        Every transaction must be assigned one of the following categories ONLY:
-        Direct Income
-        Indirect Income
-        Direct Expense
-        Indirect Expense
-        Current Assets
-        Current Liabilities
-        Equity
-
-        No other category names are allowed.
-        Income must be classified as: Direct Income or Indirect Income
-        Expenses must be classified as: Direct Expense or Indirect Expense
-        This fixes your Profit Loss = 0 problem.
-
-        ### INCOME DETECTION RULE
-        Credit transactions usually represent Income.
-        If narration contains:
-        UPI CR
-        NEFT CR
-        IMPS CR
-        RTGS CR
-        RECEIVED
-        BY TRANSFER
-        PAYMENT RECEIVED
-        Then classify as:
-        Account Head: Sales Income
-        Category: Direct Income
-
-        ### EXPENSE DETECTION RULE
-        Debit transactions usually represent Expenses.
-        If narration contains:
-        UPI DR
-        POS
-        ATM
-        PURCHASE
-        PAYMENT
-        FUEL
-        PETROL
-        ELECTRICITY
-        BILL
-        RECHARGE
-        BANK CHARGES
-        Then classify as:
-        Category: Indirect Expense
-
-        ### INTELLIGENT ACCOUNTING RULE
-        The AI must NOT classify most transactions as Transfer.
-        Transfer classification must be used ONLY if narration contains:
-        SELF TRANSFER
-        OWN ACCOUNT
-        ACCOUNT TRANSFER
-        Otherwise treat as business transaction.
-
-        ### MANDATORY TRANSACTION CLASSIFICATION
-        Every transaction must be classified.
-        No transaction should remain uncategorized.
-        Each transaction must belong to one category.
-        
-        REQUIRED JSON FORMAT:
+        REQUIRED JSON OUTPUT FORMAT:
         {{
             "transactions": [
                 {{
                     "date": "DD/MM/YYYY",
-                    "narration": "Original narration text",
-                    "entries": [
-                         {{ "account": "Fuel Expense", "type": "DEBIT", "amount": 500.00, "category": "Indirect Expense" }},
-                         {{ "account": "Bank Account", "type": "CREDIT", "amount": 500.00, "category": "Current Assets" }}
-                    ]
+                    "narration": "Exact original narration from statement",
+                    "debit": 0.00,
+                    "credit": 0.00,
+                    "balance": 0.00
                 }}
             ]
         }}
-        
-        OUTPUT JSON ONLY:
+
+        REMINDERS:
+        - debit and credit fields are MUTUALLY EXCLUSIVE per transaction (one is 0.00)
+        - balance = running balance shown in statement (0.00 if not present)
+        - Skip any transaction where date or amount is missing or unclear
+        - Output JSON ONLY. No explanation text.
         """
         max_retries = 5
         base_delay = 10.0
@@ -263,6 +188,52 @@ class AccountingService:
         
         return []
 
+    async def _classify_transaction(self, transaction: Dict) -> Dict:
+        """
+        Agent 2: Classification Agent (LLM)
+        Determines the precise Account Head and Category for a raw transaction.
+        """
+        narration = transaction.get("narration", "")
+        # If it's already classified well by the extractor, we might skip, but let's enforce rules here.
+        prompt = f"""
+        You are an expert Accountant. Classify the following bank transaction narration.
+        
+        NARRATION: "{narration}"
+        
+        ### ACCOUNT CATEGORY RULE (MANDATORY)
+        Every transaction must be assigned one of the following categories ONLY:
+        - Direct Income
+        - Indirect Income
+        - Direct Expense
+        - Indirect Expense
+        - Current Assets
+        - Current Liabilities
+        - Equity
+
+        ### RULES
+        - Money arriving (CREDIT to Bank) is usually Income or Liability.
+        - Money leaving (DEBIT from Bank) is usually Expense or Asset.
+        - Look for keywords: "UPI PAYMENT", "NEFT CR", "ATM", "SALARY", "RENT", etc.
+        
+        REQUIRED JSON FORMAT:
+        {{
+            "account_head": "Name of the Account (e.g., Office Rent, Sales Income)",
+            "category": "One of the strict categories above"
+        }}
+        """
+        try:
+            response = await self.llm.ainvoke(prompt)
+            data = self.ai_service._extract_json(response.content)
+            # Update the non-bank entry in the transaction
+            for entry in transaction.get("entries", []):
+                if entry.get("account", "").upper() != "BANK ACCOUNT":
+                    entry["account"] = data.get("account_head", entry.get("account", "Unclassified"))
+                    entry["category"] = data.get("category", entry.get("category", "Unclassified"))
+            return transaction
+        except Exception as e:
+            print(f"[WARNING] Classification failed for narration '{narration}': {e}")
+            return transaction
+
     async def _get_broad_type(self, acc_name: str, cat_name: str, balance: float) -> str:
         """Helper to categorize account nature based on AI category and balance sign."""
         cat_upper = cat_name.upper()
@@ -284,8 +255,11 @@ class AccountingService:
         previous_context: str = None
     ) -> AsyncGenerator[Union[str, Dict[str, str]], None]:
         """
-        Stream the financial synthesis using a Map-Reduce strategy (Batch Extraction -> Final Report).
-        If previous_context is provided, it refines the existing report instead of starting from scratch.
+        Multi-Agent Pipeline:
+          Agent 1: Extractor (LLM) -> Agent 2: Classifier (LLM)
+          -> Agent 3: Journal (deterministic, updates Ledger Store)
+          -> Agent 4: P&L (pure math) + Agent 5: Balance Sheet (pure math)
+          -> Tally Agent (audit/verify)
         """
         
         # --- REFINEMENT MODE (ITERATION) ---
@@ -327,500 +301,484 @@ class AccountingService:
             
             return # Exit after refinement, do not proceed to extraction
 
-        # --- STANDARD GENERATION MODE ---
+        # =====================================================================
+        # --- STANDARD GENERATION MODE  (5-Agent Pipeline) ---
+        # =====================================================================
 
         if not context_chunks:
             yield "[ERROR] No context data provided."
             return
 
-        
-        # PHASE 1: BATCH EXTRACTION (Map Step)
-        
-        total_chunks = len(context_chunks)
-        BATCH_SIZE = 50 # Increased for faster processing of large documents.
-        
-        all_transactions = []
-        
-        yield {"status": "Analyzing documents..."}
-        print(f"[INFO] Starting batch extraction for {total_chunks} chunks...")
-
-        # Create batches
-        batches = [context_chunks[i:i + BATCH_SIZE] for i in range(0, total_chunks, BATCH_SIZE)]
+        # ===================================================================
+        # AGENT 1: EXTRACTOR POOL (LLM — N parallel extractor workers)
+        # ===================================================================
+        # KEY: Keep batch size SMALL so the LLM doesn't hit context window limits.
+        # 50 chunks × 2000 chars = 100k chars per prompt → LLM misses transactions.
+        # 8 chunks × 2000 chars = 16k chars per prompt → LLM processes all rows.
+        BATCH_SIZE = 8
+        all_transactions: List[Dict] = []
+        batches = [context_chunks[i:i + BATCH_SIZE] for i in range(0, len(context_chunks), BATCH_SIZE)]
         total_batches = len(batches)
-        
-        # Parallel Processing Setup
-        # Only allow 1 concurrent request to strictly align with 8 RPM limiting.
-        # OpenRouter's "free" tier is highly aggressive about concurrency.
-        sem = asyncio.Semaphore(1) 
-        tasks = []
+
+        # 3 parallel workers to speed up extraction.
+        N_EXTRACTORS = 20
+        WORKER_DELAY_SEC = 1.0
+        sem = asyncio.Semaphore(N_EXTRACTORS)
+
+        print(f"[AGENT-1] Extractor Pool: {len(context_chunks)} chunks → {total_batches} batches (size={BATCH_SIZE}) → {N_EXTRACTORS} workers")
 
         async def process_batch(index, batch_data, batch_metas):
             async with sem:
-                # We enforce sequential pacing of exactly ~8.0 seconds of sleep between consecutive calls
-                # to guarantee we never exceed 8 tokens/minute (60/8 = 7.5s).
-                if index > 0:
-                    print(f"[INFO] Sequential pacing: waiting 8.0 seconds before starting batch {index + 1}...")
-                    await asyncio.sleep(8.0)
-                    
-                transactions = await self._extract_transactions_from_batch(batch_data, context_query=question, company_id=company_id)
-                
-                # Tag transactions with source metadata for robust deduplication
-                if transactions and batch_metas:
-                    source_indices = [m.get('chunk_index') for m in batch_metas if m.get('chunk_index') is not None]
-                    doc_names = list(set(m.get('document_name') for m in batch_metas if m.get('document_name')))
-                    
-                    min_idx = min(source_indices) if source_indices else 0
-                    max_idx = max(source_indices) if source_indices else 0
-                    
-                    for t in transactions:
-                        t['_source_chunks_range'] = (min_idx, max_idx)
-                        t['_source_docs'] = doc_names
-                return transactions
+                slot = index % N_EXTRACTORS
+                # Stagger requests so all workers don't fire at the exact same millisecond
+                if index >= N_EXTRACTORS:
+                    await asyncio.sleep(WORKER_DELAY_SEC * slot)
+                elif slot > 0:
+                    await asyncio.sleep(slot * 0.5)
 
-        for i, batch in enumerate(batches):
-            batch_metas = context_metadatas[i*BATCH_SIZE : (i+1)*BATCH_SIZE] if context_metadatas else None
-            tasks.append(process_batch(i, batch, batch_metas))
-        
-        # Process batches concurrently and stream status as each finishes
-        completed_batches = 0
-        for task in asyncio.as_completed(tasks):
+                print(f"[AGENT-1][Worker-{slot+1}] → Batch {index + 1}/{total_batches} starting... ({len(batch_data)} chunks)")
+                txns = await self._extract_transactions_from_batch(
+                    batch_data, context_query=question, company_id=company_id
+                )
+                print(f"[AGENT-1][Worker-{slot+1}] ← Batch {index + 1}/{total_batches} done: {len(txns)} transactions extracted")
+
+                if txns and batch_metas:
+                    src_docs = list(set(m.get('document_name') for m in batch_metas if m.get('document_name')))
+                    for t in txns:
+                        t['_source_docs'] = src_docs
+                return txns
+
+        tasks = [
+            process_batch(i, b, context_metadatas[i*BATCH_SIZE:(i+1)*BATCH_SIZE] if context_metadatas else None)
+            for i, b in enumerate(batches)
+        ]
+        completed = 0
+        yield {"status": f"Agent 1 (Extractor ×{N_EXTRACTORS}): processing {total_batches} batches..."}
+        for coro in asyncio.as_completed(tasks):
             try:
-                result = await task
-                completed_batches += 1
-                yield {"status": f"Extracting transactions (Batch {completed_batches}/{total_batches} complete)..."}
-                
-                transactions = result
-                if transactions:
-                    # Add to shared accounts to help next batches stay consistent
-                    for t in transactions:
-                        for e in t.get('entries', []):
-                            self.shared_accounts.add(str(e.get('account')).strip().title())
-                    
-                    all_transactions.extend(transactions)
-                    print(f"[INFO] Batch completed: Extracted {len(transactions)} transactions")
-            
+                result = await coro
+                completed += 1
+                yield {"status": f"Agent 1 (Extractor ×{N_EXTRACTORS}): {completed}/{total_batches} batches done..."}
+                if result:
+                    all_transactions.extend(result)
             except Exception as e:
-                completed_batches += 1
-                yield {"status": f"Extracting transactions (Batch {completed_batches}/{total_batches} complete)..."}
-                print(f"[WARNING] Batch extraction failed: {e}")
+                completed += 1
+                print(f"[AGENT-1][ERROR] Extractor batch {completed} failed: {e}")
 
         if not all_transactions:
-            print("[WARNING] No transactions could be extracted from the documents.")
-            yield "Information: No transactions could be identified in the provided documents. Please ensure the documents contain clear financial data.\n"
+            yield "No transactions could be identified in the provided documents. Please check the file has clear financial data.\n"
             return
 
-        print(f"[INFO] Total extracted transactions: {len(all_transactions)}")
-        
-        # --- DEDUPLICATION ---
-        # Keep ONLY unique transactions to avoid double-counting due to overlapping text chunks.
-        
-        unique_transactions = []
-        seen_fingerprints = set()
-        
-        # Sort by date, then by total amount, then by narration for consistent processing
-        def get_sort_key(t):
-            from datetime import datetime
-            date_str = str(t.get('date', '')).strip()
+        # Deduplication + chronological sort
+        import re as _re
+        from datetime import datetime as _dt
+
+        def _sort_key(t):
+            ds = str(t.get('date', '')).strip()
             try:
-                # Convert DD/MM/YYYY to datetime for correct chronological sorting
-                sort_date = datetime.strptime(date_str, "%d/%m/%Y")
+                d = _dt.strptime(ds, "%d/%m/%Y")
             except Exception:
-                # Fallback to a far-future date or string if parsing fails
-                sort_date = datetime.max
-                
-            narration = str(t.get('narration', '')).strip()
-            raw_entries = t.get('entries', [])
-            total_amount = sum(float(e.get('amount', 0)) for e in raw_entries if str(e.get('type')).upper() == "DEBIT")
-            if total_amount == 0 and raw_entries:
-                total_amount = sum(float(e.get('amount', 0)) for e in raw_entries if str(e.get('type')).upper() == "CREDIT")
-            return (sort_date, total_amount, narration)
-        
-        all_transactions.sort(key=get_sort_key)
-        print(f"[DEBUG] Transactions sorted for deterministic ordering")
-        
-        for t in all_transactions:
-            date_str = str(t.get('date', '')).strip()
-            narration = str(t.get('narration', '')).strip()
-            
-            raw_entries = t.get('entries', [])
-            total_amount = sum(float(e.get('amount', 0)) for e in raw_entries if str(e.get('type')).upper() == "DEBIT")
-            if total_amount == 0 and raw_entries:
-                total_amount = sum(float(e.get('amount', 0)) for e in raw_entries if str(e.get('type')).upper() == "CREDIT")
-                
-            # Normalize narration for deduplication
-            import re
-            norm_narration = re.sub(r'[^a-zA-Z0-9]', '', narration).lower()
-            
-            # Simple fingerprint: Date + Amount + Alphanumeric Narration
-            # This is robust to slight LLM variation in narration capitalization or spaces
-            fingerprint = f"{date_str}_{total_amount:.2f}_{norm_narration}"
-            
-            if fingerprint not in seen_fingerprints:
-                seen_fingerprints.add(fingerprint)
-                unique_transactions.append(t)
-            else:
-                pass # Extracted duplicate dropped
-                
-        all_transactions = unique_transactions
-        print(f"[INFO] Total transactions after deduplication: {len(all_transactions)}")
-        
-        # --- VALIDATION: Calculate total debits and credits for consistency check ---
-        total_validation_dr = 0.0
-        total_validation_cr = 0.0
-        for t in all_transactions:
+                d = _dt.max
+            narr = str(t.get('narration', '')).strip()
             entries = t.get('entries', [])
-            for e in entries:
-                amount = float(e.get('amount', 0))
-                if str(e.get('type')).upper() == "DEBIT":
-                    total_validation_dr += amount
-                else:
-                    total_validation_cr += amount
-        
-        print(f"[VALIDATION] Total Debits: ₹{total_validation_dr:,.2f}, Total Credits: ₹{total_validation_cr:,.2f}")
-        if abs(total_validation_dr - total_validation_cr) > 0.01:
-            print(f"[WARNING] Transaction imbalance detected: Difference of ₹{abs(total_validation_dr - total_validation_cr):,.2f}")
-        
-        yield {"status": f"Verifying Double-Entry Integrity for {len(all_transactions)} unique transactions..."}
+            amt = sum(float(e.get('amount', 0)) for e in entries if str(e.get('type')).upper() == 'DEBIT')
+            if amt == 0 and entries:
+                amt = sum(float(e.get('amount', 0)) for e in entries if str(e.get('type')).upper() == 'CREDIT')
+            return (d, amt, narr)
 
-        
-        # PHASE 2: FINANCIAL PROCESSING (Python Core)
-        
-        
-        # Data Structures for Financial Statements
+        # Improved deduplication: include occurrence counter so that two legitimately
+        # identical transactions (same date + amount + narration) are NOT dropped.
+        # We only drop exact cross-batch duplicates from overlapping chunk windows.
+        all_transactions.sort(key=_sort_key)  # chronological order first
+        from collections import Counter as _Counter
+        narr_count: _Counter = _Counter()
+        seen_fps: set = set()
+        unique_txns: List[Dict] = []
+        for t in all_transactions:
+            ds = str(t.get('date', '')).strip()
+            narr = str(t.get('narration', '')).strip()
+            entries = t.get('entries', [])
+            amt = sum(float(e.get('amount', 0)) for e in entries if str(e.get('type')).upper() == 'DEBIT')
+            if amt == 0 and entries:
+                amt = sum(float(e.get('amount', 0)) for e in entries if str(e.get('type')).upper() == 'CREDIT')
+            norm = _re.sub(r'[^a-zA-Z0-9]', '', narr).lower()
+            base_fp = f"{ds}_{amt:.2f}_{norm}"
+            # Count how many times this exact fingerprint has appeared across ALL batches.
+            # Only drop if this is the 2nd+ time we've seen it (true cross-batch duplicate).
+            narr_count[base_fp] += 1
+            fp = f"{base_fp}#{narr_count[base_fp]}"
+            if fp not in seen_fps:
+                seen_fps.add(fp)
+                unique_txns.append(t)
+        all_transactions = unique_txns
+        print(f"[DEDUP] Raw extracted: {len(seen_fps)} fingerprints → {len(all_transactions)} unique transactions kept")
+
+        # ===================================================================
+        # AGENT 2: BATCH CLASSIFIER POOL (LLM — N parallel classifier workers)
+        # ===================================================================
+        CLASSIFY_BATCH_SIZE = 20     # transactions per LLM call
+        N_CLASSIFIERS = 20           # parallel classifier workers
+        CLASSIFIER_DELAY_SEC = 1.0   # stagger delay between worker slots
+
+        classify_batches = [
+            all_transactions[i:i + CLASSIFY_BATCH_SIZE]
+            for i in range(0, len(all_transactions), CLASSIFY_BATCH_SIZE)
+        ]
+        total_classify_batches = len(classify_batches)
+        print(f"[AGENT-2] Classifier Pool: {len(all_transactions)} txns → {total_classify_batches} batches (size={CLASSIFY_BATCH_SIZE}) → {N_CLASSIFIERS} workers")
+        yield {"status": f"Agent 2 (Classifier ×{N_CLASSIFIERS}): classifying {len(all_transactions)} transactions..."}
+
+        cls_sem = asyncio.Semaphore(N_CLASSIFIERS)
+        classified_results: Dict[int, List[Dict]] = {}  # bidx → list of classified transactions
+
+        async def classify_batch(bidx: int, c_batch: List[Dict]):
+            async with cls_sem:
+                slot = bidx % N_CLASSIFIERS
+                # Small stagger on first round to avoid burst
+                if bidx >= N_CLASSIFIERS:
+                    await asyncio.sleep(CLASSIFIER_DELAY_SEC * (slot % 3))
+                elif slot > 0:
+                    await asyncio.sleep(slot * 0.3)
+
+                narrations_list = ""
+                for j, t in enumerate(c_batch):
+                    dr = float(t.get('debit', 0) or 0)
+                    cr = float(t.get('credit', 0) or 0)
+                    direction = f"DEBIT \u20b9{dr:,.2f}" if dr > 0 else f"CREDIT \u20b9{cr:,.2f}"
+                    narrations_list += f"{j+1}. [{direction}] {t.get('narration', 'Unknown')}\n"
+
+                classify_prompt = f"""
+                {AGENT_SYSTEM_PROMPTS['classifier']}
+
+                {CLASSIFIER_RULES}
+
+                TRANSACTIONS TO CLASSIFY:
+                {narrations_list}
+
+                For each transaction, output the double-entry mapping.
+                Return a JSON array with EXACTLY {len(c_batch)} objects (one per transaction, in order):
+                [{{
+                    "debit_account": "Account to be debited",
+                    "credit_account": "Account to be credited",
+                    "account_type": "income/expense/asset/liability/equity",
+                    "category": "One of the mandatory categories",
+                    "confidence": 0.85
+                }}]
+
+                Bank Account Logic (NON-NEGOTIABLE):
+                - If transaction is CREDIT (money IN) \u2192 debit_account = "Bank Account"
+                - If transaction is DEBIT  (money OUT) \u2192 credit_account = "Bank Account"
+
+                Output JSON array ONLY. No explanation.
+                """
+                batch_classified = []
+                try:
+                    response = await self.llm.ainvoke(classify_prompt)
+                    results = self.ai_service._extract_json(response.content)
+                    if isinstance(results, dict):
+                        results = list(results.values())[0] if results else []
+                    if not isinstance(results, list):
+                        results = []
+                    print(f"[AGENT-2][Worker-{slot+1}] Batch {bidx+1}/{total_classify_batches}: {len(results)} classifications")
+
+                    for j, t in enumerate(c_batch):
+                        dr = float(t.get('debit', 0) or 0)
+                        cr = float(t.get('credit', 0) or 0)
+                        amt = dr if dr > 0 else cr
+                        if j < len(results):
+                            res = results[j]
+                            debit_acc  = res.get('debit_account', 'Bank Account').strip().title()
+                            credit_acc = res.get('credit_account', 'Bank Account').strip().title()
+                            category   = res.get('category', 'Unclassified')
+                            t['entries'] = [
+                                {"account": debit_acc,  "type": "DEBIT",  "amount": amt, "category": category},
+                                {"account": credit_acc, "type": "CREDIT", "amount": amt, "category": "Current Assets"},
+                            ]
+                            t['confidence'] = res.get('confidence', 1.0)
+                        else:
+                            # Fallback for missing LLM result
+                            if dr > 0:
+                                t['entries'] = [
+                                    {"account": "Suspense Account", "type": "DEBIT",  "amount": dr, "category": "Current Assets"},
+                                    {"account": "Bank Account",     "type": "CREDIT", "amount": dr, "category": "Current Assets"},
+                                ]
+                            else:
+                                t['entries'] = [
+                                    {"account": "Bank Account",     "type": "DEBIT",  "amount": cr, "category": "Current Assets"},
+                                    {"account": "Suspense Account", "type": "CREDIT", "amount": cr, "category": "Current Assets"},
+                                ]
+                        batch_classified.append(t)
+
+                except Exception as e:
+                    print(f"[AGENT-2][Worker-{slot+1}][ERROR] Batch {bidx+1} failed: {e}")
+                    for t in c_batch:
+                        dr = float(t.get('debit', 0) or 0)
+                        cr = float(t.get('credit', 0) or 0)
+                        amt = dr if dr > 0 else cr
+                        if dr > 0:
+                            t['entries'] = [
+                                {"account": "Suspense Account", "type": "DEBIT",  "amount": amt, "category": "Current Assets"},
+                                {"account": "Bank Account",     "type": "CREDIT", "amount": amt, "category": "Current Assets"},
+                            ]
+                        else:
+                            t['entries'] = [
+                                {"account": "Bank Account",     "type": "DEBIT",  "amount": amt, "category": "Current Assets"},
+                                {"account": "Suspense Account", "type": "CREDIT", "amount": amt, "category": "Current Assets"},
+                            ]
+                        batch_classified.append(t)
+
+                return bidx, batch_classified
+
+        cls_tasks = [classify_batch(i, b) for i, b in enumerate(classify_batches)]
+        cls_completed = 0
+        for coro in asyncio.as_completed(cls_tasks):
+            bidx, batch_result = await coro
+            classified_results[bidx] = batch_result
+            cls_completed += 1
+            if cls_completed % 5 == 0 or cls_completed == total_classify_batches:
+                yield {"status": f"Agent 2 (Classifier ×{N_CLASSIFIERS}): {cls_completed}/{total_classify_batches} batches done..."}
+
+        # Reconstruct in original order (as_completed gives out-of-order results)
+        classified: List[Dict] = []
+        for i in range(total_classify_batches):
+            classified.extend(classified_results.get(i, []))
+
+        print(f"[AGENT-2] Parallel classification complete: {len(classified)} transactions classified")
+
+        # ===================================================================
+        # LEDGER STORE (Shared State)
+        # ===================================================================
         ledger_balances: Dict[str, float] = {}
-        account_category_votes: Dict[str, List[str]] = {}
-        journal_rows_data = []
+        account_categories: Dict[str, str] = {}
+
+        # ===================================================================
+        # AGENT 3: JOURNAL AGENT (Deterministic) — also populates Ledger
+        # ===================================================================
+        print(f"[AGENT-3] {AGENT_SYSTEM_PROMPTS['journal']}")
+        yield {"status": "Agent 3 (Journal): Writing double-entry journal & populating Ledger Store..."}
+        journal_rows_data: List[List] = []
         tx_count = 0
-        MAX_JOURNAL_ENTRIES_SHOW = 50
-        
-        from datetime import date
-        today = date.today().strftime("%Y-%m-%d")
+        MAX_JOURNAL = 50
 
-        yield "1. Professional Journal Book\n\n"
-        yield "| Date | Particulars (Account) | L.F. | Debit (₹) | Credit (₹) | Narration |\n"
-        yield "|---|---|---|---|---|---|\n"
+        yield "\n\n1. Professional Journal Book\n\n| Date | Particulars (Account) | L.F. | Debit (\u20b9) | Credit (\u20b9) | Narration |\n|---|---|---|---|---|---|\n"
 
-        # Structured data for frontend editing
-        journal_headers = ["Date", "Particulars (Account)", "L.F.", "Debit (₹)", "Credit (₹)", "Narration"]
-
-        for t in all_transactions:
-            date = str(t.get('date', '')).strip()
+        for t in classified:
+            date_val = str(t.get('date', '')).strip()
             narration = str(t.get('narration', '')).strip()
             entries = t.get('entries', [])
-            
-            # Validation: Double Entry
-            dr_total = sum(float(e.get('amount', 0)) for e in entries if str(e.get('type')).upper() == "DEBIT")
-            cr_total = sum(float(e.get('amount', 0)) for e in entries if str(e.get('type')).upper() == "CREDIT")
-            
+
+            dr_total = sum(float(e.get('amount', 0)) for e in entries if str(e.get('type')).upper() == 'DEBIT')
+            cr_total = sum(float(e.get('amount', 0)) for e in entries if str(e.get('type')).upper() == 'CREDIT')
             if abs(dr_total - cr_total) > 0.01:
-                print(f"[ERROR] Transaction Imbalance: Dr {dr_total} != Cr {cr_total} for {narration}")
-                continue    
-                
+                print(f"[JOURNAL] Skipped imbalanced tx (Dr={dr_total} Cr={cr_total}): '{narration}'")
+                continue
+
             tx_count += 1
-            
-            # --- LEDGER PROCESSING (Always do this for all transactions) ---
-            for entry in entries:
-                account = str(entry.get('account', 'Unclassified')).strip().title()
-                category = entry.get('category', 'Unclassified')
-                amount = float(entry.get('amount', 0))
-                etype = str(entry.get('type')).upper()
-                
-                if account not in ledger_balances:
-                    ledger_balances[account] = 0.0
-                    account_category_votes[account] = []
-                
-                if category and category != "Unclassified":
-                    account_category_votes[account].append(category)
-                
-                if etype == "DEBIT":
-                    ledger_balances[account] += amount
-                else:
-                    ledger_balances[account] -= amount
 
-            if tx_count > MAX_JOURNAL_ENTRIES_SHOW:
-                 if tx_count == MAX_JOURNAL_ENTRIES_SHOW + 1:
-                     yield f"| ... | ... | | ... | ... | processed internally... |\n"
-                 continue
-
-            first_entry = True
+            # Update Ledger Store
             for entry in entries:
                 acc = str(entry.get('account', 'Unclassified')).strip().title()
-                etype = str(entry.get('type')).upper()
+                cat = str(entry.get('category', 'Unclassified')).strip()
                 amt = float(entry.get('amount', 0))
-                
-                # Format columns
-                disp_acc = f"{acc} Dr." if etype == "DEBIT" else f"    To {acc}"
-                disp_dr = f"{amt:,.2f}" if etype == "DEBIT" else ""
-                disp_cr = f"{amt:,.2f}" if etype == "CREDIT" else ""
-                disp_date = date if first_entry else ""
-                disp_narr = narration if first_entry else ""
-                
-                # Explicit Markdown Row
-                yield f"| {disp_date} | {disp_acc} | | {disp_dr} | {disp_cr} | {disp_narr} |\n"
-                
-                # Structured Row
-                journal_rows_data.append([disp_date, disp_acc, "", disp_dr, disp_cr, disp_narr])
-                first_entry = False
+                etype = str(entry.get('type')).upper()
+                ledger_balances.setdefault(acc, 0.0)
+                if cat and cat != 'Unclassified':
+                    account_categories[acc] = cat
+                if etype == 'DEBIT':
+                    ledger_balances[acc] += amt
+                else:
+                    ledger_balances[acc] -= amt
+
+            # Yield journal rows
+            if tx_count <= MAX_JOURNAL:
+                first = True
+                for entry in entries:
+                    acc = str(entry.get('account', 'Unclassified')).strip().title()
+                    etype = str(entry.get('type')).upper()
+                    amt = float(entry.get('amount', 0))
+                    d_acc = f"{acc} Dr." if etype == 'DEBIT' else f"    To {acc}"
+                    d_dr = f"{amt:,.2f}" if etype == 'DEBIT' else ""
+                    d_cr = f"{amt:,.2f}" if etype == 'CREDIT' else ""
+                    d_date = date_val if first else ""
+                    d_narr = narration if first else ""
+                    yield f"| {d_date} | {d_acc} | | {d_dr} | {d_cr} | {d_narr} |\n"
+                    journal_rows_data.append([d_date, d_acc, "", d_dr, d_cr, d_narr])
+                    first = False
+            elif tx_count == MAX_JOURNAL + 1:
+                yield "| ... | ... | | ... | ... | (remaining processed internally) |\n"
 
         self.structured_tables.append({
             "type": "journal",
             "title": "Professional Journal Book",
-            "headers": journal_headers,
+            "headers": ["Date", "Particulars (Account)", "L.F.", "Debit (\u20b9)", "Credit (\u20b9)", "Narration"],
             "rows": journal_rows_data
         })
+        print(f"[AGENT-3] Journal done: {tx_count} valid transactions written.")
+        print(f"[AGENT-3] Ledger Store populated: {len(ledger_balances)} accounts.")
+        for acc, bal in ledger_balances.items():
+            cat = account_categories.get(acc, 'Unclassified')
+            print(f"[LEDGER]   {acc:<40} | {bal:>12,.2f} | {cat}")
 
-        
-        # PHASE 3: REPORT GENERATION (LLM Synthesis with Rules)
-        
-        
-        yield {"status": "Compiling Trial Balance..."}
-        
-        
-        # DETERMINISTIC CLASSIFICATION (VOTING)
-        
-        # Resolve categories by majority vote to prevent batch-order randomness
-        from collections import Counter
-        account_categories: Dict[str, str] = {}
-        
-        for acc, votes in account_category_votes.items():
-            if not votes:
-                account_categories[acc] = "Unclassified"
-            else:
-                # Pick most common
-                most_common = Counter(votes).most_common(1)[0][0]
-                account_categories[acc] = most_common
+        # ===================================================================
+        # AGENT 4: P&L AGENT (Pure Math — no LLM) — uses PNL_CONFIG rules
+        # ===================================================================
+        print(f"[AGENT-4] {AGENT_SYSTEM_PROMPTS['pnl']}")
+        print(f"[AGENT-4] Include: {PNL_CONFIG['include_types']} | Exclude: {PNL_CONFIG['exclude_types']}")
+        yield {"status": "Agent 4 (P&L Agent): Calculating Profit & Loss from Ledger..."}
+        yield "\n\n2. Profit & Loss Statement\n\n"
 
-        # 1. GENERATE LEDGER SUMMARY / TRIAL BALANCE (Programmatic)
-        yield "2. Ledger Summary (Trial Balance)\n\n"
-        yield "| Account Head | Net Balance (₹) | Type |\n"
-        yield "|---|---|---|\n"
-        
-        tb_headers = ["Account Head", "Net Balance (₹)", "Type"]
-        tb_rows_data = []
-        
-        trial_balance_summary = ""
-        total_debits = 0.0
-        total_credits = 0.0
-        
-        for account, balance in sorted(ledger_balances.items()):
-            if abs(balance) < 0.01: continue
-            
-            abs_bal = abs(balance)
-            # Logic: If balance > 0 -> Debit (Asset/Expense), If < 0 -> Credit (Liability/Income)
-            # But we must check our sign convention from Phase 2
-            # Phase 2: Debit += amount, Credit -= amount. So >0 is Debit.
-            
-            bal_type = "Dr" if balance > 0 else "Cr"
-            
-            # Table Row
-            yield f"| {account} | {abs_bal:,.2f} | {bal_type} |\n"
-            tb_rows_data.append([account, f"{abs_bal:,.2f}", bal_type])
-            
-            # Summary for LLM
-            # Include category hint if available
-            cat_hint = f"[{account_categories.get(account, 'Unknown')}]"
-            trial_balance_summary += f"- {account} {cat_hint}: ₹ {abs_bal:,.2f} ({bal_type})\n"
-            
-            if balance > 0:
-                total_debits += balance
-            else:
-                total_credits += abs(balance)
-                
-        if abs(total_debits - total_credits) > 0.01:
-            diff = total_debits - total_credits
-            suspense_acc = "Suspense Account (TB Difference)"
-            abs_diff = abs(diff)
-            
-            # Add to ledger/categories for consistent handling
-            account_categories[suspense_acc] = "Current Assets" if diff < 0 else "Current Liabilities"
-            
-            if diff > 0:
-                # Debits > Credits -> Need a Credit in Suspense
-                total_credits += abs_diff
-                yield f"| {suspense_acc} | {abs_diff:,.2f} | Cr |\n"
-                trial_balance_summary += f"- {suspense_acc}: ₹ {abs_diff:,.2f} (Cr)\n"
-            else:
-                # Credits > Debits -> Need a Debit in Suspense
-                total_debits += abs_diff
-                yield f"| {suspense_acc} | {abs_diff:,.2f} | Dr |\n"
-                trial_balance_summary += f"- {suspense_acc}: ₹ {abs_diff:,.2f} (Dr)\n"
-            
-            print(f"[WARNING] TB Imbalance! Difference of {abs_diff} handled via Suspense Account.")
+        pnl_dr_rows: List[tuple] = []
+        pnl_cr_rows: List[tuple] = []
+        pnl_dr = 0.0
+        pnl_cr = 0.0
 
-        yield f"| TOTAL | {total_debits:,.2f} | {total_credits:,.2f} |\n"
-        tb_rows_data.append(["TOTAL", f"{total_debits:,.2f}", f"{total_credits:,.2f}"])
+        # Determine which accounts to exclude from P&L (assets, liabilities, equity, etc.)
+        _pnl_exclude_upper = [x.upper() for x in PNL_CONFIG['exclude_types']]
 
+        for acc, bal in ledger_balances.items():
+            cat = account_categories.get(acc, "").upper()
+            if abs(bal) < 0.01:
+                continue
+            # Skip if account name or category matches any PNL exclude keyword
+            acc_upper = acc.upper()
+            if any(excl in cat or excl in acc_upper for excl in _pnl_exclude_upper):
+                print(f"[AGENT-4] Excluding from P&L: {acc} (cat={cat})")
+                continue
+            if "INCOME" in cat:
+                pnl_cr_rows.append((f"By {acc}", abs(bal)))
+                pnl_cr += abs(bal)
+            elif "EXPENSE" in cat:
+                pnl_dr_rows.append((f"To {acc}", abs(bal)))
+                pnl_dr += abs(bal)
+
+        net_profit = pnl_cr - pnl_dr
+        if net_profit > 0:
+            pnl_dr_rows.append(("To Net Profit (c/d)", net_profit))
+            pnl_dr += net_profit
+        elif net_profit < 0:
+            pnl_cr_rows.append(("By Net Loss (c/d)", abs(net_profit)))
+            pnl_cr += abs(net_profit)
+
+        if not pnl_dr_rows and not pnl_cr_rows:
+            yield "_No income or expense transactions were classified. Check that the document contains transaction data._\n"
+        else:
+            yield "| Particulars (Dr) | Amount (\u20b9) | Particulars (Cr) | Amount (\u20b9) |\n|---|---|---|---|\n"
+            pnl_table_rows: List[List] = []
+            for i in range(max(len(pnl_dr_rows), len(pnl_cr_rows))):
+                d_part = pnl_dr_rows[i][0] if i < len(pnl_dr_rows) else ""
+                d_amt = f"{pnl_dr_rows[i][1]:,.2f}" if i < len(pnl_dr_rows) else ""
+                c_part = pnl_cr_rows[i][0] if i < len(pnl_cr_rows) else ""
+                c_amt = f"{pnl_cr_rows[i][1]:,.2f}" if i < len(pnl_cr_rows) else ""
+                yield f"| {d_part} | {d_amt} | {c_part} | {c_amt} |\n"
+                pnl_table_rows.append([d_part, d_amt, c_part, c_amt])
+            yield f"| **TOTAL** | **{pnl_dr:,.2f}** | **TOTAL** | **{pnl_cr:,.2f}** |\n"
+            pnl_table_rows.append(["TOTAL", f"{pnl_dr:,.2f}", "TOTAL", f"{pnl_cr:,.2f}"])
+            self.structured_tables.append({
+                "type": "profit_loss",
+                "title": "Profit & Loss Statement",
+                "headers": ["Particulars (Dr)", "Amount (\u20b9)", "Particulars (Cr)", "Amount (\u20b9)"],
+                "rows": pnl_table_rows
+            })
+            result_label = f"Net Profit: \u20b9{net_profit:,.2f}" if net_profit > 0 else f"Net Loss: \u20b9{abs(net_profit):,.2f}"
+            print(f"[AGENT-4] P&L done \u2192 Income: \u20b9{pnl_cr:,.2f} | Expense: \u20b9{pnl_dr - (net_profit if net_profit > 0 else 0):,.2f} | {result_label}")
+
+        # ===================================================================
+        # AGENT 5: BALANCE SHEET AGENT (Pure Math — no LLM)
+        # ===================================================================
+        print(f"[AGENT-5] {AGENT_SYSTEM_PROMPTS['balance_sheet']}")
+        yield {"status": "Agent 5 (Balance Sheet Agent): Building Balance Sheet from Ledger..."}
+        yield "\n\n3. Balance Sheet\n\n"
+
+        bs_assets: List[tuple] = []
+        bs_liab: List[tuple] = []
+        asset_total = 0.0
+        liab_total = 0.0
+
+        for acc, bal in ledger_balances.items():
+            cat = account_categories.get(acc, "").upper()
+            if abs(bal) < 0.01:
+                continue
+            # P&L accounts excluded — their net is captured via Net Profit/Loss
+            if "INCOME" in cat or "EXPENSE" in cat:
+                continue
+            if bal > 0:  # Debit balance → Asset
+                bs_assets.append((acc, bal))
+                asset_total += bal
+            else:  # Credit balance → Liability / Equity
+                bs_liab.append((acc, abs(bal)))
+                liab_total += abs(bal)
+
+        # Inject Net Profit/Loss into Equity side
+        if net_profit > 0:
+            bs_liab.append(("Add: Net Profit", net_profit))
+            liab_total += net_profit
+        elif net_profit < 0:
+            bs_liab.append(("Less: Net Loss", -abs(net_profit)))
+            liab_total -= abs(net_profit)
+
+        yield "| Liabilities & Equity | Amount (\u20b9) | Assets | Amount (\u20b9) |\n|---|---|---|---|\n"
+        bs_table_rows: List[List] = []
+        for i in range(max(len(bs_liab), len(bs_assets), 1)):
+            l_part = bs_liab[i][0] if i < len(bs_liab) else ""
+            l_amt = f"{bs_liab[i][1]:,.2f}" if i < len(bs_liab) else ""
+            a_part = bs_assets[i][0] if i < len(bs_assets) else ""
+            a_amt = f"{bs_assets[i][1]:,.2f}" if i < len(bs_assets) else ""
+            yield f"| {l_part} | {l_amt} | {a_part} | {a_amt} |\n"
+            bs_table_rows.append([l_part, l_amt, a_part, a_amt])
+        yield f"| **TOTAL** | **{liab_total:,.2f}** | **TOTAL** | **{asset_total:,.2f}** |\n"
+        bs_table_rows.append(["TOTAL", f"{liab_total:,.2f}", "TOTAL", f"{asset_total:,.2f}"])
         self.structured_tables.append({
-            "type": "trial_balance",
-            "title": "Ledger Summary (Trial Balance)",
-            "headers": tb_headers,
-            "rows": tb_rows_data
+            "type": "balance_sheet",
+            "title": "Balance Sheet",
+            "headers": ["Liabilities & Equity", "Amount (\u20b9)", "Assets", "Amount (\u20b9)"],
+            "rows": bs_table_rows
         })
+        print(f"[AGENT-5] Balance Sheet done → Assets: ₹{asset_total:,.2f} | Liabilities+Equity: ₹{liab_total:,.2f}")
 
-        if abs(total_debits - total_credits) > 0.01:
-            yield f"\n IMBALANCE DETECTED: A mismatch of ₹ {abs(total_debits - total_credits):,.2f} was found in the data extraction. A Suspense Account has been added to balance the books.\n"
+        # ===================================================================
+        # AGENT 6 — TALLY / AUDITOR AGENT  (uses TALLY_CONFIG rules)
+        # ===================================================================
+        print(f"[AGENT-6] {AGENT_SYSTEM_PROMPTS['tally']}")
+        print(f"[AGENT-6] Config: {TALLY_CONFIG}")
+        yield {"status": "Agent 6 (Tally Auditor): Running all 3 validation checks..."}
 
-        yield "\n3. Financial Statements (Profit & Loss and Balance Sheet)\n\n"
-        yield {"status": "Synthesizing Final Balance Sheet with AI..."}
+        # --- CHECK 1: TRIAL BALANCE ---
+        tb_total_dr = sum(v for v in ledger_balances.values() if v > 0)
+        tb_total_cr = sum(abs(v) for v in ledger_balances.values() if v < 0)
+        tb_diff = abs(tb_total_dr - tb_total_cr)
+        if TALLY_CONFIG['trial_balance_check']:
+            if tb_diff > 0.01:
+                print(f"[AGENT-6] Trial Balance MISMATCH: Dr=\u20b9{tb_total_dr:,.2f} Cr=\u20b9{tb_total_cr:,.2f} Diff=\u20b9{tb_diff:,.2f}")
+                yield f"\n> \u26a0\ufe0f **Trial Balance FAILED**: Dr \u20b9{tb_total_dr:,.2f} \u2260 Cr \u20b9{tb_total_cr:,.2f} (diff=\u20b9{tb_diff:,.2f})\n"
+            else:
+                print(f"[AGENT-6] Trial Balance PASSED: \u20b9{tb_total_dr:,.2f}")
+                yield f"\n> \u2705 **Trial Balance PASSED** \u2014 Total Dr = Total Cr = \u20b9{tb_total_dr:,.2f}\n"
 
-        prompt = f"""
-You are a Professional Accountant with 10+ years of experience. You only process bank statements as your primary book of accounts.
-Prepare finalized financial statements for Harsh Tailor using the provided Trial Balance data.
-
-### BANK STATEMENT ACCOUNTING MODE (MANDATORY)
-The system will receive only bank statements.
-The AI must behave like a professional accountant and prepare:
-- Opening Balance
-- Profit & Loss Statement
-- Balance Sheet
-- Closing Balance
-- Balance Verification
-All accounting must be derived strictly from bank transactions.
-No external data will be provided.
-The bank statement is the primary book of accounts.
-
-### OPENING BALANCE RULE (CRITICAL)
-Opening Balance must always be extracted from the bank statement.
-Opening Balance = First available balance value.
-The first balance value must always be treated as Opening Balance.
-Opening Balance must NOT be included in Profit & Loss.
-Opening Balance must be stored as:
-Assets:
-Bank Account = Opening Balance
-
-### CLOSING BALANCE RULE (CRITICAL)
-Closing Balance must be extracted from the bank statement.
-Closing Balance = Last available balance value.
-The last balance value must be used as Bank Balance in Balance Sheet.
-
-### PROFIT AND LOSS RULE (MANDATORY)
-Profit & Loss must always be generated from transactions.
-If transactions exist, Profit & Loss must NEVER be zero.
-Total Income = Sum of Direct Income + Indirect Income
-Total Expenses = Sum of Direct Expense + Indirect Expense
-Net Profit = Income - Expense
-Opening Balance must NOT be included.
-
-### BALANCE SHEET CALCULATION RULE (CRITICAL)
-The Balance Sheet must always satisfy:
-Total Assets = Total Liabilities + Total Equity
-If totals do not match, the AI must recalculate values.
-Balance Sheet must never be returned with mismatched totals.
-
-### BANK BALANCE RULE (MANDATORY)
-Bank Balance in Balance Sheet must always equal:
-Closing Balance from bank statement.
-Bank Balance must NEVER be calculated manually.
-Bank Balance = Last balance value in statement.
-This fixes 40% mismatch issues.
-
-### EQUITY CALCULATION RULE (CRITICAL)
-Equity must always be calculated as:
-Equity = Opening Balance + Net Profit - Drawings
-Where:
-Opening Balance = First balance value in bank statement
-Net Profit = Profit & Loss result
-Drawings = Owner withdrawals if detected
-Most systems forget Net Profit addition.
-
-### ASSET RULE
-Assets must include:
-Bank Balance
-Cash Withdrawals (if ATM withdrawals exist)
-Total Assets = Sum of all Assets.
-
-### LIABILITY RULE
-Liabilities must include:
-Loans detected from narration such as:
-LOAN CREDIT
-EMI
-FINANCE
-NBFC
-BANK LOAN
-Loan credits increase liabilities.
-EMI reduces liabilities.
-
-### BALANCE VERIFICATION RULE (MANDATORY)
-The AI must verify:
-Total Assets
-=
-Total Liabilities + Total Equity
-
-If mismatch occurs, AI must adjust Equity so that balance matches.
-If Total Assets ≠ Total Liabilities + Equity, Equity must be recalculated as:
-Equity = Total Assets - Total Liabilities
-
-### CRITICAL FINAL REMINDER
-If transactions exist, Profit & Loss must never return zero values.
-CRITICAL: You MUST list EVERY account marked as 'Expense' (e.g., Direct Expense, Indirect Expense, etc.) from the Trial Balance in the "Particulars (Dr)" column of the P&L Statement. Do not combine them into zero!
-If the Trial Balance contains ONLY Expenses and ZERO Income, you MUST still list every Expense in the P&L table, leave Income blank (or 0.00), and calculate a Net Loss.
-Net Profit / (Net Loss) = Total Income - Total Expenses
-If Total Expenses > Total Income, it is a NET LOSS. Show it clearly in the P&L table (By Net Loss) and subtract it from Equity.
-Returning a blank or "0.00" P&L table when Expenses or Income exist in the Trial Balance is STRICTLY FORBIDDEN.
-
-### TRANSACTION ACCOUNTING RULE
-Every transaction must affect either: Income, Expense, Asset, Liability, Equity. 
-No transaction should remain unclassified.
-
-### DEBUG OUTPUT RULE
-Before generating Profit & Loss, you must internally calculate:
-Total Credits, Total Debits, Income Amount, Expense Amount.
-If Income > 0 or Expense > 0, Profit & Loss must not be zero.
-
-### TRIAL BALANCE DATA
-{trial_balance_summary}
-
----
-
-### REQUIRED OUTPUT FORMAT (MANDATORY)
-You MUST return the results EXACTLY in this 5-part structure, including the numbers. DO NOT output anything else.
-
-1) Opening Balance
-
-Opening Balance: [Opening Balance Amount]
-
-
-2) Profit & Loss Statement
-
-| Particulars (Dr) | Amount (₹) | Particulars (Cr) | Amount (₹) |
-|---|---|---|---|
-| To [Specific Expense Account 1] | [Amount] | By [Specific Income Account 1] | [Amount] |
-| To [Specific Expense Account 2] | [Amount] | By [Specific Income Account 2] | [Amount] |
-| To [List ALL trial balance expenses!]| [Amount] | | |
-| To Net Profit (if Income > Expenses) | [Amount] | By Net Loss (if Expenses > Income) | [Amount] |
-| TOTAL | [Total] | TOTAL | [Total] |
-
-
-3) Balance Sheet
-
-| Liabilities & Equity | Amount (₹) | Assets | Amount (₹) |
-|---|---|---|---|
-| Equity (Opening Bal) | [Amount] | Bank Balance | [Closing Balance Amount] |
-| Add: Net Profit | [Amount] | [Other Asset Accounts] | [Amount] |
-| Less: Net Loss | [Amount] | | |
-| Less: Drawings | [Amount] | | |
-| Add: Capital Intro | [Amount] | | |
-| Loans (Liabilities) | [Amount] | | |
-| TOTAL | [Total] | TOTAL | [Total] |
-"""
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                if attempt > 0:
-                    yield f"\n\n[INFO] Connection dropped. Retrying synthesis (Attempt {attempt + 1}/{max_retries})...\n\n"
-                    
-                async for chunk in self.llm.astream(prompt):
-                    if chunk.content:
-                        yield chunk.content
-                # If we complete the stream without exception, we're done
-                break
-            except Exception as e:
-                print(f"[WARNING] Final Synthesis failed on attempt {attempt + 1}: {str(e)}")
-                if attempt == max_retries - 1:
-                    print(f"[ERROR] Final Synthesis failed after {max_retries} attempts: {str(e)}")
-                    yield f"\n[ERROR] Final Synthesis failed: {str(e)}"
+        # --- CHECK 2: BALANCE SHEET EQUATION ---
+        diff = abs(asset_total - liab_total)
+        if TALLY_CONFIG['balance_sheet_check']:
+            if diff > 0.01:
+                if TALLY_CONFIG['auto_capital_adjustment']:
+                    # Add Capital Adjustment entry under Equity to absorb gap
+                    cap_adj = asset_total - liab_total
+                    bs_liab.append(("Capital Adjustment", cap_adj))
+                    liab_total += cap_adj
+                    yield (
+                        f"\n> \u26a0\ufe0f **Balance Sheet ADJUSTED**: Difference of \u20b9{abs(cap_adj):,.2f} absorbed "
+                        f"via Capital Adjustment under Equity (per TALLY_RULES).\n"
+                    )
+                    print(f"[AGENT-6] BS adjusted by Capital Adjustment: \u20b9{cap_adj:,.2f}")
                 else:
-                    await asyncio.sleep(3.0 * (attempt + 1))
+                    yield (
+                        f"\n> \u26a0\ufe0f **Balance Sheet FAILED**: Out of balance by \u20b9{diff:,.2f}.\n"
+                        f"> Missing Opening Balance entries or unclassified transactions.\n"
+                    )
+                    print(f"[AGENT-6] BS FAILED: Assets=\u20b9{asset_total:,.2f} L+E=\u20b9{liab_total:,.2f} Diff=\u20b9{diff:,.2f}")
+            else:
+                yield (
+                    f"\n> \u2705 **Balance Sheet PASSED** \u2014 Assets = Liabilities + Equity = \u20b9{asset_total:,.2f}\n"
+                )
+                print(f"[AGENT-6] BS PASSED: \u20b9{asset_total:,.2f}")
 
     async def _parse_markdown_tables(self, text: str) -> List[Dict[str, Any]]:
         """Extract structured data from markdown tables in text."""

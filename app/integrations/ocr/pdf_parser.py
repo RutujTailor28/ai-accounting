@@ -12,7 +12,7 @@ import io
 class DocumentParser:
     """Unified document parser for multiple file formats."""
     
-    SUPPORTED_EXTENSIONS = {'.pdf', '.xlsx', '.xls', '.csv', '.docx'}
+    SUPPORTED_EXTENSIONS = {'.pdf', '.xlsx', '.xls', '.csv', '.docx', '.html'}
     
     @staticmethod
     def parse(file_content: BinaryIO, filename: str) -> str:
@@ -46,6 +46,8 @@ class DocumentParser:
                 return DocumentParser._parse_csv(file_content)
             elif extension == 'docx':
                 return DocumentParser._parse_docx(file_content)
+            elif extension == 'html':
+                return DocumentParser._parse_html(file_content)
         except Exception as e:
             print(f"[ERROR] Error parsing {filename}: {str(e)}")
             raise
@@ -65,6 +67,14 @@ class DocumentParser:
         
         file_content_for_plumber = io.BytesIO(file_bytes)
         
+        # Check if this is actually an HTML file disguised as a PDF
+        # (common for exported reports that are HTML-based)
+        sample = file_bytes[:500].lower()
+        if b"<!doctype html>" in sample or b"<html>" in sample:
+            print("[INFO] HTML content detected in PDF file. Routing to HTML parser.")
+            file_content_for_plumber.seek(0)
+            return DocumentParser._parse_html(file_content_for_plumber)
+
         # Method 1: Native Extraction with pdfplumber
         try:
             import pdfplumber
@@ -184,3 +194,27 @@ class DocumentParser:
         full_text = '\n\n'.join(text_parts)
         print(f"[INFO] Extracted {len(full_text)} characters from Word document")
         return full_text
+
+    @staticmethod
+    def _parse_html(file_content: BinaryIO) -> str:
+        """Extract text from HTML file using regex (safe fallback without BS4)."""
+        try:
+            raw_content = file_content.read().decode('utf-8')
+        except UnicodeDecodeError:
+            raw_content = file_content.read().decode('latin-1')
+            
+        import re
+        # Remove script and style elements
+        text = re.sub(r'<(script|style)[^>]*>.*?</\1>', '', raw_content, flags=re.DOTALL | re.IGNORECASE)
+        # Remove all other tags
+        text = re.sub(r'<[^>]+>', ' ', text)
+        # Handle common entities
+        text = text.replace('&nbsp;', ' ')
+        text = text.replace('&amp;', '&')
+        text = text.replace('&lt;', '<')
+        text = text.replace('&gt;', '>')
+        # Normalize whitespace
+        text = re.sub(r'\s+', ' ', text).strip()
+        
+        print(f"[INFO] Extracted {len(text)} characters from HTML document")
+        return text

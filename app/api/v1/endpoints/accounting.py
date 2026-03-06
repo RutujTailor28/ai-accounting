@@ -369,7 +369,7 @@ async def accounting_query(request_body: ChatQueryRequest, request: Request, use
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.patch("/messages/{message_id}")
-async def update_accounting_message(message_id: UUID, content: str, data: Dict[str, Any] = None, user=Depends(get_current_user)):
+async def update_accounting_message(message_id: UUID, content: str = None, data: Dict[str, Any] = None, user=Depends(get_current_user)):
     """
     Update a chat message's content and structured data.
     Only the creator can edit their messages.
@@ -380,9 +380,14 @@ async def update_accounting_message(message_id: UUID, content: str, data: Dict[s
         if not msg_check.data or msg_check.data["created_by"] != user.id:
             raise HTTPException(status_code=403, detail="Forbidden")
             
-        update_fields = {"content": content}
+        update_fields = {}
+        if content is not None:
+            update_fields["content"] = content
         if data is not None:
             update_fields["data"] = data
+            
+        if not update_fields:
+            return {"message": "No fields to update"}
             
         res = supabase.table("chat_messages").update(update_fields).eq("id", str(message_id)).execute()
         return res.data[0]
