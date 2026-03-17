@@ -48,6 +48,48 @@ class LLMService:
         )
         print(f"[INFO] LLMService initialized with OpenRouter model={settings.openrouter_model}")
     
+    async def classify_query_intent(self, question: str) -> Dict[str, Any]:
+        """
+        Use the LLM to categorize the user's query intent.
+        Returns: {
+            "intent": "SUMMARY" | "EXTRACTION" | "GENERAL",
+            "explicit_limit": int | None,
+            "report_types": List[str] | None,
+            "target_keywords": List[str] | None
+        }
+        """
+        prompt = f"""You are an intent discovery agent for a financial RAG system.
+        Categorize the user's question into one of three intents:
+        
+        1. **SUMMARY**: The user is asking for a high-level overview, a balance, financial health, or a specific structured report (Balance Sheet, P&L, Statement, Computation). 
+           Examples: "what is my closing balance?", "give me balance sheet", "how are my finances?", "summary of account".
+        
+        2. **EXTRACTION**: The user is asking for specific transactional data points, a list of records, or has provided an explicit limit (e.g., "last 5 upi").
+           Examples: "list upi transactions", "show last 10 records", "extract all atm withdrawals".
+        
+        3. **GENERAL**: General questions about the system or accounting practices that don't directly require document data extraction.
+           Examples: "how do I upload?", "what is a balance sheet?".
+
+        USER QUESTION: "{question}"
+
+        Return ONLY a JSON object:
+        {{
+            "intent": "SUMMARY" | "EXTRACTION" | "GENERAL",
+            "explicit_limit": int_or_null,
+            "report_types": ["balance_sheet", "p_and_l", "computation", "statement", "general_summary"],
+            "target_keywords": ["keyword1", "keyword2"]
+        }}
+        """
+        try:
+            response = await self.llm.ainvoke(prompt)
+            intent_data = self._extract_json(response.content)
+            print(f"[INFO] Intent Discovery: query='{question}' -> intent={intent_data.get('intent')}")
+            return intent_data
+        except Exception as e:
+            print(f"[ERROR] Intent Discovery failed: {e}")
+            # Robust fallback
+            return {"intent": "EXTRACTION", "explicit_limit": None, "report_types": [], "target_keywords": []}
+
     def _extract_json(self, text: str) -> Dict[str, Any]:
         """
         Robustly extract and parse JSON from LLM output.
@@ -547,26 +589,26 @@ class LLMService:
    
    - **CRITICAL RULES:**
      - **DO NOT SKIP CREDITS** - They are just as important as debits
-     - **BALANCE INCREASE = CREDIT** - This is the most reliable indicator
-     - **If balance increased, it CANNOT be a DEBIT** - Always mark as CREDIT
-     - **If you're unsure, default to balance comparison - if balance increased, it's a CREDIT**
-     - **Track balance sequentially** - Process transactions line by line, maintaining balance state
+   - **BALANCE INCREASE = CREDIT** - This is the most reliable indicator
+   - **If balance increased, it CANNOT be a DEBIT** - Always mark as CREDIT
+   - **If you're unsure, default to balance comparison - if balance increased, it's a CREDIT**
+   - **Track balance sequentially** - Process transactions line by line, maintaining balance state
 
-4. **Output Format:** Return results as a STRICT valid JSON object with this structure:
-   {{
-     "transactions": [
-       {{
-         "date": "transaction date",
-         "description": "transaction description/narration (include the full text for accuracy)",
-         "amount": "transaction amount (ABSORLUTELY REQUIRED: Use the non-zero numeric value. NEVER use 0.00)",
-         "direction": "CREDIT or DEBIT",
-         "transaction_id": "UPI ID/reference number/Chq No/Instrument No if available",
-         "type": "UPI/NEFT/CASH/CHQ/IMPS/RTGS etc if identifiable",
-         "bank_name": "MANDATORY: Use the 'STATEMENT_BANK' name from the block header exactly. DO NOT guess based on narrations.",
-         "source_document": "name of the document this transaction was found in"
-       }}
-     ]
-   }}
+4. **Output Format:**     {{
+      "transactions": [
+        {{
+          "date": "transaction date",
+          "description": "transaction description/narration (include the full text for accuracy)",
+          "amount": "transaction amount (ABSORLUTELY REQUIRED: Use the non-zero numeric value. NEVER use 0.00)",
+          "direction": "CREDIT or DEBIT",
+          "balance": "MANDATORY: The running balance value shown on the same line as the transaction",
+          "transaction_id": "UPI ID/reference number/Chq No/Instrument No if available",
+          "type": "UPI/NEFT/CASH/CHQ/IMPS/RTGS etc if identifiable",
+          "bank_name": "MANDATORY: Use the 'STATEMENT_BANK' name from the block header exactly. DO NOT guess based on narrations.",
+          "source_document": "name of the document this transaction was found in"
+        }}
+      ]
+    }}
    
    **DIRECTION DETERMINATION (MANDATORY FOR EVERY TRANSACTION):**
    - Before setting "direction", you MUST:
@@ -581,21 +623,18 @@ class LLMService:
    - **CRITICAL**: Do NOT list "0.00" as the transaction amount. Use the actual numeric value from the other column.
    - **CRITICAL**: Do NOT default all transactions to "DEBIT". Many transactions are CREDITS - use balance comparison to determine.
 
-5. **No Data Found:** If no matching records OR summary reports are found, return: {{"transactions": [], "message": "I could not find the requested information in the documents."}}
+**GOAL**: Be helpful, comprehensive, and professional. Provide a **detailed and thorough analysis** of the found information. Do not give short or one-line answers. Explain the context, any trends you see, and all relevant details found in the documents. 
 
-**Response Guidelines:**
-- **CRITICAL: START EXTRACTING IMMEDIATELY. Do not summarize. Extract EVERY row.**
-- Extract EVERY SINGLE piece of valid data that matches the user's request - NO EXCEPTIONS
-- Return the COMPLETE dataset - do NOT summarize or provide a sample
-- **CREDIT TRANSACTIONS ARE MANDATORY**: Ensure you extract ALL credit transactions. If you see deposits, receipts, salary, interest, refunds, or any money coming IN, they MUST be included with `"direction": "CREDIT"`
-- **ZERO AMOUNT RULE**: If you extract a record with `amount: 0.0` or `0.00`, you have FAILED. Look at the numbers on that same line again. One of them is non-zero. Use THAT one.
-- **BALANCE-BASED VALIDATION**: Before finalizing each transaction, verify the direction by checking if the balance increased (CREDIT) or decreased (DEBIT)
-- **BANK NAME CONSISTENCY**: Do NOT change the `bank_name` based on the payee or UPI ID (like @oksbi). Use the bank name of the statement owner.
-- Keep descriptions complete including any reference numbers found at the end of the line.
-- **FINAL CHECK**: Before returning results, count how many CREDIT vs DEBIT transactions you found. If you found significantly more DEBITS than CREDITS, you may have missed some credit transactions. Re-check the data.
-- **STRICT FILTER ADHERENCE**: If the user asked for "Cash", and you see ANY transaction with "UPI", "VPA", or "@" identifiers, you HAVE FAILED. REMOVE THEM. Only matching records must remain.
+**MANDATORY FORMATTING**:
+- Your response **MUST** be structured with multiple bullet points.
+- Every key fact, insight, transaction detail, or summary point **MUST start with a dash and space** (e.g., `- Detailed insight here`).
+- Use standard markdown bolding (**text**) for important numbers, dates, or names.
+- Use **simple, easy-to-understand English**. Avoid technical financial jargon (like "liabilities" or "assets") where possible—instead, use plain words (like "money you owe" or "things you own").
+- If the user asks a question, provide a deep explanation based on the context.
 
-**RESPONSE (JSON ONLY):**
+**DO NOT** just return JSON; always include a **rich, detailed human-readable explanation** before the JSON. The human-readable part should feel like a complete mini-report, not just a snippet.
+
+**RESPONSE**:
 """
         
         try:
@@ -637,22 +676,44 @@ class LLMService:
 
             # For summary-style questions, make the "where did it come from?" explicit in the
             # human-readable answer shown in Search UI.
-            q_lower = (question or "").lower()
-            is_summary = any(kw in q_lower for kw in ["balance sheet", "p&l", "profit", "loss", "report", "summary", "computation"])
+            intent_data = await self.classify_query_intent(question)
+            is_summary = (intent_data.get("intent") == "SUMMARY")
             # Clean up the human-readable answer (remove raw JSON blobs)
             human_answer = answer
-            # Remove ```json ... ``` blocks
-            human_answer = re.sub(r'```json\s*.*?\s*```', '', human_answer, flags=re.DOTALL)
-            # Remove any raw { ... } that looks like JSON if the whole line is JSON
+            
+            # 1. Remove markdown code blocks (```json ... ```)
+            human_answer = re.sub(r'```(?:json)?\s*[\{\[][\s\S]*?[\}\]]\s*```', '', human_answer, flags=re.DOTALL)
+            
+            # 2. Remove raw JSON objects or arrays that might be leaked outside code blocks
+            # Surgical removal: Only remove blocks that look like structural JSON (keys, braces, lists)
+            # but preserve narrative text even if it contains braces.
+            human_answer = re.sub(r'(?m)^[\{\[]\s*".*?"\s*:[\s\S]*?[\}\]]\s*$', '', human_answer, flags=re.DOTALL)
+            
+            # Robust fallback: If we still see multi-line JSON artifacts, we'll catch them in the line-by-line phase below.
+            
+            # 3. Final line-by-line check to remove any lines that look like JSON noise or keys
             human_lines = []
             for line in human_answer.split('\n'):
                 line_strip = line.strip()
+                # Skip lines that are purely JSON structural components or key-value pairs
+                if not line_strip:
+                    human_lines.append(line)
+                    continue
+                    
+                # Skip lines that are just a brace or bracket
+                if line_strip in ['{', '}', '[', ']', '},', '],']:
+                    continue
+                
+                # Skip lines that look like "key": "value"
+                if re.match(r'^\s*"\w+"\s*:\s*.*?,?\s*$', line_strip):
+                    continue
+                    
+                # Skip lines that are just JSON arrays or objects
                 if (line_strip.startswith('{') and line_strip.endswith('}')) or \
                    (line_strip.startswith('[') and line_strip.endswith(']')):
-                    # Check if it actually parses as JSON to be sure
                     try:
                         json.loads(line_strip)
-                        continue # Skip this line
+                        continue
                     except:
                         pass
                 human_lines.append(line)
@@ -681,7 +742,7 @@ class LLMService:
         question: str,
         context_chunks: List[str],
         source_documents: List[str],
-        batch_size: int = 15,
+        batch_size: int = 3,
         company_id: str = None
     ) -> Dict[str, Any]:
         """
@@ -699,22 +760,14 @@ class LLMService:
         # Step 1: Pre-scan for document metadata
         doc_metadata = await self._extract_document_metadata(context_chunks, source_documents, company_id=company_id)
 
-        # If the user asked for a summary report (Balance Sheet / P&L / Computation),
-        # aggressively focus on only those document types; otherwise the model will be
-        # overwhelmed by irrelevant bank statement chunks and respond "not found".
-        q_lower = (question or "").lower()
-        is_summary = any(kw in q_lower for kw in ["balance sheet", "p&l", "p & l", "profit", "loss", "report", "summary", "computation"])
+        # Intent-based document filtering
+        intent_data = await self.classify_query_intent(question)
+        intent = intent_data.get("intent")
+        is_summary = (intent == "SUMMARY")
+        
         if is_summary and doc_metadata:
-            wanted_types = set()
-            if "balance sheet" in q_lower:
-                wanted_types.add("balance sheet")
-            if "p&l" in q_lower or "p & l" in q_lower or "profit" in q_lower or "loss" in q_lower:
-                wanted_types.add("profit")
-                wanted_types.add("loss")
-                wanted_types.add("p&l")
-            if "computation" in q_lower:
-                wanted_types.add("computation")
-
+            wanted_types = set(intent_data.get("report_types", []))
+            
             def _doc_matches(doc_name: str) -> bool:
                 meta = doc_metadata.get(doc_name) or {}
                 doc_type = str(meta.get("document_type", "")).lower()
@@ -724,16 +777,10 @@ class LLMService:
                 if wanted_types and any(w in doc_type for w in wanted_types):
                     return True
                 
-                # Rule 2: Match by filename hints
-                name_hints = ["balance", "bl.", "bl_", "-bl", "bs.", "p&l", "pl.", "pl_", "-pl", "profit", "loss", "computation"]
+                # Rule 2: Match by filename hints (Fallback for summary)
+                name_hints = ["balance", "bl.", "bl_", "-bl", "bs.", "p&l", "pl.", "pl_", "-pl", "profit", "loss", "computation", "statement"]
                 if any(h in name for h in name_hints):
-                    # Only match if the hint corresponds to the WANTED type
-                    if "balance" in q_lower and any(h in name for h in ["balance", "bl.", "bl_", "-bl", "bs."]):
-                        return True
-                    if ("p&l" in q_lower or "p & l" in q_lower or "profit" in q_lower) and any(h in name for h in ["p&l", "pl.", "pl_", "-pl", "profit", "loss"]):
-                        return True
-                    if "computation" in q_lower and "computation" in name:
-                        return True
+                    return True # More permissive if it's already a SUMMARY intent
                 return False
 
             keep_docs = {d for d in set(source_documents) if _doc_matches(d)}
@@ -833,27 +880,24 @@ class LLMService:
                         # Create a fingerprint to avoid duplicates
                         # Include direction to prevent credits and debits from being considered duplicates
                         desc = str(t.get('description', '')).strip().lower()
-                        amt = str(t.get('amount', '0')).replace(',', '').replace('.', '')  # Normalize amount
-                        date = str(t.get('date', ''))
-                        direction = str(t.get('direction', '')).upper()
+                        def _norm(val: str) -> str:
+                            try: return f"{float(val.replace(',', '').strip()):.2f}"
+                            except: return val.replace(',', '').strip()
+
+                        amt = _norm(str(t.get('amount', '0')))
+                        balance = _norm(str(t.get('balance', '')))
+                        date = str(t.get('date', '')).strip()
+                        direction = str(t.get('direction', '')).upper().strip()
                         tx_id = str(t.get('transaction_id', '')).strip()
-                        ref_id = str(t.get('ref_id', '')).strip() # Capture Ref/Cheque ID
-                        source_doc = str(t.get('source_document', '')).strip()
-                        bank_name = str(t.get('bank_name', '')).strip()
                         
-                        # Use transaction_id if available for better uniqueness
+                        # Fingerprint: when a Ref ID exists, use it alone — same physical
+                        # transaction must never appear twice regardless of DEBIT/CREDIT assignment.
                         if tx_id:
-                            fp = f"{date}|{amt}|{direction}|{tx_id}"
+                            fp = tx_id
+                        elif balance and balance != '0.00':
+                            fp = f"{date}|{amt}|{direction}|{balance}"
                         else:
-                            # Enhanced Fingerprint for better differentiation
-                            # 1. Include Ref ID if available
-                            # 2. Increase normalized description length to 120 chars to capture unique details at end of string
-                            desc_norm = re.sub(r'[^a-zA-Z0-9]', '', desc)
-                            fp_parts = [date, amt, direction, desc_norm[:120], source_doc, bank_name]
-                            if ref_id:
-                                fp_parts.insert(3, ref_id) # Add ref_id to uniqueness check
-                                
-                            fp = "|".join(fp_parts)
+                            fp = f"{date}|{amt}|{direction}"
                         
                         if fp not in seen_fingerprints:
                             seen_fingerprints.add(fp)
@@ -864,12 +908,18 @@ class LLMService:
             except Exception as e:
                 print(f"[DEBUG] Error merging batch result: {str(e)}")
 
-        # Extract source documents ONLY from transactions that made it into final results
+        # Extract source documents ONLY from transactions that made it into final results.
+        # WHITELIST: Only accept source_doc values that are actual filenames from ChromaDB metadata.
+        # This rejects any LLM-hallucinated string (e.g. "Bank Statement", "Context 1").
+        valid_source_docs = set(source_documents)
         all_sources = set()
         for tx in all_transactions:
             source_doc = str(tx.get('source_document', '')).strip()
-            if source_doc and source_doc.lower() != 'unknown':
+            if source_doc and source_doc in valid_source_docs:
                 all_sources.add(source_doc)
+        # Fallback: if LLM gave no valid source_doc matches, use all real source_documents instead.
+        if not all_sources and not is_summary:
+            all_sources = set([d for d in source_documents if d and d.lower() != 'unknown'])
         # For summary outputs (no transactions), still expose the documents we actually scanned.
         if is_summary and not all_sources:
             all_sources = set([d for d in source_documents if d and d.lower() != "unknown"])
@@ -918,64 +968,95 @@ class LLMService:
         if not context_chunks:
             return {"answer": "No document content provided.", "sources": []}
 
+        # SECONDARY SAFETY CAP: Ensure context doesn't explode if the API caller forgot to cap it.
+        # 250 chunks ~ 125k-150k tokens, which is safe for a 256k limit including response headroom.
+        CONTEXT_CAP = 250
+        if len(context_chunks) > CONTEXT_CAP:
+            print(f"[WARNING] generate_summary_report: Capping context from {len(context_chunks)} to {CONTEXT_CAP} chunks for safety.")
+            context_chunks = context_chunks[:CONTEXT_CAP]
+            source_documents = source_documents[:CONTEXT_CAP]
+
         # Combine chunks into a single text block for the LLM
         combined_context = "\n\n".join(context_chunks)
         sources = sorted(set([d for d in source_documents or [] if d and d.lower() != "unknown"]))
 
-        prompt = f"""You are a specialized financial analyst. Your task is to extract a structured Financial Report (Balance Sheet, Profit & Loss (also known as p & l), or Computation of Income) from the provided document context.
+        prompt = f"""You are a senior financial analyst. Your task is to provide a helpful, professional, and comprehensive summary of the provided documents, or to extract a specific financial report if asked.
 
 **USER REQUEST:** "{question}"
 
 **DOCUMENT CONTEXT:**
 {combined_context}
 
-**INSTRUCTIONS:**
-1. **CATEGORIZATION ACCURACY (HIGHEST PRIORITY)**:
-   - **EQUITY AND LIABILITIES**: Capital, Loans, Sundry Creditors, Provisions, Outstanding Expenses.
-   - **ASSETS**: Fixed Assets (Cars, Land, Furniture), Sundry Debtors, Bank Balance, Cash in Hand, Deposits, Prepaid Expenses.
-   - **SUNDRY DEBTORS ARE ALWAYS ASSETS**. Do NOT place them in Liabilities.
-   - **SUNDRY CREDITORS ARE ALWAYS LIABILITIES**.
+**INSTRUCTIONS**:
+1. **HELPFUL & DETAILED ANALYST (CRITICAL)**: Act as a senior financial analyst. Provide a **comprehensive and detailed summary** of the documents. Do not be brief. Explain what the numbers mean, identify major categories, and provide a full picture of the financial state.
+2. **SIMPLE LANGUAGE, DEEP INSIGHT**: Answer in **simple English**, but provide **deep detail**. **DO NOT** use difficult financial words like "liabilities" or "assets" where regular words work better (e.g., use "money you owe" or "things you own").
+3. **MANDATORY BULLET POINTS**: Every important detail, fact, observation, and figure **MUST start with a dash and space** (e.g., `- The total revenue recorded is **\u20b95,00,000**`). Use multiple bullet points to organize the information clearly.
+4. **CATEGORIZATION RULES**:
+   - **MONEY YOU OWE (LIABILITIES)**: Capital, Loans, Sundry Creditors, Provisions, Outstanding Expenses.
+   - **THINGS YOU OWN (ASSETS)**: Fixed Assets, Sundry Debtors, Bank Balance, Cash, Deposits, Prepaid Expenses.
+5. **Accuracy is Critical**: Preserve exact names and amounts as seen in the documents.
+6. **Output Format (MANDATORY)**:
+   - **PART 1 (STRUCTURED)**: AT THE VERY BEGINNING, provide the structured data in a strict JSON code block:
+     ```json
+     {{
+       "balance_sheet": {{ "liabilities": [...], "assets": [...] }},
+       "p_and_l": {{ "income": [...], "expenses": [...] }},
+       "summary_metadata": {{ "account_name": "...", "account_number": "...", "period": "..." }}
+     }}
+     ```
+   - **PART 2 (CONVERSATIONAL)**: AFTER the JSON, provide your **detailed natural language answer**. This should be a thorough explanation of the findings. Use **MANDATORY bullet points** (`- `) for every category and major detail. Use standard markdown bolding (**text**) for all numbers.
 
-2. **Identify the Report Type**: Determine if the context contains a Balance Sheet, P&L Account, or Computation of Income.
-3. **Handle OCR Artifacts**: Be aware that headers might be spaced out (e.g., "L I A B I L I T I E S") or misspelled (e.g., "ASSESTS"). Use your intelligence to map them correctly.
-4. **Accuracy is Critical**:
-   - For Balance Sheets: Correctly separate **Liabilities/Equity** and **Assets**. (e.g. Loans are Liabilities, Cars/Fixed Assets are Assets).
-   - For P&L: Separate **Income/Revenue** and **Expenses/Expenditure**.
-   - Preserve the exact names and amounts as seen in the document.
-5. **TABLE INTEGRITY**: You MUST produce a single continuous markdown table for each section. **DO NOT** break a table with empty lines or interleaved text. Output EVERY row for a section in one block.
-6. **VERTICALIZATION RULE (CRITICAL)**: Many documents show Liabilities and Assets side-by-side in a 4-column layout. You MUST VERTICALIZE this.
-   - NEVER produce a table with 4 columns (Liabilities, Amount, Assets, Amount).
-   - Process the entire "LIABILITIES" column/side first.
-   - Then process the entire "ASSETS" column/side first.
-   - Output them as TWO SEPARATE TABLES, one after the other.
-7. **BALANCE SHEET COMPLETENESS**: For a Balance Sheet, you MUST provide BOTH an "ASSETS" section AND an "EQUITY AND LIABILITIES" section. Extract all rows for both sides.
-8. **STRICT FORMATTING**: 
-   - **START DIRECTLY** with the first markdown table.
-   - **DO NOT** include any report titles, headers, or introductory text (e.g. NO "BALANCE SHEET").
-   - **DO NOT** use markdown headers (#) or bolding (**).
-   - **DO NOT** wrap the entire response in markdown code blocks (```markdown or ```).
-9. **Output Format**:
-   - **Textual Part**: Start directly with the first markdown table.
-   - **JSON Part**: At the end, include a JSON block with the following structure:
-     - If Balance Sheet: `{{"transactions": [], "balance_sheet": {{"liabilities": [{{"particulars": "...", "amount": "..."}}], "assets": [{{"particulars": "...", "amount": "..."}}]}}}}`
-     - If P&L: `{{"transactions": [], "p_and_l": {{"income": [{{"particulars": "...", "amount": "..."}}], "expenses": [{{"particulars": "...", "amount": "..."}}]}}}}`
-
-**RESPONSE (Markdown + JSON):**
+**RESPONSE**:
 """
         try:
             print(f"[INFO] Generating LLM-based summary report for: {question[:50]}...")
             response = await self.llm.ainvoke(prompt)
-            answer = response.content.strip()
+            answer = response.content.strip() if response.content else ""
+            print(f"[DEBUG] [Received from AI] Response length: {len(answer)} chars")
+            print(f"[DEBUG] [Raw AI Response Preview]: {answer[:500]}...")
+            
+            if not answer:
+                print(f"[WARNING] LLM returned empty response for summary report. Retrying with smaller context...")
+                # Fallback: retry with only first 100 chunks if first attempt failed
+                if len(context_chunks) > 100:
+                    context_chunks = context_chunks[:100]
+                    combined_context = "\n\n".join(context_chunks)
+                    # Re-run with smaller context
+                    response = await self.llm.ainvoke(prompt)
+                    answer = response.content.strip() if response.content else ""
+                    print(f"[DEBUG] [Retry] Received {len(answer)} chars")
             
             # Extract JSON and metadata
             parsed_json = self._extract_json(answer)
             
             # Clean up the human-readable answer (remove raw JSON blobs)
             human_answer = answer
-            human_answer = re.sub(r'```json\s*.*?\s*```', '', human_answer, flags=re.DOTALL)
+            
+            # 1. Remove markdown code blocks (```json ... ```)
+            human_answer = re.sub(r'```(?:json)?\s*[\{\[][\s\S]*?[\}\]]\s*```', '', human_answer, flags=re.DOTALL)
+            
+            # 2. Remove raw JSON objects or arrays that might be leaked outside code blocks
+            # This follows a greedy approach to find the largest { } or [ ] blocks
+            human_answer = re.sub(r'(?m)^[\{\[].*?[\}\]]$', '', human_answer, flags=re.DOTALL)
+            
+            # 3. Final line-by-line check to remove any lines that look like JSON noise or keys
             human_lines = []
             for line in human_answer.split('\n'):
                 line_strip = line.strip()
+                # Skip lines that are purely JSON structural components or key-value pairs
+                if not line_strip:
+                    human_lines.append(line)
+                    continue
+                    
+                # Skip lines that are just a brace or bracket
+                if line_strip in ['{', '}', '[', ']', '},', '],']:
+                    continue
+                
+                # Skip lines that look like "key": "value"
+                if re.match(r'^\s*"\w+"\s*:\s*.*?,?\s*$', line_strip):
+                    continue
+                    
+                # Skip lines that are just JSON arrays or objects
                 if (line_strip.startswith('{') and line_strip.endswith('}')) or \
                    (line_strip.startswith('[') and line_strip.endswith(']')):
                     try:
@@ -1028,7 +1109,7 @@ class LLMService:
         question: str,
         context_chunks: List[str],
         source_documents: List[str],
-        batch_size: int = 10,
+        batch_size: int = 3,
         company_id: str = None
     ):
         """
@@ -1042,20 +1123,14 @@ class LLMService:
         # Step 1: Pre-scan for document metadata
         doc_metadata = await self._extract_document_metadata(context_chunks, source_documents, company_id=company_id)
 
-        # Summary focus: restrict to Balance Sheet / P&L / Computation docs.
-        q_lower = (question or "").lower()
-        is_summary = any(kw in q_lower for kw in ["balance sheet", "p&l", "p & l", "profit", "loss", "report", "summary", "computation"])
+        # Intent-based document filtering
+        intent_data = await self.classify_query_intent(question)
+        intent = intent_data.get("intent")
+        is_summary = (intent == "SUMMARY")
+        
         filtered_sources_for_summary = None
         if is_summary and doc_metadata:
-            wanted_types = set()
-            if "balance sheet" in q_lower:
-                wanted_types.add("balance sheet")
-            if "p&l" in q_lower or "p & l" in q_lower or "profit" in q_lower or "loss" in q_lower:
-                wanted_types.add("profit")
-                wanted_types.add("loss")
-                wanted_types.add("p&l")
-            if "computation" in q_lower:
-                wanted_types.add("computation")
+            wanted_types = set(intent_data.get("report_types", []))
 
             def _doc_matches(doc_name: str) -> bool:
                 meta = doc_metadata.get(doc_name) or {}
@@ -1067,11 +1142,8 @@ class LLMService:
                     return True
                 
                 # Rule 2: Match by filename hints
-                if "balance" in q_lower and any(h in name for h in ["balance", "bl.", "bl_", "-bl", "bs."]):
-                    return True
-                if ("p&l" in q_lower or "p & l" in q_lower or "profit" in q_lower) and any(h in name for h in ["p&l", "pl.", "pl_", "-pl", "profit", "loss"]):
-                    return True
-                if "computation" in q_lower and "computation" in name:
+                name_hints = ["balance", "bl.", "bl_", "-bl", "bs.", "p&l", "pl.", "pl_", "-pl", "profit", "loss", "computation", "statement"]
+                if any(h in name for h in name_hints):
                     return True
                 return False
 
@@ -1100,7 +1172,11 @@ class LLMService:
                 else:
                     print(f"[WARNING] Transaction search focus: All {len(skip_docs)} documents were filtered out. Using original context to avoid empty results.")
         
-        total_batches = (len(context_chunks) + batch_size - 1) // batch_size
+        # OVERLAP IMPLEMENTATION: Step size = batch_size - 1 (overlap of 1 chunk)
+        step = batch_size - 1 if batch_size > 1 else 1
+        total_batches = (len(context_chunks) + step - 1) // step
+        print(f"[INFO] Splitting {len(context_chunks)} chunks into ~{total_batches} batches with overlap (step={step}, batch_size={batch_size})")
+
         tasks = []
         sem = asyncio.Semaphore(6) # Increased for speed (Higher throughput)
         
@@ -1122,9 +1198,12 @@ class LLMService:
 
         # Explicitly create Tasks so we can cancel them if the stream is aborted
         running_tasks = []
-        for i in range(0, len(context_chunks), batch_size):
+        batch_idx = 0
+        for i in range(0, len(context_chunks), step):
             batch = context_chunks[i:i + batch_size]
             batch_source_docs = source_documents[i:i + batch_size]
+            batch_idx += 1
+            print(f"[INFO] Stream Batch {batch_idx}: Processing {len(batch)} chunks (start_idx={i})")
             # Create task directly
             task = asyncio.create_task(process_batch_with_sem(batch, batch_source_docs))
             running_tasks.append(task)
@@ -1135,7 +1214,7 @@ class LLMService:
         all_debit_count = 0
         all_sources = set()
         seen_fingerprints = set() # For streaming de-duplication
-        all_unique_transactions = []  # Store all unique transactions to extract sources at end
+        all_unique_transactions = []  # Store all transactions to extract sources at end
         full_answers = [] # Aggregated textual responses
 
         try:
@@ -1192,21 +1271,24 @@ class LLMService:
                                 # Create a fingerprint to avoid duplicates
                                 # Include direction to prevent credits and debits from being considered duplicates
                                 desc = str(t.get('description', '')).strip().lower()
-                                amt = str(t.get('amount', '0')).replace(',', '').replace('.', '')  # Normalize amount
-                                date = str(t.get('date', ''))
-                                direction = str(t.get('direction', '')).upper()
+                                def _norm(val: str) -> str:
+                                    try: return f"{float(val.replace(',', '').strip()):.2f}"
+                                    except: return val.replace(',', '').strip()
+
+                                amt = _norm(str(t.get('amount', '0')))
+                                balance = _norm(str(t.get('balance', '')))
+                                date = str(t.get('date', '')).strip()
+                                direction = str(t.get('direction', '')).upper().strip()
                                 tx_id = str(t.get('transaction_id', '')).strip()
-                                source_doc = str(t.get('source_document', '')).strip()
-                                bank_name = str(t.get('bank_name', '')).strip()
                             
-                                # Use transaction_id if available for better uniqueness
+                                # Fingerprint: when a Ref ID exists, use it alone — same physical
+                                # transaction must never appear twice regardless of DEBIT/CREDIT assignment.
                                 if tx_id:
-                                    fp = f"{date}|{amt}|{direction}|{tx_id}"
+                                    fp = tx_id
+                                elif balance and balance != '0.00':
+                                    fp = f"{date}|{amt}|{direction}|{balance}"
                                 else:
-                                    # Include direction, source_document, and bank_name to distinguish similar transactions
-                                    # Use first 100 chars of description to handle very long descriptions
-                                    desc_short = desc[:100] if len(desc) > 100 else desc
-                                    fp = f"{date}|{amt}|{direction}|{desc_short}|{source_doc}|{bank_name}"
+                                    fp = f"{date}|{amt}|{direction}"
                             
                                 if fp not in seen_fingerprints:
                                     # Apply secondary hard-coded filter
@@ -1258,11 +1340,17 @@ class LLMService:
                     cancelled_count += 1
             if cancelled_count > 0:
                 print(f"[INFO] Cancelled {cancelled_count} pending background tasks.")
-        # Extract source documents ONLY from transactions that made it into final results
+        # Extract source documents ONLY from transactions that made it into final results.
+        # WHITELIST: Only accept source_doc values that are actual filenames from ChromaDB metadata.
+        # This rejects any LLM-hallucinated string (e.g. "Bank Statement", "Context 1").
+        valid_source_docs = set(source_documents)
         for tx in all_unique_transactions:
             source_doc = str(tx.get('source_document', '')).strip()
-            if source_doc and source_doc.lower() != 'unknown':
+            if source_doc and source_doc in valid_source_docs:
                 all_sources.add(source_doc)
+        # Fallback: if LLM gave no valid source_doc matches, use all real source_documents.
+        if not all_sources and not is_summary:
+            all_sources = set([d for d in source_documents if d and d.lower() != 'unknown'])
         # For summary outputs (no transactions), still show the documents we scanned.
         if is_summary and not all_sources:
             if filtered_sources_for_summary is not None:
@@ -1284,6 +1372,8 @@ class LLMService:
             for pat in not_found_patterns:
                 final_full_answer = final_full_answer.replace(pat, "")
             final_full_answer = final_full_answer.replace('{"transactions": []}', "").strip()
+            if not final_full_answer:
+                final_full_answer = "I could not find the information you requested in the uploaded documents."
 
         print(f"[INFO] Streaming extraction complete: {all_transactions_count} total ({all_credit_count} CREDITS, {all_debit_count} DEBITS)")
         yield json.dumps({

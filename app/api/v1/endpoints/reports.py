@@ -134,49 +134,23 @@ async def stream_query_documents(request_body: QueryRequest, request: Request, u
                 yield json.dumps({"type": "error", "message": "No documents found"}) + "\n"
             return StreamingResponse(empty_gen(), media_type="application/x-ndjson")
 
-        # Retrieval logic
-        q_lower = request_body.question.lower()
+        # Intent Discovery via LLM (No hardcoding)
+        intent_data = await llm_service.classify_query_intent(request_body.question)
+        intent = intent_data.get("intent", "EXTRACTION")
+        explicit_limit = intent_data.get("explicit_limit")
         
-        # 1. Check for explicit limit (e.g. "10 records", "top 5 transactions")
-        import re
-        limit_match = re.search(r'\b(\d+)\s*(?:records|rows|transactions|items|results|entries)\b', q_lower)
-        explicit_limit = int(limit_match.group(1)) if limit_match else None
-
-        # 2. Check for keywords that imply "ALL"
-        has_exhaustive_keywords = any(kw in q_lower for kw in [
-            "all", "every", "sum", "total", "exhaustive", "upi", "cheque", "chq", "instrument",
-            "cash", "atm", "self", "withdrawal"
-        ])
+        # Mapping intent to processing strategy
+        is_summary = (intent == "SUMMARY")
+        # Summary requests always use exhaustive retrieval across relevant docs to build a full picture
+        is_exhaustive = (intent == "SUMMARY" or intent == "EXTRACTION") 
         
-        # 3. Check for summary/report keywords (Balance Sheet, P&L, etc.)
-        has_summary_keywords = any(kw in q_lower for kw in [
-            "balance sheet", "p&l", "p & l", "profit", "loss", "report", "summary", "computation"
-        ])
-
-        # 4. Check for active filters
-        # If specific folders, date range, file types, or tags are provided, user expects ALL matching data
-        has_active_filters = bool(
-            (request_body.start_date and request_body.end_date) or 
-            request_body.folder_ids or 
-            request_body.file_types or 
-            request_body.tags or
-            request_body.uploaded_by
-        )
-
-        # Decision Logic
         if explicit_limit:
-            # Case A: User asked for a specific number. Honor it strictly.
-            is_exhaustive = False
-            is_summary = False
             n_results = explicit_limit
-            print(f"[INFO] Explicit limit detected: {n_results}. Mode: Standard (Limited)")
-            
+            is_exhaustive = False
+            print(f"[INFO] Intent: EXTRACTION with Limit={n_results}")
         else:
-            # Case B: Default (Filters, Keywords, or General). Exhaustive Search.
-            # User wants "all records" by default unless a specific number is requested.
-            is_exhaustive = True
-            is_summary = has_summary_keywords
-            print(f"[INFO] Defaulting to Exhaustive Search (All Records). keywords={has_exhaustive_keywords}, filters={has_active_filters}")
+            n_results = 50 # Default if extraction but no limit
+            print(f"[INFO] Intent: {intent} (Exhaustive={is_exhaustive})")
         
         if is_exhaustive:
             print(f"[INFO] Streaming exhaustive extraction for ALL chunks (is_summary={is_summary})")
@@ -280,31 +254,13 @@ async def stream_query_documents(request_body: QueryRequest, request: Request, u
                     return
                 
                 if is_summary:
-                    # Filter down to likely report documents to avoid massive contexts
-                    # Match by keywords in question and document name
-                    ql = (request_body.question or "").lower()
-                    
-                    def _is_relevant_doc(doc_name: str) -> bool:
-                        dn = (doc_name or "").lower()
-                        if "balance sheet" in ql and any(k in dn for k in ["balance", "bl.", "bl_", "-bl", "bs."]):
-                            return True
-                        if ("p&l" in ql or "profit" in ql or "loss" in ql) and any(k in dn for k in ["p&l", "pl.", "pl_", "-pl", "profit"]):
-                            return True
-                        if "computation" in ql and "computation" in dn:
-                            return True
-                        return False
-
-                    filtered = [(c, d) for c, d in zip(documents, source_documents) if _is_relevant_doc(d)]
-                    
-                    if filtered:
-                        documents_local = [c for c, _ in filtered]
-                        source_documents_local = [d for _, d in filtered]
-                        print(f"[INFO] Summary focus: filtered to {len(documents_local)} chunks from relevant documents")
-                    else:
-                        # Fallback to all documents if no naming matches found
-                        documents_local = documents
-                        source_documents_local = source_documents
-                        print(f"[INFO] Summary focus: No name matches found, using all {len(documents)} chunks")
+                    # Summary focus: for summary results, we cap the context to avoid token overflow
+                    # while ensuring we have enough document depth.
+                    # 200 chunks ~ 100k-150k tokens, which fits in modern LLM contexts safely
+                    CHUNK_CAP = 200 
+                    documents_local = documents[:CHUNK_CAP]
+                    source_documents_local = source_documents[:CHUNK_CAP]
+                    print(f"[INFO] Summary focus: Capping at first {len(documents_local)} chunks (original: {len(documents)})")
 
                     # Summary reports: return a single deterministic summary when possible
                     result = await llm_service.generate_summary_report(
@@ -320,6 +276,7 @@ async def stream_query_documents(request_body: QueryRequest, request: Request, u
                     
                     summary_payload = {
                         "type": "summary",
+                        "intent": "SUMMARY",
                         "total_transactions": 0,
                         "total_credits": 0,
                         "total_debits": 0,
@@ -337,12 +294,12 @@ async def stream_query_documents(request_body: QueryRequest, request: Request, u
                         question=effective_question,
                         context_chunks=documents,
                         source_documents=source_documents,
-                        batch_size=5, # Reduced for faster initial response
+                        batch_size=3, # Reduced for higher extraction precision
                         company_id=request_body.company_id
                     ):
                         # Check if client disconnected before yielding each chunk
                         if await request.is_disconnected():
-                            print("[INFO] ✅ Client disconnected during exhaustive streaming, stopping processing")
+                            print("[INFO] Client disconnected during exhaustive streaming, stopping processing")
                             return
                         yield chunk + "\n"
                 else:
@@ -457,8 +414,6 @@ async def query_documents(request: QueryRequest, user=Depends(get_current_user))
                 )
 
         # Step 2: Retrieve Relevant Chunks
-        print(f"[INFO] Step 2: Retrieving relevant chunks from vector store...")
-        # Get count first as a sanity check
         count = vector_store.get_collection_count(company_id=request.company_id)
         if count == 0:
             return QueryResponse(
@@ -466,44 +421,22 @@ async def query_documents(request: QueryRequest, user=Depends(get_current_user))
                 sources=[]
             )
             
-        # Retrieval logic based on question intent
-        q_lower = request.question.lower()
-        
-        # 1. Check for explicit limit
-        import re
-        limit_match = re.search(r'\b(\d+)\s*(?:records|rows|transactions|items|results|entries)\b', q_lower)
-        explicit_limit = int(limit_match.group(1)) if limit_match else None
+        # Intent Discovery via LLM (No hardcoding)
+        intent_data = await llm_service.classify_query_intent(request.question)
+        intent = intent_data.get("intent", "EXTRACTION")
+        explicit_limit = intent_data.get("explicit_limit")
 
-        # 2. Check for keywords that imply "ALL"
-        has_exhaustive_keywords = any(kw in q_lower for kw in [
-            "all", "every", "sum", "total", "exhaustive", "upi", "cheque", "chq", "instrument",
-            "cash", "atm", "self", "withdrawal"
-        ])
-        
-        # 3. Check for summary/report keywords (Balance Sheet, P&L, etc.)
-        has_summary_keywords = any(kw in q_lower for kw in [
-            "balance sheet", "p&l", "p & l", "profit", "loss", "report", "summary", "computation"
-        ])
+        # Mapping intent to processing strategy
+        is_summary = (intent == "SUMMARY")
+        is_exhaustive = (intent == "SUMMARY" or intent == "EXTRACTION")
 
-        # 4. Check for active filters
-        has_active_filters = bool(
-            (request.start_date and request.end_date) or 
-            request.folder_ids or 
-            request.file_types or 
-            request.tags or
-            request.uploaded_by
-        )
-
-        # Decision Logic - Identical to streaming endpoint
         if explicit_limit:
-            is_exhaustive = False
             n_results = explicit_limit
-            print(f"[INFO] Explicit limit detected: {n_results}. Mode: Standard (Limited)")
-            
+            is_exhaustive = False
+            print(f"[INFO] Intent: EXTRACTION with Limit={n_results}")
         else:
-            # Default to Exhaustive
-            is_exhaustive = True
-            print(f"[INFO] Defaulting to Exhaustive Search (All Records). keywords={has_exhaustive_keywords}, filters={has_active_filters}")
+            n_results = 50
+            print(f"[INFO] Intent: {intent} (Exhaustive={is_exhaustive})")
         
         if is_exhaustive:
             print(f"[INFO] Exhaustive extraction mode triggered")

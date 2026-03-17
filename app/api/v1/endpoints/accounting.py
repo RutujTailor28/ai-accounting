@@ -5,6 +5,7 @@ from uuid import UUID
 import json
 import re
 import uuid
+import asyncio
 from app.schemas.chat import ChatQueryRequest, ChatMessageResponse
 from app.api.deps import get_current_user
 from app.core.supabase import supabase, supabase_admin
@@ -23,12 +24,89 @@ async def accounting_query(request_body: ChatQueryRequest, request: Request, use
     Generate accounting reports (entries, balance sheets) from workspace documents with streaming.
     """
     try:
-        # Step 0: Get company_id
+        # Step 0: Input Guard (Agent 0)
+        # Prevent accidental or meaningless inputs (like "nw", ".", "hi") from triggering full processing.
+        q_low = str(request_body.question).strip().lower()
+        # Regex to catch gibberish or very short non-accounting tokens
+        # Keywords that indicate a valid accounting intent
+        valid_keywords = [
+            "p&l", "p & l", "profit", "loss", "statement", "ledger", "journal", "audit", 
+            "tally", "sheet", "categorize", "category", "account", "expense", "amount", 
+            "gst", "interest", "analyze", "analysis", "find", "show", "get", "instead", 
+            "change", "move", "shift", "put", "update", "edit", "modify", "balance", 
+            "total", "summary", "report", "extract", "transaction", "analyze", "list"
+        ]
+        is_meaningless = len(q_low) < 3 or (not any(kw in q_low for kw in valid_keywords))
+        
+        # Exceptions for common shorthand
+        if q_low in ["p&l", "bs", "tb", "p & l"]: is_meaningless = False
+        
+        if is_meaningless:
+            async def meaningless_stream():
+                msg = "I didn't quite catch that. Could you please ask a specific question about your documents? For example: 'Analyze my P&L' or 'Show my journal entries'."
+                yield f"data: {json.dumps({'token': msg})}\n\n"
+            return StreamingResponse(meaningless_stream(), media_type="text/event-stream")
+
+        # Step 0.1: Get company_id
         profile_res = supabase.table("profiles").select("company_id").eq("id", user.id).single().execute()
         company_id = profile_res.data["company_id"]
 
-        # Step 1: Resolve documents to query
+        # Step 1: Pre-resolve session history for efficiency (Iteration Check)
+        previous_context = None
+        cached_all_tables = []
+        cached_transactions = []
+        aggregated_instructions = ""
+
+        try:
+            # Fetch full session history to aggregate refinements
+            history_res = supabase.table("chat_messages") \
+                .select("role, content, data") \
+                .eq("session_id", str(request_body.session_id)) \
+                .order("created_at", desc=True) \
+                .execute()
+            
+            if history_res.data:
+                # 1. Get the last assistant message for context (tables/txns)
+                last_assistant = next((m for m in history_res.data if m["role"] == "assistant"), None)
+                if last_assistant:
+                    content = last_assistant.get("content", "")
+                    data_obj = last_assistant.get("data", {}) or {}
+                    data_tables = data_obj.get("tables", [])
+                    cached_all_tables = data_obj.get("all_tables", data_tables)
+                    cached_transactions = data_obj.get("transactions", [])
+                    
+                    # Reconstruct full context with ALL cached tables
+                    full_previous_context = ""
+                    for t in cached_all_tables:
+                        if t.get("type") in ["profit_loss", "balance_sheet", "p_and_l"]:
+                            title = t.get("title", "")
+                            headers = t.get("headers", [])
+                            rows = t.get("rows", [])
+                            full_previous_context += f"### {title}\n"
+                            full_previous_context += f"| {' | '.join(headers)} |\n"
+                            full_previous_context += f"| {' | '.join(['---'] * len(headers))} |\n"
+                            for row in rows:
+                                clean_row = [str(c) if c is not None else "" for c in row]
+                                full_previous_context += f"| {' | '.join(clean_row)} |\n"
+                            full_previous_context += "\n"
+                    
+                    full_previous_context += content
+                    if "Balance Sheet" in full_previous_context or "Profit & Loss" in full_previous_context or "|---|" in full_previous_context:
+                        previous_context = full_previous_context
+
+                # 2. Aggregate ALL user instructions for Cumulative Refinement
+                user_msgs = [m["content"] for m in reversed(history_res.data) if m["role"] == "user"]
+                if len(user_msgs) > 0:
+                    instructions = user_msgs # Use all history for context
+                    aggregated_instructions = " + ".join(instructions)
+        except Exception as e:
+            print(f"[WARNING] Failed to retrieve session history early: {e}")
+
+        # Step 2: Resolve context and documents to query
         doc_names = []
+        chunks = []
+        metadatas = []
+        
         effective_workspace_id = str(request_body.workspace_id) if request_body.workspace_id else None
         effective_customer_id = str(request_body.customer_id) if request_body.customer_id else None
 
@@ -69,7 +147,6 @@ async def accounting_query(request_body: ChatQueryRequest, request: Request, use
                         or_conditions.append(f"name.in.({','.join(names)})")
                         
                 if request_body.folder_ids:
-                    # Folder IDs are expected to be UUIDs in the database schema
                     quoted_folder_ids = [f'"{str(foid)}"' for foid in request_body.folder_ids]
                     or_conditions.append(f"folder_id.in.({','.join(quoted_folder_ids)})")
                 
@@ -104,11 +181,8 @@ async def accounting_query(request_body: ChatQueryRequest, request: Request, use
             if not doc_names:
                 raise HTTPException(status_code=400, detail="Workspace has no documents.")
 
-        # Step 2: Retrieve ALL Chunks (High Context for Reports)
-        # For accounting reports, we often need the full story, so we pull more results than usual
+        # Step 3: Retrieve ALL Chunks
         query_embedding = embedding_service.generate_embedding(request_body.question)
-        
-        # Prepare filters
         query_filters = {
             "file_types": request_body.file_types,
             "folder_ids": request_body.folder_ids,
@@ -118,9 +192,6 @@ async def accounting_query(request_body: ChatQueryRequest, request: Request, use
             "tags": request_body.tags
         }
 
-        # For accounting, we need to get ALL chunks from the documents, not just semantically similar ones
-        # First get count to retrieve all available chunks
-        
         count_result = vector_store.collection.get(
             where=vector_store._build_where_filter(
                 company_id=company_id,
@@ -128,15 +199,11 @@ async def accounting_query(request_body: ChatQueryRequest, request: Request, use
                 **query_filters
             ),
             include=[],
-            limit=10000  # Explicitly set high limit to get actual count
+            limit=10000
         )
         total_available = len(count_result['ids'])
-        print(f"[INFO] Accounting endpoint: Total available chunks for documents: {total_available}")
         
-        # Retrieve ALL chunks for these documents (not just semantically similar ones)
-        # This ensures we get transaction data, not just headers/footers
         if total_available > 0:
-            # Get all chunks without semantic filtering - just filter by document
             all_results = vector_store.collection.get(
                 where=vector_store._build_where_filter(
                     company_id=company_id,
@@ -144,133 +211,70 @@ async def accounting_query(request_body: ChatQueryRequest, request: Request, use
                     **query_filters
                 ),
                 include=['documents', 'metadatas'],
-                limit=10000  # Explicitly set high limit for accounting synthesis
+                limit=10000
             )
-            chunks = all_results.get('documents', [])
-            metadatas = all_results.get('metadatas', [])
-            print(f"[INFO] Accounting endpoint: Retrieved {len(chunks)} chunks (ALL chunks from documents) for accounting synthesis")
+            raw_chunks = all_results.get('documents', [])
+            raw_metadatas = all_results.get('metadatas', [])
             
-            # Deterministic Sorting
-            # Ensure chunks are processed in a stable order across runs
             combined = []
-            for i in range(len(chunks)):
-                meta = metadatas[i] or {}
-                # Tie-breaker: content snippet
-                sort_key = (
-                    meta.get('document_name', ''),
-                    int(meta.get('chunk_index', 0)),
-                    chunks[i][:20]
-                )
-                combined.append((sort_key, chunks[i], meta))
+            for i in range(len(raw_chunks)):
+                meta = raw_metadatas[i] or {}
+                sort_key = (meta.get('document_name', ''), int(meta.get('chunk_index', 0)), raw_chunks[i][:20])
+                combined.append((sort_key, raw_chunks[i], meta))
             
             combined.sort(key=lambda x: x[0])
-            
             chunks = [x[1] for x in combined]
             metadatas = [x[2] for x in combined]
-            print(f"[INFO] Accounting endpoint: Sorted {len(chunks)} chunks for deterministic processing")
 
-            # Filter out header/footer chunks that don't contain transaction-like patterns
             transaction_keywords = ['CASH', 'WDL', 'ATM', 'WITHDRAWAL', 'SELF', 'UPI', 'NEFT', 'IMPS', 'RTGS', 
-                                  'PAYMENT', 'RECEIVED', 'TRANSFER', 'DEBIT', 'CREDIT', 
-                                  'DEPOSIT', 'DATE', '/', 'Rs.', 'AMOUNT', 'CHQ', 'CHEQUE', 'INSTRUMENT',
-                                  '22/', '23/', '24/', '25/', '01/', '02/', '03/', '04/', '05/',
-                                  '06/', '07/', '08/', '09/', '10/', '11/', '12/']
+                                'PAYMENT', 'RECEIVED', 'TRANSFER', 'DEBIT', 'CREDIT', 'CR', 'DR',
+                                'DEPOSIT', 'DATE', '/', 'Rs.', 'AMOUNT', 'CHQ', 'CHEQUE']
             
             filtered_chunks = []
             filtered_metadatas = []
-            
             for chunk, metadata in zip(chunks, metadatas):
                 chunk_upper = chunk.upper()
-                # Check if chunk contains transaction-like patterns
                 has_transaction_pattern = any(keyword in chunk_upper for keyword in transaction_keywords)
-                
-                # Check if chunk has date-like patterns (DD/MM/YY or DD/MM/YYYY)
                 has_date_pattern = bool(re.search(r'\d{1,2}[/-]\d{1,2}[/-]\d{2,4}', chunk))
-                
-                # Check if chunk has amount patterns (numbers with commas or decimals)
                 has_amount_pattern = bool(re.search(r'\d+[,\.]\d+', chunk))
+                is_header_footer = any(keyword in chunk_upper for keyword in ['CLOSING BALANCE INCLUDES', 'GSTIN NUMBER', 'IFSC'])
                 
-                # Exclude chunks that are clearly headers/footers
-                is_header_footer = any(keyword in chunk_upper for keyword in [
-                    'CLOSING BALANCE INCLUDES', 'STATEMENT WILL BE CONSIDERED CORRECT',
-                    'ERROR IS REPORTED WITHIN', 'GSTIN NUMBER', 'GST NUMBER',
-                    'REGISTERED OFFICE', 'BRANCH CODE', 'IFSC', 'MICR', 'ACCOUNT TYPE',
-                    'STATEMENT OF ACCOUNT FROM', 'ACCOUNT BRANCH', 'PHONE NO', 'EMAIL',
-                    'CUST ID', 'ACCOUNT NO', 'A/C OPEN DATE', 'ACCOUNT STATUS'
-                ])
-                
-                # Include chunk if:
-                # 1. It has transaction patterns, OR
-                # 2. It has date AND amount patterns (likely a transaction), OR  
-                # 3. It's not a header/footer (keep if we're not sure)
-                if (has_transaction_pattern or 
-                    (has_date_pattern and has_amount_pattern) or 
-                    (not is_header_footer and len(chunk) > 50)):  # Exclude very short chunks too
+                if has_transaction_pattern or (has_date_pattern and has_amount_pattern) or (not is_header_footer and len(chunk) > 50):
                     filtered_chunks.append(chunk)
                     filtered_metadatas.append(metadata)
             
-            # If we filtered too much, use original chunks (but log warning)
-            if len(filtered_chunks) < 5 and len(chunks) > 10:
-                print(f"[WARNING] Filtering removed too many chunks ({len(chunks)} -> {len(filtered_chunks)}). Using all chunks.")
-                chunks = chunks
-            elif filtered_chunks:
-                original_count = len(chunks)
+            if filtered_chunks:
                 chunks = filtered_chunks
-                removed_count = original_count - len(chunks)
-                print(f"[INFO] Accounting endpoint: After filtering, using {len(chunks)} chunks with transaction data (removed {removed_count} header/footer chunks)")
-            else:
-                print(f"[WARNING] All chunks were filtered out. Using original chunks.")
+                metadatas = filtered_metadatas
         else:
-            # Fallback to semantic search if no chunks found
+            # Fallback
             results = vector_store.workspace_query(
                 query_embedding=query_embedding,
                 company_id=company_id,
                 document_names=doc_names,
-                n_results=100,  # Much higher for accounting
+                n_results=100,
                 **query_filters
             )
             chunks = results.get('documents', [[]])[0]
-            print(f"[INFO] Accounting endpoint: Retrieved {len(chunks)} chunks via semantic search (fallback)")
+            metadatas = results.get('metadatas', [[]])[0]
         
-        if not chunks:
+        if not chunks and not cached_transactions:
             raise HTTPException(
                 status_code=400, 
-                detail="No document content found. Please ensure documents are uploaded and processed correctly."
+                detail="No document content found and no cached data available."
             )
+
+        # Step 4: Intent and Refinement Logic
+        q_lower = request_body.question.lower()
+        q_words = re.sub(r'[^a-z0-9]', ' ', q_lower).split()
         
-        # Log chunk preview for debugging
-        if chunks:
-            total_length = sum(len(chunk) for chunk in chunks)
-            print(f"[INFO] Accounting endpoint: Total context length: {total_length} characters")
-            # Show first chunk that looks like it has transactions
-            for i, chunk in enumerate(chunks[:5]):
-                if any(kw in chunk.upper() for kw in ['UPI', 'NEFT', 'DEBIT', 'CREDIT', 'DATE']):
-                    print(f"[DEBUG] Accounting endpoint: Chunk {i} preview (first 300 chars): {chunk[:300]}...")
-                    break
-            else:
-                print(f"[DEBUG] Accounting endpoint: First chunk preview (200 chars): {chunks[0][:200]}...")
-
-
-        previous_context = None
-        try:
-            # Fetch the last message from this session (assistant role)
-            last_msg_res = supabase.table("chat_messages") \
-                .select("content, data") \
-                .eq("session_id", str(request_body.session_id)) \
-                .eq("role", "assistant") \
-                .order("created_at", desc=True) \
-                .limit(1) \
-                .execute()
-            
-            if last_msg_res.data:
-                last_msg = last_msg_res.data[0]
-                # Check if it looks like a report (contains tables or report keywords)
-                content = last_msg.get("content", "")
-                if "Balance Sheet" in content or "Profit & Loss" in content or "|---|" in content:
-                    previous_context = content
-                    print(f"[INFO] Found previous report context for iteration (length: {len(previous_context)})")
-        except Exception as e:
-            print(f"[WARNING] Failed to retrieve previous context: {e}")
+        show_tables_requested = []
+        if any(kw in q_lower for kw in ['balanc', 'asset', 'liabilit', 'equity']) or 'bs' in q_words:
+            show_tables_requested.append("balance_sheet")
+        if any(kw in q_lower for kw in ['profit', 'loss', 'p&l', 'pnl', 'income', 'expense', 'revenue']):
+            show_tables_requested.append("profit_loss")
+        if "journal" in q_lower or "entries" in q_lower or "ledger" in q_lower: 
+            show_tables_requested.append("journal")
 
         # Step 3: Define Streaming Generator
         async def stream_generator():
@@ -280,27 +284,68 @@ async def accounting_query(request_body: ChatQueryRequest, request: Request, use
                 return
             
             full_response = ""
-            # Prepare streaming from AccountingService
-            # Pass previous_context to enable refinement mode
-            async for token in accounting_service.stream_accounting_synthesis(
-                request_body.question, 
-                chunks, 
-                metadatas, 
-                company_id=company_id,
-                previous_context=previous_context
-            ):
-                # Check if client disconnected before yielding each token
-                if await request.is_disconnected():
-                    print("[INFO] ✅ Client disconnected during accounting streaming, stopping processing")
-                    return
+            final_structured_tables = []
+            final_all_tables = []
+            final_transactions = []
+            
+            # Check if we can fulfill this from cache instantly
+            tables_to_show = [t for t in cached_all_tables if t.get("type") in show_tables_requested]
+            if cached_all_tables and tables_to_show and not any(kw in q_lower for kw in ["change", "update", "modify", "edit", "fix", "instead", "move", "remove", "add", "to"]):
+                print(f"[INFO] Instant Cache Hit! Serving {len(tables_to_show)} tables from session cache.")
+                full_response = "Here is the requested report based on the already analyzed statement.\n\n"
+                yield f"data: {json.dumps({'token': full_response})}\n\n"
                 
-                if isinstance(token, dict):
-                     # Status update (already a dict, just wrap in data)
-                     yield f"data: {json.dumps(token)}\n\n"
-                else:
-                    full_response += token
-                    # SSE Format: data: <payload>\n\n
-                    yield f"data: {json.dumps({'token': token})}\n\n"
+                for t in tables_to_show:
+                    title = t.get("title", "")
+                    headers = t.get("headers", [])
+                    rows = t.get("rows", [])
+                    table_md = f"### {title}\n"
+                    table_md += f"| {' | '.join(headers)} |\n"
+                    table_md += f"| {' | '.join(['---'] * len(headers))} |\n"
+                    for row in rows:
+                        clean_row = [str(c) if c is not None else "" for c in row]
+                        table_md += f"| {' | '.join(clean_row)} |\n"
+                    table_md += "\n"
+                    
+                    full_response += table_md
+                    yield f"data: {json.dumps({'token': table_md})}\n\n"
+                    await asyncio.sleep(0.1)
+                
+                final_structured_tables = tables_to_show
+                final_all_tables = cached_all_tables
+            else:
+                # Prepare streaming from AccountingService
+                # Pass previous_context to enable refinement mode
+                # Use aggregated_instructions if present to ensure cumulative refinement
+                async for token in accounting_service.stream_accounting_synthesis(
+                    request_body.question, 
+                    chunks, 
+                    metadatas, 
+                    company_id=company_id,
+                    customer_id=effective_customer_id,
+                    previous_context=previous_context,
+                    input_transactions=cached_transactions if cached_transactions else None,
+                    feedback_history=aggregated_instructions if aggregated_instructions else None
+                ):
+                    # Check if client disconnected before yielding each token
+                    if await request.is_disconnected():
+                        print("[INFO] Client disconnected during accounting streaming, stopping processing")
+                        return
+                    
+                    if isinstance(token, dict):
+                         if "structured_tables" in token:
+                             final_structured_tables = token["structured_tables"]
+                             final_all_tables = token.get("all_tables", final_structured_tables)
+                         elif "all_transactions" in token:
+                             # Capture transactions for persistence
+                             final_transactions = token["all_transactions"]
+                         else:
+                             # Status update (already a dict, just wrap in data)
+                             yield f"data: {json.dumps(token)}\n\n"
+                    else:
+                        full_response += token
+                        # SSE Format: data: <payload>\n\n
+                        yield f"data: {json.dumps({'token': token})}\n\n"
             
             # Check disconnection before saving history
             if await request.is_disconnected():
@@ -332,8 +377,25 @@ async def accounting_query(request_body: ChatQueryRequest, request: Request, use
                 supabase_admin.table("chat_messages").insert(user_msg_data).execute()
 
                 # Save AI Synthesis
-                # Phase 2: Extract ALL structured tables from combined generator output
-                structured_tables = await accounting_service.get_all_structured_tables(full_response)
+                if not final_structured_tables:
+                    final_structured_tables = await accounting_service._parse_markdown_tables(full_response)
+                    
+                    # Merge with cached_all_tables so we don't lose the un-edited tables
+                    merged_all = list(cached_all_tables) if cached_all_tables else []
+                    
+                    for refined_t in final_structured_tables:
+                        matched = False
+                        for i, old_t in enumerate(merged_all):
+                            if old_t.get('type') == refined_t.get('type'):
+                                merged_all[i] = refined_t
+                                matched = True
+                                break
+                        if not matched:
+                            merged_all.append(refined_t)
+                            
+                    final_all_tables = merged_all
+                
+                structured_tables = final_structured_tables
                 
                 msg_data = {
                     "session_id": str(request_body.session_id),
@@ -343,7 +405,11 @@ async def accounting_query(request_body: ChatQueryRequest, request: Request, use
                     "content": full_response,
                     "company_id": company_id,
                     "created_by": user.id,
-                    "data": {"tables": structured_tables},
+                    "data": {
+                        "tables": structured_tables, 
+                        "all_tables": final_all_tables,
+                        "transactions": final_transactions or cached_transactions
+                    },
                     "file_names": doc_names
                 }
                 if session_title:

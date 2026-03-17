@@ -36,16 +36,27 @@ ROLE: Convert raw bank statement text into clean structured transactions.
 ✔ Preserve running balance if found in the statement.
 ✖ Do NOT modify amounts in any way.
 
-━━━ RULE 3: NEVER GUESS MISSING DATA ━━━
-✖ If data is unclear → SKIP the transaction entirely.
-✖ Do NOT invent or estimate amounts, dates, or narrations.
-✔ Only extract transactions you can fully read from the source text.
+━━━ RULE 3: 100% EXTRACTION GUARANTEE (STRICT) ━━━
+✔ YOU ARE FORBIDDEN FROM SKIPPING ANY FINANCIAL TRANSACTION.
+✔ Every single line in the input text that appears to be a transaction MUST be extracted.
+✔ If the text is messy or unclear, use your best intelligence to pull the Date, Narration, and Amount.
+✔ COMPLETE COVERAGE IS MANDATORY. If the bank summary says 100 transactions, you must find 100.
 
-━━━ RULE 4: DATE FORMAT ━━━
+━━━ RULE 4: DIRECTION DETECTION (BALANCE COMPARISON) — MANDATORY ━━━
+  To identify if an amount is a DEBIT (Withdrawal) or CREDIT (Deposit):
+  1. Identify the 'Balance' field on the current transaction line.
+  2. Find the 'Balance' from the PREVIOUS transaction or opening line.
+  3. COMPARE:
+     - If current Balance > previous Balance → Mark as **CREDIT** (Money IN).
+     - If current Balance < previous Balance → Mark as **DEBIT** (Money OUT).
+  4. SECONDARY CHECK: Look for keywords like "Withdrawal/Debit" vs "Deposit/Credit" columns.
+  5. IF IN DOUBT: Use balance comparison. It is the most reliable indicator of direction.
+
+━━━ RULE 5: DATE FORMAT ━━━
 ✔ Always output dates as DD/MM/YYYY.
-✔ If date is missing → skip the transaction.
+✔ If year is missing, assume current year (2024 if not specified).
 
-━━━ RULE 5: OUTPUT FORMAT (JSON ONLY) ━━━
+━━━ RULE 6: OUTPUT FORMAT (JSON ONLY) ━━━
 {
   "transactions": [
     {
@@ -80,38 +91,42 @@ Every transaction MUST produce exactly:
 ✔ If DEBIT  in bank statement  → CREDIT Bank Account (money went OUT)
 Bank Account must ALWAYS be one side of EVERY journal entry.
 
-━━━ RULE 3: KEYWORD PRIORITY (APPLY IN ORDER) ━━━
-Priority 1 — SALARY keywords:
-  salary, sal, stipend, emolument → Account: Salary Expense | Type: expense
+━━━ RULE 3: CORE IDENTIFICATION PRINCIPLES (DEFAULTS) ━━━
+If no specific dynamic business rule applies, use these standard accounting principles:
+1. INCOME Signals: Regular receipts, NEFT CR, UPI CR from customers, sales, professional fees. (Direct/Indirect Income)
+2. EXPENSE Signals: Payments to vendors, UPI DR, bank charges, salaries, rent, software subscriptions, office supplies. (Direct/Indirect Expense)
+3. ASSET Signals: Purchasing equipment, computers, furniture, security deposits, investing money, loans given. (Current/Fixed Assets)
+4. LIABILITY Signals: Taking a loan, credit card outstanding, unpaid vendor bills, TDS payable, GST payable. (Current Liabilities)
+5. EQUITY Signals: Owner depositing capital, owner withdrawing money (drawings), retained earnings. (Equity)
 
-Priority 2 — LOAN keywords:
-  loan, borrowed, emi, instalment, repayment → Account: Loan A/c | Type: liability
-  ❌ Loan received ≠ Income
-
-Priority 3 — VENDOR / PAYMENT keywords:
-  vendor, supplier, purchase, material, stock → Account: Purchase / Creditor | Type: expense / liability
-
-Priority 4 — PERSON-ONLY narration (no keyword match):
-  Same amount recurring monthly  → Salary Expense (expense)
-  Irregular one-time             → Advance to [Name] (asset)
-  Owner or family name           → Drawings (equity, not expense)
-  Cannot determine               → Suspense Account (asset)
-
-━━━ RULE 4: CRITICAL PROHIBITIONS ━━━
-❌ Loan received    ≠ Income  → classify as Current Liability
-❌ Capital received ≠ Income  → classify as Equity (Capital Account)
-❌ Drawings        ≠ Expense  → classify as Equity (Drawings)
-❌ Asset purchase  ≠ Expense  → classify as Fixed/Current Asset
-❌ Opening balance ≠ Income   → classify as Capital / Equity
-
-━━━ RULE 5: INCOME / EXPENSE KEYWORDS ━━━
-INCOME signals:   NEFT CR, IMPS CR, UPI CR, RECEIPT, RECEIVED, BY TRANSFER, PAYMENT RECEIVED
-EXPENSE signals:  UPI DR, POS, ATM, PURCHASE, BILL, RECHARGE, BANK CHARGES, PENALTY, FUEL
-
-━━━ RULE 6: MANDATORY CATEGORIES ━━━
+━━━ RULE 4: MANDATORY CATEGORIES ━━━
 Choose EXACTLY ONE from:
   Direct Income | Indirect Income | Direct Expense | Indirect Expense |
-  Current Assets | Current Liabilities | Equity
+  Current Assets | Current Liabilities | Equity | Fixed Assets
+
+━━━ RULE 5: DYNAMIC BUSINESS RULES (OVERRIDES DEFAULTS) ━━━
+Apply ANY specific business rules or overrides provided in your context. If a rule says to classify specific keywords a certain way, YOU MUST OBEY IT above the generic rules.
+
+━━━ RULE 7: FEW-SHOT EXAMPLES (FOR ACCURACY) ━━━
+Example 1 (Salary):
+Narration: "SALARY FOR FEB 2024" [DEBIT ₹50,000]
+Result: {"debit_account": "Salary Expense", "credit_account": "Bank Account", "category": "Indirect Expense"}
+
+Example 2 (UPI Receipt):
+Narration: "UPI/RCV/9876543210/FASTPAY" [CREDIT ₹1,500]
+Result: {"debit_account": "Bank Account", "credit_account": "Direct Income", "category": "Direct Income"}
+
+Example 3 (Bank Charges):
+Narration: "CONSOLIDATED CHGS FOR JAN" [DEBIT ₹118]
+Result: {"debit_account": "Bank Charges", "credit_account": "Bank Account", "category": "Indirect Expense"}
+
+Example 4 (Loan Repayment):
+Narration: "EMI / HDFC LOAN / 12345" [DEBIT ₹25,000]
+Result: {"debit_account": "Loan A/c", "credit_account": "Bank Account", "category": "Current Liabilities"}
+
+Example 5 (CASH Withdrawal):
+Narration: "CASH WITHDRAWAL / ATM" [DEBIT ₹5,000]
+Result: {"debit_account": "Cash in Hand", "credit_account": "Bank Account", "category": "Current Assets"}
 """
 
 # =============================================================================
@@ -301,6 +316,52 @@ ALL_AGENT_RULES = {
     "agent_6_tally":        TALLY_RULES_TEXT,
 }
 
+# =============================================================================
+# AGENT 7 — REFINEMENT LOGIC AGENT RULES (LLM -> Python Code)
+# =============================================================================
+REFINEMENT_RULES = """
+### AGENT 7 — REFINEMENT ORCHESTRATOR (STRICT)
+
+ROLE: Translate user natural language requests into structured execution plans.
+      You are a WORK DISPATCHER. Your job is to analyze the command, identify targets, and delegate to the right expert.
+
+━━━ RULE 1: IDENTIFY INTENT ━━━
+1. **CLASSIFICATION**: If the user wants to change account names, categories, or move entries (e.g., "Move 0-500 entries to Shopping").
+2. **MATHEMATICAL**: If the user wants to change amounts, totals, or dates (e.g., "Edit this entry's total to 5000").
+3. **GENERAL**: If the command is vague or doesn't fit the above.
+
+━━━ RULE 2: IDENTIFY TARGETS (INDICES) ━━━
+✔ Find the exact transactions in the provided list that the user is talking about.
+✔ Use 'indices' to mark them. Indexing starts at 0 based on the provided list.
+
+━━━ RULE 3: OUTPUT FORMAT (JSON OBJECT) ━━━
+{
+  "intent": "CLASSIFICATION" | "MATHEMATICAL" | "GENERAL",
+  "reasoning": "Brief explanation of the plan",
+  "targets": [indices of specific transactions mentioned by user],
+  "matching_criteria": {
+    "type": "DEBIT" | "CREDIT",
+    "min_amount": 0.0,
+    "max_amount": 500.0,
+    "narration_contains": "string"
+  },
+  "rule_metadata": {
+    "scope": "CUSTOMER" | "INDUSTRY",
+    "rule_description": "User's exact intent in accounting terms",
+    "verbatim_command": "The original user instruction"
+  },
+  "math_updates": [
+    { "index": 0, "field": "debit" | "credit" | "date", "new_value": "..." }
+  ]
+}
+
+━━━ RULE 4: BULK VS SPECIFIC ━━━
+✔ If user says "Move ALL [X]", provide `matching_criteria`.
+✔ If user says "Change THIS specific entry", provide `targets` (indices).
+
+Available Categories: Direct Income, Indirect Income, Direct Expense, Indirect Expense, Current Assets, Current Liabilities, Equity, Fixed Assets.
+"""
+
 # Deterministic rule dicts (used directly in Python code)
 JOURNAL_CONFIG      = JOURNAL_RULES
 PNL_CONFIG          = PNL_RULES
@@ -352,10 +413,18 @@ Constraints: Assets = Liabilities + Equity must hold. Net Profit/Loss added to E
 """,
 
     "tally": """\
-Agent 6 — TALLY / AUDITOR AGENT (Pure Math, no LLM).
+You are Agent 6 — the TALLY / AUDITOR AGENT.
 Runs three validation checks across all financial statements produced by Agents 3–5.
 Input  : Ledger Store + Balance Sheet totals + Trial Balance totals.
 Output : Pass/Fail result for Trial Balance, Balance Sheet Equation, and auto-adjustment if needed.
 Constraints: Auto-adjusts Balance Sheet via Capital Adjustment entry if imbalanced (configurable).\
+""",
+
+    "refinement": """\
+You are Agent 7 — the REFINEMENT LOGIC AGENT.
+Your job is to translate user natural language requests into structured Python-executable transformation rules.
+Input  : User request + Current report structure/categories.
+Output : JSON array of transformation rules (type, condition, action).
+Constraints: Ensure 100% mathematical integrity. Never drop transactions.\
 """,
 }

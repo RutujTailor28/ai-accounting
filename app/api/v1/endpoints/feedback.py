@@ -51,6 +51,32 @@ async def submit_feedback(
             metadata=metadata
         )
         
+        # 4. Also save to structured accounting_rules table if it's tied to a customer
+        if feedback.customer_id:
+            try:
+                # Fetch business_type to associate with rule
+                cust_res = supabase.table("customers").select("business_type").eq("id", feedback.customer_id).single().execute()
+                business_type = cust_res.data.get("business_type") if cust_res.data else None
+                
+                rule_record = {
+                    "customer_id": feedback.customer_id,
+                    "business_type": business_type,
+                    "rule_description": rule_text
+                }
+                
+                # Only add company_id if it's a valid UUID to avoid DB type errors
+                try:
+                    uuid.UUID(str(company_id))
+                    rule_record["company_id"] = company_id
+                except ValueError:
+                    # company_id is a custom string (e.g. comp-xxxx), skip for this table
+                    pass
+
+                supabase.table("accounting_rules").insert(rule_record).execute()
+                print(f"[INFO] Saved custom rule to database for customer {feedback.customer_id}")
+            except Exception as e:
+                print(f"[WARNING] Failed to save rule to accounting_rules table: {e}")
+        
         return FeedbackResponse(
             id=uuid.uuid4(),
             original_query=feedback.original_query,
@@ -58,6 +84,7 @@ async def submit_feedback(
             user_correction=feedback.user_correction,
             explanation=feedback.explanation,
             company_id=company_id,
+            customer_id=feedback.customer_id,
             created_at=datetime.now()
         )
 

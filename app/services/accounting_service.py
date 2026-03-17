@@ -4,10 +4,10 @@ import asyncio
 import hashlib
 from langchain_openai import ChatOpenAI
 from app.core.config import settings
-from app.services.ai_service import LLMService
+from app.services.ai_service import LLMService, retry_with_backoff
 from app.ai.rag.retriever import vector_store
 from app.services.accounting_rules import (
-    EXTRACTOR_RULES, CLASSIFIER_RULES, JOURNAL_RULES_TEXT,
+    EXTRACTOR_RULES, CLASSIFIER_RULES, REFINEMENT_RULES, JOURNAL_RULES_TEXT,
     PNL_RULES_TEXT, BALANCE_SHEET_RULES_TEXT, TALLY_RULES_TEXT,
     PNL_CONFIG, BALANCE_SHEET_CONFIG, TALLY_CONFIG, JOURNAL_CONFIG,
     AGENT_SYSTEM_PROMPTS
@@ -29,7 +29,24 @@ class AccountingService:
         self.ai_service = LLMService() # Reuse AI service for extraction helpers
         self.shared_accounts = set() # Track account names across batches for consistency
         self.extraction_cache: Dict[str, List[Dict]] = {} # Cache: content_hash -> extracted transactions
-        self.structured_tables: List[Dict[str, Any]] = [] # Track structured table data for frontend
+        
+        # --- SMART CONCURRENCY DETECTION ---
+        # User requested 10 workers maximum. 
+        # We still auto-throttle for ":free" models to avoid 429s.
+        self.model_name = model.lower()
+        self.is_free_model = ":free" in self.model_name
+        
+        if self.is_free_model:
+            self.n_extractors = 5
+            self.n_classifiers = 3
+            self.worker_delay = 1.5
+            print(f"[INFO] Free Model Detected ({model}). Throttling to {self.n_extractors} workers.")
+        else:
+            self.n_extractors = 10  # USER REQUESTED LIMIT
+            self.n_classifiers = 10
+            self.worker_delay = 0.5
+            print(f"[INFO] Professional Model ({model}). Speed capped at {self.n_extractors} workers.")
+            
         print(f"[INFO] AccountingService initialized with model={model}")
     
     async def _get_base_doc_name(self, filename: str) -> str:
@@ -44,6 +61,37 @@ class AccountingService:
         base = re.sub(r'\s+copy$', '', base, flags=re.IGNORECASE)
         return base.strip().lower()
 
+    async def _discover_intent(self, question: str) -> Dict[str, Any]:
+        """
+        Agent 0: Intent Discovery Agent.
+        Uses LLM to categorize the user's request so we can route to the correct pipeline.
+        """
+        prompt = f"""
+        You are an Accounting Intent Discovery Agent.
+        Categorize the following user request into one of these types:
+        - EXTRACTION: User wants to pull data from new documents/statements (e.g. "analyze this", "pnl", "show journal").
+        - REFINEMENT: User wants to CHANGE or FIX existing data/calculations (e.g. "move this to shopping", "fix transaction 5", "update category").
+        - ANALYSIS: User is asking a general question about the reports (e.g. "why is profit low?", "explain this entry").
+
+        REQUEST: "{question}"
+
+        JSON OUTPUT:
+        {{
+            "intent": "EXTRACTION | REFINEMENT | ANALYSIS",
+            "explicit_limit": null,
+            "report_types": ["profit_loss", "balance_sheet"],
+            "target_keywords": []
+        }}
+        """
+        try:
+            res = await self.llm.ainvoke(prompt)
+            data = self.ai_service._extract_json(res.content)
+            print(f"[INFO] Intent Discovery: query='{question[:50]}...' -> intent={data.get('intent')}")
+            return data
+        except Exception as e:
+            print(f"[WARNING] Intent Discovery failed: {e}")
+            return {"intent": "EXTRACTION", "report_types": ["profit_loss", "balance_sheet"]}
+
     async def _normalize_narration(self, narration: str) -> str:
         """
         Normalize narration for robust deduplication.
@@ -56,27 +104,57 @@ class AccountingService:
         normalized = re.sub(r'[^a-zA-Z0-9]', '', narration).lower()
         return normalized
 
-    async def _extract_transactions_from_batch(self, batch_chunks: List[str], context_query: str = None, company_id: str = None) -> List[Dict]:
+    def _detect_requested_tables(self, question: str) -> set:
         """
-        Extract structured transaction data from a small batch of chunks.
-        Uses content-based caching to ensure identical chunks produce identical results.
+        Determine which table types to expose based on the user's question.
+        Generates everything internally but only shows the asked-for cards.
         """
-        # Create a deterministic hash of the batch content for caching
-        context = "\n".join(batch_chunks)
-        query_part = f"_{context_query}" if context_query else ""
-        content_hash = hashlib.sha256((context + query_part).encode('utf-8')).hexdigest()
+        import re
+        # Normalize: collapse "p & l" → "p&l", "p & l statement" → "p&l", etc.
+        q = question.lower()
+        q = re.sub(r'p\s*&\s*l', 'p&l', q)  # "p & l" → "p&l"
+        q = re.sub(r'p\s+and\s+l\b', 'p&l', q)  # "p and l" → "p&l"
         
-        # Check cache first
+        q_words = re.sub(r'[^a-z0-9]', ' ', q).split()
+
+        wants_bs  = any(kw in q for kw in [
+            'balanc', 'asset', 'liabilit', 'equity'
+        ]) or 'bs' in q_words
+        wants_pnl = any(kw in q for kw in [
+            'profit', 'loss', 'p&l', 'pnl', 'income', 'expense', 'revenue',
+            'trading', 'income statement', 'statement of profit'
+        ])
+
+        if wants_bs and wants_pnl:
+            return {'profit_loss', 'balance_sheet'}
+        if wants_bs:
+            return {'balance_sheet'}
+        if wants_pnl:
+            return {'profit_loss'}
+        # Default: show all financial statements (no journal)
+        return {'profit_loss', 'balance_sheet'}
+
+    async def _extract_transactions_from_batch(
+        self, 
+        context: Union[str, List[str]], 
+        context_query: str = None, 
+        company_id: str = None,
+        feedback_context: str = ""
+    ) -> List[Dict]:
+        """
+        Extract structured transaction data from a text batch.
+        IMPROVED: Feedback context passed as argument to avoid redundant VDB queries.
+        """
+        if isinstance(context, list):
+            context = "\n---\n".join(context)
+            
+        content_hash = hashlib.sha256(context.encode()).hexdigest()
+        
+        # Check cache
         if content_hash in self.extraction_cache:
             print(f"[CACHE HIT] Reusing cached extraction for batch (hash: {content_hash[:8]}...)")
             return self.extraction_cache[content_hash]
         
-        # Injection of already seen accounts to prevent duplicates
-        known_accounts_str = ", ".join(list(self.shared_accounts)[:50]) if self.shared_accounts else "None yet"
-        
-        query_instruction = ""
-        feedback_context = ""
-
         if context_query:
             query_instruction = f"""
         USER INTENT: "{context_query}"
@@ -87,24 +165,7 @@ class AccountingService:
            - DO NOT SKIP ANY VALID BANK TRANSACTIONS. Extract everything.
         3. ONLY if the user explicitly requested a specific filter:
            - Skip transactions that DO NOT match the requested type.
-           - CASH SEARCH: Exclude any line containing UPI, VPA, NEFT, or @ markers.
-           - UPI SEARCH: Exclude any line containing CASH, ATM, or WITHDRAWAL markers.
         """
-            # Agentic Feedback Injection
-            if company_id:
-                try:
-                    # Generate embedding for the query to find similar past mistakes
-                    from app.services.deps import embedding_service
-                    q_emb = embedding_service.generate_embedding(context_query)
-                    
-                    relevant_feedback = vector_store.query_feedback(q_emb, company_id)
-                    if relevant_feedback:
-                        feedback_context = "\n**LESSONS LEARNED (PAST USER CORRECTIONS):**\n"
-                        for i, fb in enumerate(relevant_feedback):
-                            feedback_context += f"- {fb}\n"
-                        print(f"[INFO] AccountingService: Injected {len(relevant_feedback)} past corrections into prompt for company {company_id}")
-                except Exception as e:
-                    print(f"[WARNING] AccountingService: Failed to retrieve feedback: {e}")
 
         prompt = f"""
         {AGENT_SYSTEM_PROMPTS['extractor']}
@@ -118,8 +179,12 @@ class AccountingService:
         {context}
 
         TASK:
-        Read the bank statement text and extract every transaction you can clearly read.
-        Do NOT classify, do NOT create journal entries, do NOT decide income/expense.
+        Read the bank statement text and extract EVERY SINGLE transaction without exception.
+        - YOU ARE FORBIDDEN FROM SKIPPING ANY ROW.
+        - IDENTIFY COLUMNS: Look for headers like Withdrawal/Debit and Deposit/Credit.
+        - MAP DATA CORRECTLY: Money OUT goes into `debit`, Money IN goes into `credit`.
+        - DO NOT put everything into `debit`. If it's a Deposit, put it in `credit`.
+        - If a line looks like a transaction, it MUST be in your output.
 
         REQUIRED JSON OUTPUT FORMAT:
         {{
@@ -140,99 +205,22 @@ class AccountingService:
         - Skip any transaction where date or amount is missing or unclear
         - Output JSON ONLY. No explanation text.
         """
-        max_retries = 5
-        base_delay = 10.0
-
-        for attempt in range(max_retries):
-            try:
-                # We use non-streaming call here for simpler parsing
-                response = await self.llm.ainvoke(prompt)
-                data = self.ai_service._extract_json(response.content)
-                transactions = data.get("transactions", [])
-                
-                # Cache the result for future use
-                self.extraction_cache[content_hash] = transactions
-                print(f"[CACHE STORE] Cached {len(transactions)} transactions for batch (hash: {content_hash[:8]}...)")
-                
-                return transactions
-            except Exception as e:
-                import traceback
-                error_msg = str(e).lower()
-                is_rate_limit = False
-                delay = base_delay * (2 ** attempt)
-
-                # Check if it's the exact openai RateLimitError
-                if type(e).__name__ == "RateLimitError" or "429" in error_msg or "rate limit" in error_msg:
-                    is_rate_limit = True
-                    # Try to extract the reset header if present in the error string
-                    import time
-                    try:
-                        if hasattr(e, 'response') and e.response is not None:
-                            reset_val = e.response.headers.get('x-ratelimit-reset')
-                            if reset_val:
-                                reset_timestamp = int(reset_val) / 1000.0  # MS to Sec
-                                current_timestamp = time.time()
-                                delay = max(delay, (reset_timestamp - current_timestamp) + 1.0)
-                    except Exception:
-                        pass # Fallback to standard exponential backoff
-                                
-                if is_rate_limit:
-                    if attempt < max_retries - 1:
-                        print(f"[RATE LIMIT] OpenRouter rate limit hit. Retrying in {delay:0.1f}s (Attempt {attempt+1}/{max_retries})...")
-                        await asyncio.sleep(delay)
-                        continue
-                
-                print(f"[WARNING] Batch extraction failed after {attempt + 1} attempts: {e}")
-                traceback.print_exc()
-                return []
         
-        return []
-
-    async def _classify_transaction(self, transaction: Dict) -> Dict:
-        """
-        Agent 2: Classification Agent (LLM)
-        Determines the precise Account Head and Category for a raw transaction.
-        """
-        narration = transaction.get("narration", "")
-        # If it's already classified well by the extractor, we might skip, but let's enforce rules here.
-        prompt = f"""
-        You are an expert Accountant. Classify the following bank transaction narration.
-        
-        NARRATION: "{narration}"
-        
-        ### ACCOUNT CATEGORY RULE (MANDATORY)
-        Every transaction must be assigned one of the following categories ONLY:
-        - Direct Income
-        - Indirect Income
-        - Direct Expense
-        - Indirect Expense
-        - Current Assets
-        - Current Liabilities
-        - Equity
-
-        ### RULES
-        - Money arriving (CREDIT to Bank) is usually Income or Liability.
-        - Money leaving (DEBIT from Bank) is usually Expense or Asset.
-        - Look for keywords: "UPI PAYMENT", "NEFT CR", "ATM", "SALARY", "RENT", etc.
-        
-        REQUIRED JSON FORMAT:
-        {{
-            "account_head": "Name of the Account (e.g., Office Rent, Sales Income)",
-            "category": "One of the strict categories above"
-        }}
-        """
         try:
-            response = await self.llm.ainvoke(prompt)
+            # Use the robust retry_with_backoff helper
+            response = await retry_with_backoff(self.llm.ainvoke, prompt)
             data = self.ai_service._extract_json(response.content)
-            # Update the non-bank entry in the transaction
-            for entry in transaction.get("entries", []):
-                if entry.get("account", "").upper() != "BANK ACCOUNT":
-                    entry["account"] = data.get("account_head", entry.get("account", "Unclassified"))
-                    entry["category"] = data.get("category", entry.get("category", "Unclassified"))
-            return transaction
+            transactions = data.get("transactions", [])
+            
+            # Cache the result
+            self.extraction_cache[content_hash] = transactions
+            print(f"[CACHE STORE] Cached {len(transactions)} transactions (hash: {content_hash[:8]}...)")
+            
+            return transactions
         except Exception as e:
-            print(f"[WARNING] Classification failed for narration '{narration}': {e}")
-            return transaction
+            print(f"[AGENT-1][ERROR] Fatal extraction error in batch: {e}")
+            return []
+
 
     async def _get_broad_type(self, acc_name: str, cat_name: str, balance: float) -> str:
         """Helper to categorize account nature based on AI category and balance sign."""
@@ -252,8 +240,11 @@ class AccountingService:
         context_chunks: List[str],
         context_metadatas: List[Dict[str, Any]] = None,
         company_id: str = None,
-        previous_context: str = None
-    ) -> AsyncGenerator[Union[str, Dict[str, str]], None]:
+        customer_id: str = None,
+        previous_context: str = None,
+        input_transactions: List[Dict] = None,
+        feedback_history: str = None
+    ) -> AsyncGenerator[Union[str, Dict[str, Any]], None]:
         """
         Multi-Agent Pipeline:
           Agent 1: Extractor (LLM) -> Agent 2: Classifier (LLM)
@@ -262,108 +253,412 @@ class AccountingService:
           -> Tally Agent (audit/verify)
         """
         
-        # --- REFINEMENT MODE (ITERATION) ---
-        if previous_context:
-            yield {"status": "Refining previous report based on feedback..."}
-            print(f"[INFO] Starting report refinement mode. Context length: {len(previous_context)}")
-            
-            refinement_prompt = f"""
-            You are an expert Senior Chartered Accountant. 
-            You previously generated a financial report (Balance Sheet / P&L) for the user.
-            The user has provided feedback or requested a change.
-            
-            YOUR TASK:
-            1. Update the report based on the USER FEEDBACK below.
-            2. **CRITICAL**: You MUST RECALCULATE all sub-totals and grand totals (Total Assets, Total Liabilities, Net Profit) to reflect the changes.
-            3. Maintain the exact same Markdown table structure.
-            4. Do NOT output any bolding (**) or headers (#) inside the tables, keep it plain text as before.
-            
-            ---
-            PREVIOUS REPORT:
-            {previous_context}
-            
-            ---
-            USER FEEDBACK / REQUEST:
-            "{question}"
-            
-            ---
-            UPDATED REPORT:
-            """
-            
+        # --- DYNAMIC RULES FETCHING ---
+        dynamic_business_rules = ""
+        business_type = None
+        if customer_id:
+            print(f"[RULES] Fetching dynamic rules for customer_id: {customer_id}")
             try:
-                # Stream the refined report
-                async for chunk in self.llm.astream(refinement_prompt):
-                    if chunk.content:
-                        yield chunk.content
+                from app.core.supabase import supabase
+                # Get business type
+                cust_res = supabase.table("customers").select("business_type, name").eq("id", customer_id).single().execute()
+                if cust_res.data and cust_res.data.get("business_type"):
+                    business_type = cust_res.data.get("business_type")
+                    customer_name = cust_res.data.get("name")
+                    print(f"[RULES] Found Business Type: {business_type} for Customer: {customer_name}")
+                    dynamic_business_rules += f"CUSTOMER BUSINESS TYPE: {business_type}\n"
+                
+                # Get specific rules (matching either customer_id or business_type)
+                # Note: bypassing company_id to avoid UUID type mismatch error, customer_id is unique anyway
+                query = supabase.table("accounting_rules").select("rule_description")
+                if business_type:
+                    query = query.or_(f"customer_id.eq.{customer_id},business_type.eq.{business_type}")
+                else:
+                    query = query.eq("customer_id", customer_id)
+                rules_res = query.execute()
+                
+                if rules_res.data:
+                    dynamic_business_rules += "SPECIFIC USER-TAUGHT RULES (HIGHEST PRIORITY):\n"
+                    print(f"[RULES] Successfully fetched {len(rules_res.data)} custom accounting rules.")
+                    for r in rules_res.data:
+                        rule_text = r['rule_description']
+                        dynamic_business_rules += f"- {rule_text}\n"
+                        print(f"[RULES] -> Applied Rule: {rule_text}")
+                else:
+                    print(f"[RULES] No custom rules found for this customer.")
             except Exception as e:
-                print(f"[ERROR] Refinement failed: {str(e)}")
-                yield f"\n[ERROR] Refinement failed: {str(e)}"
-            
-            return # Exit after refinement, do not proceed to extraction
+                print(f"[RULES] Failed to fetch dynamic accounting rules: {e}")
+
+        # --- REFINEMENT MODE (ITERATION) ---
+        if previous_context or feedback_history:
+            yield {"status": "Refining report with new user instruction..."}
+            print(f"[REFINEMENT] Injecting user feedback as dynamic rule: {question}")
+            # Add the user's specific refinement instruction as a CRITICAL rule
+            ctx_text = f"\nPREVIOUS CONTEXT:\n{feedback_history}" if feedback_history else ""
+            dynamic_business_rules += f"""
+            ━━━ CRITICAL COMMAND: USER AD-HOC REFINEMENT (ABSOLUTE PRIORITY) ━━━
+            THE USER HAS REQUESTED THE FOLLOWING CHANGE: "{question}"
+            {ctx_text}
+            - YOU MUST FOLLOW THIS RULE ABOVE ALL OTHER ACCOUNTING PRINCIPLES.
+            - IF THIS RULE SPECIFIES AN ACCOUNT OR CATEGORY FOR A CERTAIN RANGE/KEYWORD, APPLY IT STRICTLY.
+            ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            """
+            # We don't return here anymore; we let the pipeline re-run with this new rule.
 
         # =====================================================================
         # --- STANDARD GENERATION MODE  (5-Agent Pipeline) ---
         # =====================================================================
 
-        if not context_chunks:
+        # Local structured tables track instead of singleton variables
+        local_structured_tables = []
+        
+        # --- AGENT 0: INTENT DISCOVERY ---
+        intent_data = await self._discover_intent(question)
+        intent = intent_data.get('intent', 'EXTRACTION')
+        _show_tables = set(intent_data.get('report_types', ['profit_loss', 'balance_sheet']))
+        
+        print(f"[INTENT] User asked for: {_show_tables} | ID Intent: {intent}")
+
+        if not context_chunks and not input_transactions:
             yield "[ERROR] No context data provided."
             return
 
-        # ===================================================================
-        # AGENT 1: EXTRACTOR POOL (LLM — N parallel extractor workers)
-        # ===================================================================
-        # KEY: Keep batch size SMALL so the LLM doesn't hit context window limits.
-        # 50 chunks × 2000 chars = 100k chars per prompt → LLM misses transactions.
-        # 8 chunks × 2000 chars = 16k chars per prompt → LLM processes all rows.
-        BATCH_SIZE = 8
-        all_transactions: List[Dict] = []
-        batches = [context_chunks[i:i + BATCH_SIZE] for i in range(0, len(context_chunks), BATCH_SIZE)]
-        total_batches = len(batches)
+        yield {"status": f"Agent 0 (Guard): input validated. Starting pipeline..."}
 
-        # 3 parallel workers to speed up extraction.
-        N_EXTRACTORS = 20
-        WORKER_DELAY_SEC = 1.0
-        sem = asyncio.Semaphore(N_EXTRACTORS)
-
-        print(f"[AGENT-1] Extractor Pool: {len(context_chunks)} chunks → {total_batches} batches (size={BATCH_SIZE}) → {N_EXTRACTORS} workers")
-
-        async def process_batch(index, batch_data, batch_metas):
-            async with sem:
-                slot = index % N_EXTRACTORS
-                # Stagger requests so all workers don't fire at the exact same millisecond
-                if index >= N_EXTRACTORS:
-                    await asyncio.sleep(WORKER_DELAY_SEC * slot)
-                elif slot > 0:
-                    await asyncio.sleep(slot * 0.5)
-
-                print(f"[AGENT-1][Worker-{slot+1}] → Batch {index + 1}/{total_batches} starting... ({len(batch_data)} chunks)")
-                txns = await self._extract_transactions_from_batch(
-                    batch_data, context_query=question, company_id=company_id
-                )
-                print(f"[AGENT-1][Worker-{slot+1}] ← Batch {index + 1}/{total_batches} done: {len(txns)} transactions extracted")
-
-                if txns and batch_metas:
-                    src_docs = list(set(m.get('document_name') for m in batch_metas if m.get('document_name')))
-                    for t in txns:
-                        t['_source_docs'] = src_docs
-                return txns
-
-        tasks = [
-            process_batch(i, b, context_metadatas[i*BATCH_SIZE:(i+1)*BATCH_SIZE] if context_metadatas else None)
-            for i, b in enumerate(batches)
-        ]
-        completed = 0
-        yield {"status": f"Agent 1 (Extractor ×{N_EXTRACTORS}): processing {total_batches} batches..."}
-        for coro in asyncio.as_completed(tasks):
+        # --- PRE-FETCH ANALYTICS FEEDBACK (Learning Agent) ---
+        feedback_context = ""
+        if company_id:
             try:
-                result = await coro
-                completed += 1
-                yield {"status": f"Agent 1 (Extractor ×{N_EXTRACTORS}): {completed}/{total_batches} batches done..."}
-                if result:
-                    all_transactions.extend(result)
+                from app.services.deps import embedding_service
+                q_emb = embedding_service.generate_embedding(question)
+                relevant_feedback = vector_store.query_feedback(q_emb, company_id)
+                if relevant_feedback:
+                    feedback_context = "\n**LESSONS LEARNED (PAST USER CORRECTIONS):**\n"
+                    for fb in relevant_feedback:
+                        feedback_context += f"- {fb}\n"
+                    print(f"[INFO] Pre-fetched {len(relevant_feedback)} corrections for session.")
             except Exception as e:
-                completed += 1
-                print(f"[AGENT-1][ERROR] Extractor batch {completed} failed: {e}")
+                print(f"[WARNING] Pre-fetch Feedback failed: {e}")
+
+        all_transactions: List[Dict] = []
+        
+        # Determine Routing: If it's a REFINEMENT intent AND we have data, use Agent 7.
+        is_refinement = (intent == "REFINEMENT" or intent == "ANALYSIS") and input_transactions is not None
+        
+        if is_refinement:
+            print(f"[AGENT-7] REFINEMENT MODE: LLM Refiner triggered by intent '{intent}' for {len(input_transactions)} transactions.")
+            # --- AGENT 7: REFINEMENT ORCHESTRATOR ---
+            yield {"status": "Agent 7 (Orchestrator): Analyzing your request and identifying targets..."}
+            
+            # Agent 7 sees a sample of transactions to understand the context
+            sample_txns = input_transactions[:100] # First 100 for context
+            txn_sample_text = ""
+            for i, t in enumerate(sample_txns):
+                amt = float(t.get('debit', 0) or t.get('credit', 0) or 0)
+                txn_sample_text += f"{i}. [{t.get('date')}] {t.get('narration')} (₹{amt:,.2f})\n"
+
+            refine_discovery_prompt = f"""
+            {AGENT_SYSTEM_PROMPTS['refinement']}
+            {REFINEMENT_RULES}
+
+            USER COMMAND: "{question}"
+            BUSINESS TYPE: {business_type or "Unknown"}
+            
+            SAMPLE TRANSACTIONS:
+            {txn_sample_text}
+            
+            TASK: Identify if this is a CLASSIFICATION change (move accounts) or MATHEMATICAL change (edit totals/dates).
+            Provide the 'matching_criteria' (like the old rules) so Python can find ALL targets in the full list of {len(input_transactions)} entries.
+            
+            Output JSON only.
+            """
+            
+            plan = {}
+            try:
+                res = await self.llm.ainvoke(refine_discovery_prompt)
+                plan = self.ai_service._extract_json(res.content)
+                if not isinstance(plan, dict): plan = {}
+                print(f"[AGENT-7] Plan Discovered: Intent={plan.get('intent')} | Reasoning: {plan.get('reasoning')}")
+            except Exception as e:
+                print(f"[AGENT-7][ERROR] Orchestration failed: {e}")
+                plan = {"intent": "GENERAL"}
+
+            intent = plan.get('intent', 'GENERAL')
+            meta = plan.get('rule_metadata', {})
+            matches_for_reclassification = []
+            modified_indices = set()
+            
+            # Use matching criteria from Agent 7 to find targets in Python (for scalability)
+            m = plan.get('matching_criteria', plan.get('match', {})) # Backward compatibility during transition
+            
+            if m:
+                for i, t in enumerate(input_transactions):
+                    amt = float(t.get('debit', 0) or t.get('credit', 0) or 0)
+                    is_dr = float(t.get('debit', 0)) > 0
+                    t_type = "DEBIT" if is_dr else "CREDIT"
+                    
+                    # Match conditions
+                    if m.get('type') and m.get('type') != t_type: continue
+                    if m.get('min_amount') is not None and amt < m.get('min_amount'): continue
+                    if m.get('max_amount') is not None and amt > m.get('max_amount'): continue
+                    
+                    narr_match = m.get('narration_contains', '').lower()
+                    if narr_match and narr_match not in str(t.get('narration', '')).lower(): continue
+                        
+                    matches_for_reclassification.append(t)
+                    modified_indices.add(i)
+
+            modified_count = len(matches_for_reclassification)
+            
+            # --- EXECUTION BRANCHES ---
+            if intent == "CLASSIFICATION" and modified_count > 0:
+                yield {"status": f"Agent 7: Identified {modified_count} targets. Agent 2 (Expert): Re-classifying..."}
+                
+                # Agent 2 gets the USER'S ORIGINAL COMMAND as the law
+                refine_as_rule = f"\n━━━ USER REFINEMENT COMMAND (MANDATORY) ━━━\n{question}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                
+                re_classify_batches = [
+                    matches_for_reclassification[i:i + 50] 
+                    for i in range(0, len(matches_for_reclassification), 50)
+                ]
+                
+                total_recl = 0
+                for b_idx, batch in enumerate(re_classify_batches):
+                    prompt = f"""
+                    {AGENT_SYSTEM_PROMPTS['classifier']}
+                    {CLASSIFIER_RULES}
+                    {refine_as_rule}
+                    
+                    TRANSACTIONS TO RE-CLASSIFY:
+                    """
+                    for j, t in enumerate(batch):
+                        dr = float(t.get('debit', 0) or 0)
+                        cr = float(t.get('credit', 0) or 0)
+                        direction = f"DEBIT ₹{dr:,.2f}" if dr > 0 else f"CREDIT ₹{cr:,.2f}"
+                        prompt += f"{j+1}. [{direction}] {t.get('narration', 'Unknown')}\n"
+                    
+                    try:
+                        res = await retry_with_backoff(self.llm.ainvoke, prompt)
+                        raw_recl = self.ai_service._extract_json(res.content)
+                        if isinstance(raw_recl, dict) and "transactions" in raw_recl:
+                            updated_results = raw_recl["transactions"]
+                        elif isinstance(raw_recl, list):
+                            updated_results = raw_recl
+                        else:
+                            updated_results = []
+                        
+                        if isinstance(updated_results, list) and len(updated_results) == len(batch):
+                            for k, updated_cls in enumerate(updated_results):
+                                orig_t = batch[k]
+                                dr_acc = updated_cls.get('debit_account', 'Unclassified')
+                                cr_acc = updated_cls.get('credit_account', 'Unclassified')
+                                cat = updated_cls.get('category', 'Indirect Expense')
+                                
+                                amt = float(orig_t.get('debit', 0) or orig_t.get('credit', 0) or 0)
+                                orig_t['entries'] = [
+                                    {"account": dr_acc, "type": "DEBIT", "amount": amt, "category": cat if "Bank" not in dr_acc else "Current Assets"},
+                                    {"account": cr_acc, "type": "CREDIT", "amount": amt, "category": cat if "Bank" not in cr_acc else "Current Assets"}
+                                ]
+                                total_recl += 1
+                    except Exception as e:
+                        print(f"[RE-CLASSIFY][ERROR] Batch {b_idx} failed: {e}")
+                
+            elif intent == "MATHEMATICAL":
+                yield {"status": "Agent 7: Identified Mathematical updates. Applying changes..."}
+                updates = plan.get('math_updates', [])
+                for u in updates:
+                    idx = u.get('index')
+                    if idx is not None and 0 <= idx < len(input_transactions):
+                        t = input_transactions[idx]
+                        field = u.get('field')
+                        if field in ['debit', 'credit', 'amount']:
+                            val = float(u.get('new_value', 0))
+                            if field == 'amount':
+                                # Determine which column to update based on existing values
+                                if float(t.get('debit', 0)) > 0: t['debit'] = val
+                                else: t['credit'] = val
+                            else:
+                                t[field] = val
+                            print(f"[MATH] Updated txn {idx} {field} to {val}")
+                        elif field == 'date':
+                            t['date'] = u.get('new_value')
+
+            # --- PERSIST VERBATIM RULES (LEARNING) ---
+            if modified_count > 0 or intent == "MATHEMATICAL":
+                try:
+                    from app.core.supabase import supabase
+                    scope = meta.get('scope', 'CUSTOMER')
+                    # Use verbatim command if available, else user's instruction
+                    rule_desc = meta.get('rule_description', question)
+                    verbatim = meta.get('verbatim_command', question)
+                    
+                    save_data = {
+                        "rule_description": f"{rule_desc} (User Command: {verbatim})",
+                        "business_type": business_type if scope == "INDUSTRY" else None,
+                        "customer_id": customer_id if scope == "CUSTOMER" else None,
+                        "is_active": True
+                    }
+                    
+                    # Duplicate check
+                    check = supabase.table("accounting_rules").select("id").eq("rule_description", save_data["rule_description"])
+                    if scope == "INDUSTRY": check = check.eq("business_type", business_type).is_("customer_id", "null")
+                    else: check = check.eq("customer_id", customer_id)
+                    
+                    if not check.execute().data:
+                        supabase.table("accounting_rules").insert(save_data).execute()
+                        print(f"[LEARNING] Saved {scope} rule: {save_data['rule_description']}")
+                except Exception as e:
+                    print(f"[LEARNING][ERROR] Failed: {e}")
+
+            all_transactions = input_transactions # Preserve changes
+
+            yield {"status": f"Refinement complete. {modified_count} transactions targetted and re-classified."}
+            print(f"[AGENT-7] Pipeline: Filtered {modified_count} txns for Agent 2.")
+
+            # Reconciliation logging
+            expected_deposits = len([t for t in all_transactions if float(t.get('credit', 0) or 0) > 0])
+            expected_withdrawals = len([t for t in all_transactions if float(t.get('debit', 0) or 0) > 0])
+        else:
+            # --- TRANSACTION SUMMARY EXTRACTION (Parallelized) ---
+            summary_task = None
+            if not is_refinement:
+                summary_context = "\n".join(context_chunks[-3:])
+                summary_prompt = f"""
+                Read the following bank statement footer and extract the TRANSACTION SUMMARY table.
+                Look for "Transaction Summary", "No. of Transactions", "Deposits", and "Withdrawals".
+                
+                TEXT:
+                {summary_context}
+                
+                JSON OUTPUT:
+                {{
+                    "deposits_count": 0,
+                    "withdrawals_count": 0
+                }}
+                """
+                summary_task = asyncio.create_task(self.llm.ainvoke(summary_prompt))
+
+            BATCH_SIZE = 10
+            batches = [context_chunks[i:i + BATCH_SIZE] for i in range(0, len(context_chunks), BATCH_SIZE)]
+            total_batches = len(batches)
+
+            # Parallel workers for speed - Auto-scaled based on model tier
+            N_EXTRACTORS = self.n_extractors
+            WORKER_DELAY_SEC = self.worker_delay
+            sem = asyncio.Semaphore(N_EXTRACTORS)
+
+            print(f"[AGENT-1] Extractor Pool: {len(context_chunks)} chunks → {total_batches} batches (size={BATCH_SIZE}) → {N_EXTRACTORS} workers")
+
+            async def process_batch(index, batch_data, batch_metas):
+                async with sem:
+                    slot = index % N_EXTRACTORS
+                    # Stagger to avoid huge initial burst
+                    if index < N_EXTRACTORS:
+                        await asyncio.sleep(slot * WORKER_DELAY_SEC)
+
+                    print(f"[AGENT-1][Worker-{slot+1}] → Batch {index + 1}/{total_batches} starting... ({len(batch_data)} chunks)")
+                    txns = await self._extract_transactions_from_batch(
+                        batch_data, 
+                        context_query=question, 
+                        company_id=company_id,
+                        feedback_context=feedback_context
+                    )
+                    print(f"[AGENT-1][Worker-{slot+1}] ← Batch {index + 1}/{total_batches} done: {len(txns)} transactions extracted")
+
+                    if txns and batch_metas:
+                        src_docs = list(set(m.get('document_name') for m in batch_metas if m.get('document_name')))
+                        for t in txns:
+                            t['_source_docs'] = src_docs
+                    return index, txns
+
+            # Store batch results for potential reconciliation
+            batch_results: Dict[int, List[Dict]] = {}
+            tasks = [
+                process_batch(i, b, context_metadatas[i*BATCH_SIZE:(i+1)*BATCH_SIZE] if context_metadatas else None)
+                for i, b in enumerate(batches)
+            ]
+            completed = 0
+            yield {"status": f"Agent 1 (Extractor ×{N_EXTRACTORS}): processing {total_batches} batches..."}
+            for coro in asyncio.as_completed(tasks):
+                try:
+                    b_idx, result = await coro
+                    batch_results[b_idx] = result or []
+                    completed += 1
+                    if completed % 5 == 0 or completed == total_batches:
+                        yield {"status": f"Agent 1 (Extractor ×{N_EXTRACTORS}): {completed}/{total_batches} batches done..."}
+                    if result:
+                        all_transactions.extend(result)
+                except Exception as e:
+                    completed += 1
+                    print(f"[AGENT-1][ERROR] Extractor batch failed: {e}")
+
+            # Now finalize the summary task if it was running in background
+            expected_deposits = None
+            expected_withdrawals = None
+            if summary_task:
+                try:
+                    summary_res = await summary_task
+                    summary_data = self.ai_service._extract_json(summary_res.content)
+                    if summary_data:
+                        expected_deposits = summary_data.get("deposits_count")
+                        expected_withdrawals = summary_data.get("withdrawals_count")
+                        print(f"[RECONCILE] Bank Summary Found -> D:{expected_deposits}, W:{expected_withdrawals}")
+                except Exception as e:
+                    print(f"[RECONCILE] Summary background task failed: {e}")
+
+            # --- RECONCILIATION LOOP (NEW) ---
+            # If we missed transactions compared to the bank summary, retry empty batches meticulously
+            total_extracted = len(all_transactions)
+            total_expected = (expected_deposits or 0) + (expected_withdrawals or 0)
+            
+            if total_expected > total_extracted + 5: # 5 txn buffer for footer/header noise
+                missing_count = total_expected - total_extracted
+                print(f"[RECONCILE] Detected missing data: Found {total_extracted}, Expected {total_expected}. Retrying empty batches...")
+                yield {"status": f"⚠️ Missing {missing_count} transactions. Agent 1 (Reconciliation): Retrying empty areas..."}
+                
+                # Identify batches that returned 0
+                failed_indices = [idx for idx, res in batch_results.items() if not res]
+                if failed_indices:
+                    print(f"[RECONCILE] Retrying {len(failed_indices)} batches. Flattening chunks for parallel extraction...")
+                    
+                    # Flatten into a single chunk pool for maximum parallelism
+                    missing_tasks = []
+                    for f_idx in failed_indices:
+                        f_batch = batches[f_idx]
+                        f_metas = context_metadatas[f_idx*BATCH_SIZE:(f_idx+1)*BATCH_SIZE] if context_metadatas else [None] * len(f_batch)
+                        for c_idx, chunk in enumerate(f_batch):
+                            missing_tasks.append((chunk, f_metas[c_idx]))
+
+                    async def retry_chunk(c_idx_global, chunk_data, meta):
+                        async with sem: # Use the same extractor semaphore
+                            slot = c_idx_global % N_EXTRACTORS
+                            # Add stagger even for reconciliation to avoid bursts
+                            await asyncio.sleep(slot * WORKER_DELAY_SEC)
+                            
+                            r_txns = await self._extract_transactions_from_batch(
+                                chunk_data, 
+                                context_query=question, 
+                                company_id=company_id,
+                                feedback_context=feedback_context
+                            )
+                            if r_txns and meta:
+                                src_doc = meta.get('document_name')
+                                for t in r_txns:
+                                    t['_source_docs'] = [src_doc] if src_doc else []
+                            return r_txns
+
+                    reconcile_results = await asyncio.gather(*[retry_chunk(i, c, m) for i, (c, m) in enumerate(missing_tasks)])
+                    
+                    new_txns_count = 0
+                    for r_list in reconcile_results:
+                        if r_list:
+                            all_transactions.extend(r_list)
+                            new_txns_count += len(r_list)
+                    
+                    print(f"[RECONCILE] Done. Recovered {new_txns_count} missing transactions.")
+                    yield {"status": f"Reconciliation successful: recovered {new_txns_count} transactions."}
+                else:
+                    print(f"[RECONCILE] No empty batches to retry, but count still mismatches.")
 
         if not all_transactions:
             yield "No transactions could be identified in the provided documents. Please check the file has clear financial data.\n"
@@ -413,20 +708,43 @@ class AccountingService:
         all_transactions = unique_txns
         print(f"[DEDUP] Raw extracted: {len(seen_fps)} fingerprints → {len(all_transactions)} unique transactions kept")
 
+        # --- RECONCILIATION LOGGING ---
+        extracted_deposits = len([t for t in all_transactions if float(t.get('credit', 0) or 0) > 0])
+        extracted_withdrawals = len([t for t in all_transactions if float(t.get('debit', 0) or 0) > 0])
+        
+        print(f"[RECONCILE] Extraction Results: Deposits={extracted_deposits}, Withdrawals={extracted_withdrawals}")
+        if expected_deposits is not None or expected_withdrawals is not None:
+            if expected_deposits == extracted_deposits and expected_withdrawals == extracted_withdrawals:
+                print(f"[RECONCILE] SUCCESS: Extracted counts match Bank Summary!")
+            else:
+                warning = f"[RECONCILE] WARNING: Counts MISMATCH! Bank Summary: D={expected_deposits}, W={expected_withdrawals} | Extracted: D={extracted_deposits}, W={extracted_withdrawals}"
+                print(warning)
+                # yield error/warning message to UI optionally if it's too bad
+                if abs(len(all_transactions) - ((expected_deposits or 0) + (expected_withdrawals or 0))) > 10:
+                    yield {"status": f"⚠️ Extraction mismatch: found {len(all_transactions)} transactions, but summary expected {(expected_deposits or 0) + (expected_withdrawals or 0)}."}
+
+        # Signal the API to store these transactions for future refinement
+        yield {"all_transactions": all_transactions}
+
         # ===================================================================
         # AGENT 2: BATCH CLASSIFIER POOL (LLM — N parallel classifier workers)
         # ===================================================================
-        CLASSIFY_BATCH_SIZE = 20     # transactions per LLM call
-        N_CLASSIFIERS = 20           # parallel classifier workers
-        CLASSIFIER_DELAY_SEC = 1.0   # stagger delay between worker slots
+        CLASSIFY_BATCH_SIZE = 50     # transactions per LLM call
+        N_CLASSIFIERS = self.n_classifiers
+        CLASSIFIER_DELAY_SEC = self.worker_delay
 
-        classify_batches = [
-            all_transactions[i:i + CLASSIFY_BATCH_SIZE]
-            for i in range(0, len(all_transactions), CLASSIFY_BATCH_SIZE)
-        ]
-        total_classify_batches = len(classify_batches)
-        print(f"[AGENT-2] Classifier Pool: {len(all_transactions)} txns → {total_classify_batches} batches (size={CLASSIFY_BATCH_SIZE}) → {N_CLASSIFIERS} workers")
-        yield {"status": f"Agent 2 (Classifier ×{N_CLASSIFIERS}): classifying {len(all_transactions)} transactions..."}
+        if is_refinement:
+            print("[AGENT-2] SKIP CLASSIFIER: Refinement was handled by Agent 7 logic.")
+            total_classify_batches = 0
+            classify_batches = []
+        else:
+            classify_batches = [
+                all_transactions[i:i + CLASSIFY_BATCH_SIZE]
+                for i in range(0, len(all_transactions), CLASSIFY_BATCH_SIZE)
+            ]
+            total_classify_batches = len(classify_batches)
+            print(f"[AGENT-2] Classifier Pool: {len(all_transactions)} txns → {total_classify_batches} batches (size={CLASSIFY_BATCH_SIZE}) → {N_CLASSIFIERS} workers")
+            yield {"status": f"Agent 2 (Classifier ×{N_CLASSIFIERS}): classifying {len(all_transactions)} transactions..."}
 
         cls_sem = asyncio.Semaphore(N_CLASSIFIERS)
         classified_results: Dict[int, List[Dict]] = {}  # bidx → list of classified transactions
@@ -437,9 +755,11 @@ class AccountingService:
                 # Small stagger on first round to avoid burst
                 if bidx >= N_CLASSIFIERS:
                     await asyncio.sleep(CLASSIFIER_DELAY_SEC * (slot % 3))
-                elif slot > 0:
-                    await asyncio.sleep(slot * 0.3)
-
+                if dynamic_business_rules:
+                    print(f"[AGENT-2][Worker-{slot+1}] Injecting {len(dynamic_business_rules)} chars of custom business rules into prompt.")
+                
+                known_accs = ", ".join(list(self.shared_accounts)[:50]) if self.shared_accounts else "None yet"
+                
                 narrations_list = ""
                 for j, t in enumerate(c_batch):
                     dr = float(t.get('debit', 0) or 0)
@@ -451,6 +771,11 @@ class AccountingService:
                 {AGENT_SYSTEM_PROMPTS['classifier']}
 
                 {CLASSIFIER_RULES}
+                
+                {dynamic_business_rules}
+
+                PREVIOUSLY IDENTIFIED ACCOUNTS (Consistency):
+                {known_accs}
 
                 TRANSACTIONS TO CLASSIFY:
                 {narrations_list}
@@ -466,13 +791,15 @@ class AccountingService:
                 }}]
 
                 Bank Account Logic (NON-NEGOTIABLE):
-                - If transaction is CREDIT (money IN) \u2192 debit_account = "Bank Account"
-                - If transaction is DEBIT  (money OUT) \u2192 credit_account = "Bank Account"
+                - If transaction is CREDIT (money IN) → debit_account = "Bank Account"
+                - If transaction is DEBIT  (money OUT) → credit_account = "Bank Account"
 
                 Output JSON array ONLY. No explanation.
                 """
                 batch_classified = []
                 try:
+                    if dynamic_business_rules:
+                        print(f"[AGENT-2][Worker-{slot+1}] Batch {bidx+1}/{total_classify_batches}: Injecting dynamic business rules.")
                     response = await self.llm.ainvoke(classify_prompt)
                     results = self.ai_service._extract_json(response.content)
                     if isinstance(results, dict):
@@ -485,18 +812,33 @@ class AccountingService:
                         dr = float(t.get('debit', 0) or 0)
                         cr = float(t.get('credit', 0) or 0)
                         amt = dr if dr > 0 else cr
+                        
                         if j < len(results):
                             res = results[j]
                             debit_acc  = res.get('debit_account', 'Bank Account').strip().title()
                             credit_acc = res.get('credit_account', 'Bank Account').strip().title()
                             category   = res.get('category', 'Unclassified')
-                            t['entries'] = [
-                                {"account": debit_acc,  "type": "DEBIT",  "amount": amt, "category": category},
-                                {"account": credit_acc, "type": "CREDIT", "amount": amt, "category": "Current Assets"},
-                            ]
+                            
+                            # Apply double-entry logic with correct category mapping
+                            # If CREDIT (money IN) -> Bank is DEBITED, Income/Liability is CREDITED
+                            # If DEBIT (money OUT) -> Expense/Asset is DEBITED, Bank is CREDITED
+                            if cr > 0: # Money IN (Credit in Statement, Debit in Bank A/c)
+                                t['entries'] = [
+                                    {"account": "Bank Account", "type": "DEBIT",  "amount": amt, "category": "Current Assets"},
+                                    {"account": credit_acc,      "type": "CREDIT", "amount": amt, "category": category},
+                                ]
+                            else: # Money OUT (Debit in Statement, Credit in Bank A/c)
+                                t['entries'] = [
+                                    {"account": debit_acc,  "type": "DEBIT",  "amount": amt, "category": category},
+                                    {"account": "Bank Account", "type": "CREDIT", "amount": amt, "category": "Current Assets"},
+                                ]
                             t['confidence'] = res.get('confidence', 1.0)
                         else:
-                            # Fallback for missing LLM result
+                            # Fallback for missing LLM result: Preserve if exists!
+                            if t.get('entries'):
+                                batch_classified.append(t)
+                                continue
+                            
                             if dr > 0:
                                 t['entries'] = [
                                     {"account": "Suspense Account", "type": "DEBIT",  "amount": dr, "category": "Current Assets"},
@@ -512,6 +854,11 @@ class AccountingService:
                 except Exception as e:
                     print(f"[AGENT-2][Worker-{slot+1}][ERROR] Batch {bidx+1} failed: {e}")
                     for t in c_batch:
+                        # CRITICAL: Preserve previous classification if it exists!
+                        if t.get('entries'):
+                            batch_classified.append(t)
+                            continue
+                            
                         dr = float(t.get('debit', 0) or 0)
                         cr = float(t.get('credit', 0) or 0)
                         amt = dr if dr > 0 else cr
@@ -558,11 +905,11 @@ class AccountingService:
         yield {"status": "Agent 3 (Journal): Writing double-entry journal & populating Ledger Store..."}
         journal_rows_data: List[List] = []
         tx_count = 0
-        MAX_JOURNAL = 50
 
         yield "\n\n1. Professional Journal Book\n\n| Date | Particulars (Account) | L.F. | Debit (\u20b9) | Credit (\u20b9) | Narration |\n|---|---|---|---|---|---|\n"
 
-        for t in classified:
+        tx_source = all_transactions if is_refinement else classified
+        for t in tx_source:
             date_val = str(t.get('date', '')).strip()
             narration = str(t.get('narration', '')).strip()
             entries = t.get('entries', [])
@@ -575,13 +922,14 @@ class AccountingService:
 
             tx_count += 1
 
-            # Update Ledger Store
+            # Update Ledger Store and Shared Accounts
             for entry in entries:
                 acc = str(entry.get('account', 'Unclassified')).strip().title()
                 cat = str(entry.get('category', 'Unclassified')).strip()
                 amt = float(entry.get('amount', 0))
                 etype = str(entry.get('type')).upper()
                 ledger_balances.setdefault(acc, 0.0)
+                self.shared_accounts.add(acc) # Track for next classification batch
                 if cat and cat != 'Unclassified':
                     account_categories[acc] = cat
                 if etype == 'DEBIT':
@@ -589,59 +937,45 @@ class AccountingService:
                 else:
                     ledger_balances[acc] -= amt
 
-            # Yield journal rows
-            if tx_count <= MAX_JOURNAL:
-                first = True
-                for entry in entries:
-                    acc = str(entry.get('account', 'Unclassified')).strip().title()
-                    etype = str(entry.get('type')).upper()
-                    amt = float(entry.get('amount', 0))
-                    d_acc = f"{acc} Dr." if etype == 'DEBIT' else f"    To {acc}"
-                    d_dr = f"{amt:,.2f}" if etype == 'DEBIT' else ""
-                    d_cr = f"{amt:,.2f}" if etype == 'CREDIT' else ""
-                    d_date = date_val if first else ""
-                    d_narr = narration if first else ""
-                    yield f"| {d_date} | {d_acc} | | {d_dr} | {d_cr} | {d_narr} |\n"
-                    journal_rows_data.append([d_date, d_acc, "", d_dr, d_cr, d_narr])
-                    first = False
-            elif tx_count == MAX_JOURNAL + 1:
-                yield "| ... | ... | | ... | ... | (remaining processed internally) |\n"
+            # Yield journal rows unconditionally
+            first = True
+            for entry in entries:
+                acc = str(entry.get('account', 'Unclassified')).strip().title()
+                etype = str(entry.get('type')).upper()
+                amt = float(entry.get('amount', 0))
+                d_acc = f"{acc} Dr." if etype == 'DEBIT' else f"    To {acc}"
+                d_dr = f"{amt:,.2f}" if etype == 'DEBIT' else ""
+                d_cr = f"{amt:,.2f}" if etype == 'CREDIT' else ""
+                d_date = date_val if first else ""
+                d_narr = narration if first else ""
+                # journal row collected — not streamed as token
+                journal_rows_data.append([d_date, d_acc, "", d_dr, d_cr, d_narr])
+                first = False
 
-        self.structured_tables.append({
-            "type": "journal",
-            "title": "Professional Journal Book",
-            "headers": ["Date", "Particulars (Account)", "L.F.", "Debit (\u20b9)", "Credit (\u20b9)", "Narration"],
-            "rows": journal_rows_data
-        })
+        # Journal computed for internal ledger use — NOT added to structured_tables (not shown to user)
         print(f"[AGENT-3] Journal done: {tx_count} valid transactions written.")
         print(f"[AGENT-3] Ledger Store populated: {len(ledger_balances)} accounts.")
         for acc, bal in ledger_balances.items():
             cat = account_categories.get(acc, 'Unclassified')
             print(f"[LEDGER]   {acc:<40} | {bal:>12,.2f} | {cat}")
 
-        # ===================================================================
-        # AGENT 4: P&L AGENT (Pure Math — no LLM) — uses PNL_CONFIG rules
-        # ===================================================================
         print(f"[AGENT-4] {AGENT_SYSTEM_PROMPTS['pnl']}")
         print(f"[AGENT-4] Include: {PNL_CONFIG['include_types']} | Exclude: {PNL_CONFIG['exclude_types']}")
         yield {"status": "Agent 4 (P&L Agent): Calculating Profit & Loss from Ledger..."}
-        yield "\n\n2. Profit & Loss Statement\n\n"
 
         pnl_dr_rows: List[tuple] = []
         pnl_cr_rows: List[tuple] = []
         pnl_dr = 0.0
         pnl_cr = 0.0
 
-        # Determine which accounts to exclude from P&L (assets, liabilities, equity, etc.)
-        _pnl_exclude_upper = [x.upper() for x in PNL_CONFIG['exclude_types']]
-
         for acc, bal in ledger_balances.items():
             cat = account_categories.get(acc, "").upper()
             if abs(bal) < 0.01:
                 continue
-            # Skip if account name or category matches any PNL exclude keyword
-            acc_upper = acc.upper()
-            if any(excl in cat or excl in acc_upper for excl in _pnl_exclude_upper):
+
+            # Filter based on PNL_CONFIG rules
+            should_exclude = any(excl.upper() in cat or excl.upper() in acc.upper() for excl in PNL_CONFIG['exclude_types'])
+            if should_exclude:
                 print(f"[AGENT-4] Excluding from P&L: {acc} (cat={cat})")
                 continue
             if "INCOME" in cat:
@@ -660,20 +994,17 @@ class AccountingService:
             pnl_cr += abs(net_profit)
 
         if not pnl_dr_rows and not pnl_cr_rows:
-            yield "_No income or expense transactions were classified. Check that the document contains transaction data._\n"
+            pass  # No P&L data — card will simply not appear
         else:
-            yield "| Particulars (Dr) | Amount (\u20b9) | Particulars (Cr) | Amount (\u20b9) |\n|---|---|---|---|\n"
             pnl_table_rows: List[List] = []
             for i in range(max(len(pnl_dr_rows), len(pnl_cr_rows))):
                 d_part = pnl_dr_rows[i][0] if i < len(pnl_dr_rows) else ""
                 d_amt = f"{pnl_dr_rows[i][1]:,.2f}" if i < len(pnl_dr_rows) else ""
                 c_part = pnl_cr_rows[i][0] if i < len(pnl_cr_rows) else ""
                 c_amt = f"{pnl_cr_rows[i][1]:,.2f}" if i < len(pnl_cr_rows) else ""
-                yield f"| {d_part} | {d_amt} | {c_part} | {c_amt} |\n"
                 pnl_table_rows.append([d_part, d_amt, c_part, c_amt])
-            yield f"| **TOTAL** | **{pnl_dr:,.2f}** | **TOTAL** | **{pnl_cr:,.2f}** |\n"
             pnl_table_rows.append(["TOTAL", f"{pnl_dr:,.2f}", "TOTAL", f"{pnl_cr:,.2f}"])
-            self.structured_tables.append({
+            local_structured_tables.append({
                 "type": "profit_loss",
                 "title": "Profit & Loss Statement",
                 "headers": ["Particulars (Dr)", "Amount (\u20b9)", "Particulars (Cr)", "Amount (\u20b9)"],
@@ -687,7 +1018,6 @@ class AccountingService:
         # ===================================================================
         print(f"[AGENT-5] {AGENT_SYSTEM_PROMPTS['balance_sheet']}")
         yield {"status": "Agent 5 (Balance Sheet Agent): Building Balance Sheet from Ledger..."}
-        yield "\n\n3. Balance Sheet\n\n"
 
         bs_assets: List[tuple] = []
         bs_liab: List[tuple] = []
@@ -716,24 +1046,30 @@ class AccountingService:
             bs_liab.append(("Less: Net Loss", -abs(net_profit)))
             liab_total -= abs(net_profit)
 
-        yield "| Liabilities & Equity | Amount (\u20b9) | Assets | Amount (\u20b9) |\n|---|---|---|---|\n"
         bs_table_rows: List[List] = []
         for i in range(max(len(bs_liab), len(bs_assets), 1)):
             l_part = bs_liab[i][0] if i < len(bs_liab) else ""
             l_amt = f"{bs_liab[i][1]:,.2f}" if i < len(bs_liab) else ""
             a_part = bs_assets[i][0] if i < len(bs_assets) else ""
             a_amt = f"{bs_assets[i][1]:,.2f}" if i < len(bs_assets) else ""
-            yield f"| {l_part} | {l_amt} | {a_part} | {a_amt} |\n"
             bs_table_rows.append([l_part, l_amt, a_part, a_amt])
-        yield f"| **TOTAL** | **{liab_total:,.2f}** | **TOTAL** | **{asset_total:,.2f}** |\n"
         bs_table_rows.append(["TOTAL", f"{liab_total:,.2f}", "TOTAL", f"{asset_total:,.2f}"])
-        self.structured_tables.append({
+        local_structured_tables.append({
             "type": "balance_sheet",
             "title": "Balance Sheet",
             "headers": ["Liabilities & Equity", "Amount (\u20b9)", "Assets", "Amount (\u20b9)"],
             "rows": bs_table_rows
         })
         print(f"[AGENT-5] Balance Sheet done → Assets: ₹{asset_total:,.2f} | Liabilities+Equity: ₹{liab_total:,.2f}")
+
+        # Filter local_structured_tables to only expose what the user asked for
+        requested_tables = [t for t in local_structured_tables if t.get('type') in _show_tables]
+        print(f"[INTENT] Exposing {len(requested_tables)} table(s): {[t.get('type') for t in requested_tables]}")
+
+        # Yield structured tables directly over the stream.
+        # 'structured_tables' is what gets shown to the user this turn.
+        # 'all_tables' is cached in the DB for instant retrieval on follow-up questions.
+        yield {"structured_tables": requested_tables, "all_tables": local_structured_tables}
 
         # ===================================================================
         # AGENT 6 — TALLY / AUDITOR AGENT  (uses TALLY_CONFIG rules)
@@ -746,7 +1082,7 @@ class AccountingService:
         tb_total_dr = sum(v for v in ledger_balances.values() if v > 0)
         tb_total_cr = sum(abs(v) for v in ledger_balances.values() if v < 0)
         tb_diff = abs(tb_total_dr - tb_total_cr)
-        if TALLY_CONFIG['trial_balance_check']:
+        if TALLY_CONFIG.get('trial_balance_check'):
             if tb_diff > 0.01:
                 print(f"[AGENT-6] Trial Balance MISMATCH: Dr=\u20b9{tb_total_dr:,.2f} Cr=\u20b9{tb_total_cr:,.2f} Diff=\u20b9{tb_diff:,.2f}")
                 yield f"\n> \u26a0\ufe0f **Trial Balance FAILED**: Dr \u20b9{tb_total_dr:,.2f} \u2260 Cr \u20b9{tb_total_cr:,.2f} (diff=\u20b9{tb_diff:,.2f})\n"
@@ -756,9 +1092,9 @@ class AccountingService:
 
         # --- CHECK 2: BALANCE SHEET EQUATION ---
         diff = abs(asset_total - liab_total)
-        if TALLY_CONFIG['balance_sheet_check']:
+        if TALLY_CONFIG.get('balance_sheet_check'):
             if diff > 0.01:
-                if TALLY_CONFIG['auto_capital_adjustment']:
+                if TALLY_CONFIG.get('auto_capital_adjustment'):
                     # Add Capital Adjustment entry under Equity to absorb gap
                     cap_adj = asset_total - liab_total
                     bs_liab.append(("Capital Adjustment", cap_adj))
@@ -819,7 +1155,7 @@ class AccountingService:
             elif any("asset" in h or "liabilit" in h for h in headers_lower):
                 table_type = "balance_sheet"
             elif any("particulars" in h and "amount" in h for h in headers_lower):
-                table_type = "p_and_l"
+                table_type = "profit_loss"
                 
             tables.append({
                 "type": table_type,
@@ -827,22 +1163,4 @@ class AccountingService:
                 "rows": body
             })
         return tables
-
-    async def get_all_structured_tables(self, full_text: str) -> List[Dict[str, Any]]:
-        """Combine pre-generated tables and tables parsed from LLM response."""
-        parsed_tables = await self._parse_markdown_tables(full_text)
-        
-        # Merge logic: avoid duplicate tables if they were already captured
-        # We use types as hints
-        all_tables = self.structured_tables.copy()
-        
-        captured_types = {t["type"] for t in all_tables}
-        for pt in parsed_tables:
-            # If it's a journal or trial_balance and we already have it from programmatic extraction, skip
-            if pt["type"] in captured_types and pt["type"] in ["journal", "trial_balance"]:
-                continue
-            all_tables.append(pt)
-                
-        return all_tables
-
 

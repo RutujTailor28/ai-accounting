@@ -10,6 +10,7 @@ class FeedbackBase(CamelModel):
     user_correction: str
     explanation: Optional[str] = None
     company_id: str
+    customer_id: Optional[str] = None
     source_document: Optional[str] = None
     transaction_id: Optional[str] = None
 

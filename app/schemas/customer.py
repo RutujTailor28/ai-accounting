@@ -10,11 +10,13 @@ class CustomerBase(CamelModel):
     company_id: str
     aadhar_number: Optional[str] = None
     pan_number: Optional[str] = None
+    business_type: Optional[str] = None
 
 class CustomerCreate(CamelModel):
     name: str
     aadhar_number: Optional[str] = None
     pan_number: Optional[str] = None
+    business_type: Optional[str] = None
 
 class CustomerResponse(CustomerBase):
     id: UUID

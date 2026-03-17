@@ -18,6 +18,7 @@ async def create_customer(
     name: str = Form(...),
     aadhar_number: str = Form(...),
     pan_number: str = Form(...),
+    business_type: str = Form(None),
     aadhar: UploadFile = File(...),
     pan: UploadFile = File(...),
     user=Depends(get_current_user)
@@ -70,7 +71,8 @@ async def create_customer(
             "aadhar_number": aadhar_number,
             "pan_number": pan_number,
             "company_id": company_id,
-            "created_by": user.id
+            "created_by": user.id,
+            "business_type": business_type
         }
         # Using supabase_admin to bypass RLS for writes
         cust_res = supabase_admin.table("customers").insert(cust_data).execute()
