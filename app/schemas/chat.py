@@ -1,4 +1,4 @@
-from typing import Optional, List, Any
+from typing import Optional, List, Any, Dict
 from datetime import datetime
 from uuid import UUID
 from pydantic import Field
@@ -17,6 +17,7 @@ class ChatQueryRequest(CamelModel):
     start_date: Optional[str] = Field(None, description="Start date for filtering documents (ISO format)")
     end_date: Optional[str] = Field(None, description="End date for filtering documents (ISO format)")
     tags: Optional[List[str]] = Field(None, description="Filter by tags")
+    transactions: Optional[List[Dict[str, Any]]] = Field(None, description="Optional raw transactions for refinement/analysis")
 
 
 class ChatMessageResponse(CamelModel):

@@ -20,6 +20,8 @@ class LoginResponse(CamelModel):
     email: str
     company_id: str
     company_name: Optional[str] = None
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
     role: str = "user"
     permissions: List[str] = []
 

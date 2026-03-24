@@ -32,6 +32,7 @@ async def accounting_query(request_body: ChatQueryRequest, request: Request, use
         valid_keywords = [
             "p&l", "p & l", "profit", "loss", "statement", "ledger", "journal", "audit", 
             "tally", "sheet", "categorize", "category", "account", "expense", "amount", 
+            "income", "add", "remove", "delete", "cash", "bank", "entry", "entries",
             "gst", "interest", "analyze", "analysis", "find", "show", "get", "instead", 
             "change", "move", "shift", "put", "update", "edit", "modify", "balance", 
             "total", "summary", "report", "extract", "transaction", "analyze", "list"
@@ -56,20 +57,36 @@ async def accounting_query(request_body: ChatQueryRequest, request: Request, use
         cached_all_tables = []
         cached_transactions = []
         aggregated_instructions = ""
-
+        input_txns = request_body.transactions or []
+        
         try:
-            # Fetch full session history to aggregate refinements
-            history_res = supabase.table("chat_messages") \
+            # Fetch full session history to aggregate refinements (Admin access required for RLS)
+            history_res = supabase_admin.table("chat_messages") \
                 .select("role, content, data") \
                 .eq("session_id", str(request_body.session_id)) \
                 .order("created_at", desc=True) \
                 .execute()
             
             if history_res.data:
-                # 1. Get the last assistant message for context (tables/txns)
+                print(f"[HISTORY] Recovered {len(history_res.data)} messages for context.")
+                user_msgs = []
+                for msg in history_res.data:
+                    if msg.get('role') == 'user':
+                        user_msgs.append(msg.get('content'))
+                    
+                    # If we don't have txns from the frontend, try to grab them from the last assistant message
+                    if not input_txns and msg.get('role') == 'assistant' and msg.get('data'):
+                        input_txns = msg['data'].get('transactions', [])
+                        if input_txns:
+                            print(f"[HISTORY] Successfully recovered {len(input_txns)} transactions from last assistant message.")
+                
+                if user_msgs:
+                    instructions = user_msgs # Use all history for context
+                    aggregated_instructions = " + ".join(instructions)
+
+                # 1. Get the last assistant message for context (tables/txns/all_tables)
                 last_assistant = next((m for m in history_res.data if m["role"] == "assistant"), None)
                 if last_assistant:
-                    content = last_assistant.get("content", "")
                     data_obj = last_assistant.get("data", {}) or {}
                     data_tables = data_obj.get("tables", [])
                     cached_all_tables = data_obj.get("all_tables", data_tables)
@@ -90,17 +107,9 @@ async def accounting_query(request_body: ChatQueryRequest, request: Request, use
                                 full_previous_context += f"| {' | '.join(clean_row)} |\n"
                             full_previous_context += "\n"
                     
-                    full_previous_context += content
-                    if "Balance Sheet" in full_previous_context or "Profit & Loss" in full_previous_context or "|---|" in full_previous_context:
-                        previous_context = full_previous_context
-
-                # 2. Aggregate ALL user instructions for Cumulative Refinement
-                user_msgs = [m["content"] for m in reversed(history_res.data) if m["role"] == "user"]
-                if len(user_msgs) > 0:
-                    instructions = user_msgs # Use all history for context
-                    aggregated_instructions = " + ".join(instructions)
+                    previous_context = full_previous_context
         except Exception as e:
-            print(f"[WARNING] Failed to retrieve session history early: {e}")
+            print(f"[ERROR] Failed to retrieve session history with admin bridge: {e}")
 
         # Step 2: Resolve context and documents to query
         doc_names = []
@@ -290,7 +299,10 @@ async def accounting_query(request_body: ChatQueryRequest, request: Request, use
             
             # Check if we can fulfill this from cache instantly
             tables_to_show = [t for t in cached_all_tables if t.get("type") in show_tables_requested]
-            if cached_all_tables and tables_to_show and not any(kw in q_lower for kw in ["change", "update", "modify", "edit", "fix", "instead", "move", "remove", "add", "to"]):
+            if cached_all_tables and tables_to_show and not any(kw in q_lower for kw in [
+                "change", "update", "modify", "edit", "fix", "instead", "move", "remove", 
+                "add", "to", "want", "make", "set", "adjust", "manage"
+            ]):
                 print(f"[INFO] Instant Cache Hit! Serving {len(tables_to_show)} tables from session cache.")
                 full_response = "Here is the requested report based on the already analyzed statement.\n\n"
                 yield f"data: {json.dumps({'token': full_response})}\n\n"
@@ -319,29 +331,31 @@ async def accounting_query(request_body: ChatQueryRequest, request: Request, use
                 # Use aggregated_instructions if present to ensure cumulative refinement
                 async for token in accounting_service.stream_accounting_synthesis(
                     request_body.question, 
-                    chunks, 
-                    metadatas, 
+                    context_chunks=chunks, 
+                    context_metadatas=metadatas, 
                     company_id=company_id,
                     customer_id=effective_customer_id,
                     previous_context=previous_context,
-                    input_transactions=cached_transactions if cached_transactions else None,
+                    input_transactions=cached_transactions if cached_transactions else [],
                     feedback_history=aggregated_instructions if aggregated_instructions else None
                 ):
                     # Check if client disconnected before yielding each token
                     if await request.is_disconnected():
                         print("[INFO] Client disconnected during accounting streaming, stopping processing")
                         return
-                    
                     if isinstance(token, dict):
-                         if "structured_tables" in token:
-                             final_structured_tables = token["structured_tables"]
-                             final_all_tables = token.get("all_tables", final_structured_tables)
-                         elif "all_transactions" in token:
-                             # Capture transactions for persistence
-                             final_transactions = token["all_transactions"]
-                         else:
-                             # Status update (already a dict, just wrap in data)
-                             yield f"data: {json.dumps(token)}\n\n"
+                        if "structured_tables" in token:
+                            final_structured_tables = token["structured_tables"]
+                            final_all_tables = token.get("all_tables", final_structured_tables)
+                        elif "all_transactions" in token:
+                            # Capture transactions for persistence
+                            final_transactions = token["all_transactions"]
+                        elif "rule_persisted" in token:
+                            # Rule was saved during refinement
+                            print(f"[ACCOUNTING] Rule auto-persisted: {token['rule_persisted'].get('rule_description')}")
+                        else:
+                            # Status update (already a dict, just wrap in data)
+                            yield f"data: {json.dumps(token)}\n\n"
                     else:
                         full_response += token
                         # SSE Format: data: <payload>\n\n
@@ -376,25 +390,38 @@ async def accounting_query(request_body: ChatQueryRequest, request: Request, use
                 
                 supabase_admin.table("chat_messages").insert(user_msg_data).execute()
 
-                # Save AI Synthesis
-                if not final_structured_tables:
-                    final_structured_tables = await accounting_service._parse_markdown_tables(full_response)
-                    
-                    # Merge with cached_all_tables so we don't lose the un-edited tables
-                    merged_all = list(cached_all_tables) if cached_all_tables else []
-                    
-                    for refined_t in final_structured_tables:
-                        matched = False
-                        for i, old_t in enumerate(merged_all):
-                            if old_t.get('type') == refined_t.get('type'):
-                                merged_all[i] = refined_t
-                                matched = True
-                                break
-                        if not matched:
-                            merged_all.append(refined_t)
-                            
-                    final_all_tables = merged_all
+                # Step 4: After stream finishes, merge structured tables
+                # 1. Parse markdown tables (e.g. Journal) from the text response
+                parsed_markdown_tables = await accounting_service._parse_markdown_tables(full_response)
                 
+                # 2. Merge with structured tables yielded by the service
+                # final_structured_tables already contains tables yielded by the stream
+                merged_structured = list(final_structured_tables)
+                for pm_table in parsed_markdown_tables:
+                    matched = False
+                    for i, st_table in enumerate(merged_structured):
+                        if st_table.get('type') == pm_table.get('type'):
+                            # Keep the service-yielded table if both exist (usually more accurate)
+                            matched = True
+                            break
+                    if not matched:
+                        merged_structured.append(pm_table)
+                
+                final_structured_tables = merged_structured
+
+                # 3. Merge with cached_all_tables so we don't lose the un-edited/un-shown tables
+                merged_all = list(cached_all_tables) if cached_all_tables else []
+                for refined_t in final_structured_tables:
+                    matched = False
+                    for i, old_t in enumerate(merged_all):
+                        if old_t.get('type') == refined_t.get('type'):
+                            merged_all[i] = refined_t
+                            matched = True
+                            break
+                    if not matched:
+                        merged_all.append(refined_t)
+                
+                final_all_tables = merged_all
                 structured_tables = final_structured_tables
                 
                 msg_data = {

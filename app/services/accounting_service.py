@@ -29,6 +29,7 @@ class AccountingService:
         self.ai_service = LLMService() # Reuse AI service for extraction helpers
         self.shared_accounts = set() # Track account names across batches for consistency
         self.extraction_cache: Dict[str, List[Dict]] = {} # Cache: content_hash -> extracted transactions
+        self.classification_cache: Dict[str, List[Dict]] = {} # Cache: batch_hash -> classification results
         
         # --- SMART CONCURRENCY DETECTION ---
         # User requested 10 workers maximum. 
@@ -36,16 +37,11 @@ class AccountingService:
         self.model_name = model.lower()
         self.is_free_model = ":free" in self.model_name
         
-        if self.is_free_model:
-            self.n_extractors = 5
-            self.n_classifiers = 3
-            self.worker_delay = 1.5
-            print(f"[INFO] Free Model Detected ({model}). Throttling to {self.n_extractors} workers.")
-        else:
-            self.n_extractors = 10  # USER REQUESTED LIMIT
-            self.n_classifiers = 10
-            self.worker_delay = 0.5
-            print(f"[INFO] Professional Model ({model}). Speed capped at {self.n_extractors} workers.")
+        # Unified high-performance settings for all models 
+        self.n_extractors = 10
+        self.n_classifiers = 10           # Throttled to 10 for reliability + rate-limit safety (especially for :free models)
+        self.worker_delay = 0.2           # Balanced delay
+        print(f"[INFO] AccountingService initialized with {self.n_extractors} extractors, {self.n_classifiers} classifiers.")
             
         print(f"[INFO] AccountingService initialized with model={model}")
     
@@ -84,7 +80,8 @@ class AccountingService:
         }}
         """
         try:
-            res = await self.llm.ainvoke(prompt)
+            # Wrap in retry_with_backoff to handle transient provider errors
+            res = await retry_with_backoff(self.llm.ainvoke, prompt)
             data = self.ai_service._extract_json(res.content)
             print(f"[INFO] Intent Discovery: query='{question[:50]}...' -> intent={data.get('intent')}")
             return data
@@ -143,7 +140,8 @@ class AccountingService:
     ) -> List[Dict]:
         """
         Extract structured transaction data from a text batch.
-        IMPROVED: Feedback context passed as argument to avoid redundant VDB queries.
+        ZERO-MISMATCH DESIGN: Two-step — LLM counts rows first, then extracts exactly that many.
+        Auto-retries once if extracted count differs from stated count.
         """
         if isinstance(context, list):
             context = "\n---\n".join(context)
@@ -155,18 +153,18 @@ class AccountingService:
             print(f"[CACHE HIT] Reusing cached extraction for batch (hash: {content_hash[:8]}...)")
             return self.extraction_cache[content_hash]
         
+        query_instruction = ""
         if context_query:
             query_instruction = f"""
         USER INTENT: "{context_query}"
-        
-        STRICT PRE-FILTERING RULES:
-        1. Identify if the user is asking for a SPECIFIC transaction filter (e.g., "only cash", "only UPI").
-        2. If the user is asking for a general report (e.g., "Balance Sheet", "P&L", "summary", "journal"):
-           - DO NOT SKIP ANY VALID BANK TRANSACTIONS. Extract everything.
-        3. ONLY if the user explicitly requested a specific filter:
-           - Skip transactions that DO NOT match the requested type.
+        STRICT PRE-FILTERING:
+        - For general reports (P&L, Balance Sheet, journal): extract ALL transactions, skip nothing.
+        - Only filter if user explicitly asked for a specific type (e.g., "only cash").
         """
 
+        # ── SINGLE PASS: Count + Extract in ONE LLM call ──────────────────
+        # Returns both row_count_detected (for verification) and transactions[] in one response.
+        # This halves LLM calls per batch vs the previous two-step approach.
         prompt = f"""
         {AGENT_SYSTEM_PROMPTS['extractor']}
 
@@ -179,19 +177,23 @@ class AccountingService:
         {context}
 
         TASK:
-        Read the bank statement text and extract EVERY SINGLE transaction without exception.
-        - YOU ARE FORBIDDEN FROM SKIPPING ANY ROW.
-        - IDENTIFY COLUMNS: Look for headers like Withdrawal/Debit and Deposit/Credit.
-        - MAP DATA CORRECTLY: Money OUT goes into `debit`, Money IN goes into `credit`.
-        - DO NOT put everything into `debit`. If it's a Deposit, put it in `credit`.
-        - If a line looks like a transaction, it MUST be in your output.
+        1. First, quickly count how many transaction rows you see (rows with date + narration + debit OR credit amount).
+           Do NOT count headers, opening/closing balance rows, or summary rows.
+        2. Then extract ALL those transactions into the JSON output below.
+        3. Your "transactions" array MUST contain exactly "row_count_detected" items. No skipping.
+
+        RULES:
+        - YOU ARE FORBIDDEN FROM SKIPPING ANY TRANSACTION ROW.
+        - Money OUT → debit field. Money IN → credit field. One must be 0.00.
+        - balance = running balance from statement (0.00 if not shown).
 
         REQUIRED JSON OUTPUT FORMAT:
         {{
+            "row_count_detected": <integer — how many transaction rows you counted>,
             "transactions": [
                 {{
                     "date": "DD/MM/YYYY",
-                    "narration": "Exact original narration from statement",
+                    "narration": "Exact original narration",
                     "debit": 0.00,
                     "credit": 0.00,
                     "balance": 0.00
@@ -199,26 +201,61 @@ class AccountingService:
             ]
         }}
 
-        REMINDERS:
-        - debit and credit fields are MUTUALLY EXCLUSIVE per transaction (one is 0.00)
-        - balance = running balance shown in statement (0.00 if not present)
-        - Skip any transaction where date or amount is missing or unclear
-        - Output JSON ONLY. No explanation text.
+        Output JSON ONLY. No explanation outside the JSON.
         """
-        
+
+        async def _run_extraction(extra_hint: str = "") -> dict:
+            response = await retry_with_backoff(self.llm.ainvoke, prompt + extra_hint)
+            return self.ai_service._extract_json(response.content)
+
         try:
-            # Use the robust retry_with_backoff helper
-            response = await retry_with_backoff(self.llm.ainvoke, prompt)
-            data = self.ai_service._extract_json(response.content)
-            transactions = data.get("transactions", [])
-            
-            # Cache the result
-            self.extraction_cache[content_hash] = transactions
-            print(f"[CACHE STORE] Cached {len(transactions)} transactions (hash: {content_hash[:8]}...)")
-            
+            data = await _run_extraction()
+
+            if data.get("extraction_error") or "message" in data:
+                print(f"[AGENT-1][WARNING] Extraction fallback in batch.")
+                return data.get("transactions", [])
+
+            transactions  = data.get("transactions", [])
+            stated_count  = data.get("row_count_detected")
+            extracted_count = len(transactions)
+
+            if stated_count:
+                stated_count = int(stated_count)
+                print(f"[AGENT-1][EXTRACT] Got {extracted_count} / {stated_count} rows")
+
+                # ── Auto-retry if mismatch (only 1 extra call, not 2) ──────
+                if extracted_count != stated_count:
+                    diff = abs(stated_count - extracted_count)
+                    direction = "missing" if stated_count > extracted_count else "extra"
+                    print(f"[AGENT-1][RETRY] {direction}={diff}. Retrying...")
+                    retry_hint = f"""
+\n━━━ RETRY: You returned {extracted_count} but counted {stated_count} rows. You are {direction} {diff} transaction(s).
+Go line-by-line. Find and include every skipped row. Output full JSON again. ━━━"""
+                    retry_data = await _run_extraction(retry_hint)
+                    retried = retry_data.get("transactions", [])
+                    if retried:
+                        if abs(len(retried) - stated_count) <= abs(extracted_count - stated_count):
+                            print(f"[AGENT-1][RETRY] Improved: {extracted_count} → {len(retried)} (target={stated_count})")
+                            transactions = retried
+                        else:
+                            # Merge — pipeline dedup will clean up any cross-batch dupes
+                            transactions = transactions + retried
+            else:
+                print(f"[AGENT-1][EXTRACT] Got {extracted_count} transactions (no count target)")
+
+            # Cache only when count matches or no target
+            if transactions:
+                if stated_count is None or len(transactions) == stated_count:
+                    self.extraction_cache[content_hash] = transactions
+                    print(f"[CACHE STORE] {len(transactions)} transactions (hash: {content_hash[:8]}...)")
+                else:
+                    print(f"[CACHE SKIP] Count still off ({len(transactions)} vs {stated_count}).")
+            else:
+                print(f"[CACHE SKIP] Empty result.")
+
             return transactions
         except Exception as e:
-            print(f"[AGENT-1][ERROR] Fatal extraction error in batch: {e}")
+            print(f"[AGENT-1][ERROR] Fatal extraction error: {e}")
             return []
 
 
@@ -259,31 +296,30 @@ class AccountingService:
         if customer_id:
             print(f"[RULES] Fetching dynamic rules for customer_id: {customer_id}")
             try:
-                from app.core.supabase import supabase
+                from app.core.supabase import supabase_admin
                 # Get business type
-                cust_res = supabase.table("customers").select("business_type, name").eq("id", customer_id).single().execute()
+                cust_res = supabase_admin.table("customers").select("business_type, name").eq("id", customer_id).single().execute()
                 if cust_res.data and cust_res.data.get("business_type"):
                     business_type = cust_res.data.get("business_type")
                     customer_name = cust_res.data.get("name")
                     print(f"[RULES] Found Business Type: {business_type} for Customer: {customer_name}")
                     dynamic_business_rules += f"CUSTOMER BUSINESS TYPE: {business_type}\n"
-                
-                # Get specific rules (matching either customer_id or business_type)
-                # Note: bypassing company_id to avoid UUID type mismatch error, customer_id is unique anyway
-                query = supabase.table("accounting_rules").select("rule_description")
-                if business_type:
-                    query = query.or_(f"customer_id.eq.{customer_id},business_type.eq.{business_type}")
-                else:
-                    query = query.eq("customer_id", customer_id)
+
+                query = supabase_admin.table("accounting_rules").select("rule_description")
+                query = query.eq("customer_id", customer_id)
                 rules_res = query.execute()
-                
+
                 if rules_res.data:
-                    dynamic_business_rules += "SPECIFIC USER-TAUGHT RULES (HIGHEST PRIORITY):\n"
+                    dynamic_business_rules += "\n━━━ MANDATORY USER-DEFINED RULES (ABSOLUTE PRIORITY) ━━━\n"
+                    dynamic_business_rules += "FOLLOW THESE RULES BEFORE ANY OTHER ACCOUNTING PRINCIPLE:\n"
                     print(f"[RULES] Successfully fetched {len(rules_res.data)} custom accounting rules.")
                     for r in rules_res.data:
                         rule_text = r['rule_description']
-                        dynamic_business_rules += f"- {rule_text}\n"
-                        print(f"[RULES] -> Applied Rule: {rule_text}")
+                        # Remove "USER COMMAND:" prefix if it exists for cleaner injection
+                        clean_rule = rule_text.replace("USER COMMAND: ", "")
+                        dynamic_business_rules += f"- {clean_rule}\n"
+                        print(f"[RULES] -> Applied Rule: {clean_rule}")
+                    dynamic_business_rules += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 else:
                     print(f"[RULES] No custom rules found for this customer.")
             except Exception as e:
@@ -315,8 +351,16 @@ class AccountingService:
         # --- AGENT 0: INTENT DISCOVERY ---
         intent_data = await self._discover_intent(question)
         intent = intent_data.get('intent', 'EXTRACTION')
-        _show_tables = set(intent_data.get('report_types', ['profit_loss', 'balance_sheet']))
         
+        # STRICTOR FILTERING: Use the helper to determine which tables to actually SHOW in the UI cards.
+        # This prevents redundant "Financial Report" or "Balance Sheet" cards if only P&L was asked for.
+        _show_tables = self._detect_requested_tables(question)
+        
+        # If intent is refinement/analysis, always show what was asked. 
+        # If extraction and no specific mention, default to P&L + BS.
+        if not _show_tables:
+            _show_tables = set(intent_data.get('report_types', ['profit_loss', 'balance_sheet']))
+            
         print(f"[INTENT] User asked for: {_show_tables} | ID Intent: {intent}")
 
         if not context_chunks and not input_transactions:
@@ -346,174 +390,350 @@ class AccountingService:
         is_refinement = (intent == "REFINEMENT" or intent == "ANALYSIS") and input_transactions is not None
         
         if is_refinement:
-            print(f"[AGENT-7] REFINEMENT MODE: LLM Refiner triggered by intent '{intent}' for {len(input_transactions)} transactions.")
-            # --- AGENT 7: REFINEMENT ORCHESTRATOR ---
-            yield {"status": "Agent 7 (Orchestrator): Analyzing your request and identifying targets..."}
+            print(f"[AGENT-7] REFINEMENT MODE: LLM Universal Mutation Engine triggered for {len(input_transactions)} transactions.")
             
-            # Agent 7 sees a sample of transactions to understand the context
-            sample_txns = input_transactions[:100] # First 100 for context
+            # --- CALCULATE CURRENT LEDGER TOTALS FOR LLM CONTEXT ---
+            # Unify keywords with Agent 4 (P&L) for mathematical precision
+            pnl_inc_kws = ["INCOME", "SALES", "REVENUE", "DIRECT INCOME"]
+            pnl_exp_kws = ["EXPENSE", "DIRECT EXPENSE", "CHGS", "FEE", "TAX", "PURCHASE", "COST"]
+            
+            cur_income = sum(float(e.get('amount', 0)) for t in input_transactions for e in t.get('entries', []) 
+                            if any(k in str(e.get('category', '')).upper() for k in pnl_inc_kws))
+            cur_expense = sum(float(e.get('amount', 0)) for t in input_transactions for e in t.get('entries', []) 
+                             if any(k in str(e.get('category', '')).upper() for k in pnl_exp_kws))
+            cur_profit = cur_income - cur_expense
+            
+            yield {"status": f"Agent 7 (Universal): Calculating adjustments (Current Profit: \u20b9{cur_profit:,.2f})..."}
+            from datetime import date as _date_today
+            today_str = _date_today.today().strftime("%d/%m/%Y")
+
+
+            # Build numbered transaction list for LLM context (first 100)
             txn_sample_text = ""
-            for i, t in enumerate(sample_txns):
+            for i, t in enumerate(input_transactions[:100]):
                 amt = float(t.get('debit', 0) or t.get('credit', 0) or 0)
-                txn_sample_text += f"{i}. [{t.get('date')}] {t.get('narration')} (₹{amt:,.2f})\n"
+                txn_sample_text += f"{i}. [{t.get('date')}] {t.get('narration')} (\u20b9{amt:,.2f})\n"
 
-            refine_discovery_prompt = f"""
-            {AGENT_SYSTEM_PROMPTS['refinement']}
-            {REFINEMENT_RULES}
+            universal_prompt = f"""
+You are a Senior Chartered Accountant AI. A user has given you an accounting instruction.
+Your job is to translate that instruction into a precise list of mutations on the transaction ledger.
 
-            USER COMMAND: "{question}"
-            BUSINESS TYPE: {business_type or "Unknown"}
-            
-            SAMPLE TRANSACTIONS:
-            {txn_sample_text}
-            
-            TASK: Identify if this is a CLASSIFICATION change (move accounts) or MATHEMATICAL change (edit totals/dates).
-            Provide the 'matching_criteria' (like the old rules) so Python can find ALL targets in the full list of {len(input_transactions)} entries.
-            
-            Output JSON only.
-            """
-            
-            plan = {}
+\u2501\u2501\u2501 USER COMMAND \u2501\u2501\u2501
+\"{question}\"
+\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501
+
+TODAY'S DATE: {today_str}
+TOTAL TRANSACTIONS IN LEDGER: {len(input_transactions)}
+
+CURRENT FINANCIAL STATE:
+ - Total Income: \u20b9{cur_income:,.2f}
+ - Total Expense: \u20b9{cur_expense:,.2f}
+ - Current Net Profit: \u20b9{cur_profit:,.2f}
+
+SAMPLE TRANSACTIONS (first 100 shown by index):
+{txn_sample_text}
+
+
+\u2501\u2501\u2501 YOUR TASK \u2501\u2501\u2501
+Analyze the user command and return a JSON object with a list of "mutations".
+Each mutation tells Python exactly what to do. You can return MULTIPLE mutations for complex commands.
+
+MUTATION TYPES AND WHEN TO USE THEM:
+
+1. ADD_ENTRY - Add a new transaction/journal entry that does not yet exist.
+   Use for: "add 15 lakh saloon income", "add depreciation 50000", "add opening capital",
+            "add cash sale", "add GST liability", "add 1522670 in cash in saloon income"
+   {{
+     "type": "ADD_ENTRY",
+     "date": "DD/MM/YYYY or today",
+     "narration": "short description",
+     "debit_account": "account to debit",
+     "credit_account": "account to credit",
+     "amount": 12345.00,
+     "category": "Income | Expense | Current Assets | Fixed Assets | Liability | Equity"
+   }}
+
+2. RECLASSIFY - Move/reassign existing transactions to a different account.
+   Use for: "move all swiggy to food expense", "put UPI under purchases"
+   {{
+     "type": "RECLASSIFY",
+     "matching_criteria": {{
+       "narration_contains": "keyword or empty",
+       "type": "DEBIT or CREDIT or null",
+       "min_amount": null,
+       "max_amount": null
+     }},
+     "new_debit_account": "account name",
+     "new_credit_account": "Bank Account",
+     "new_category": "category name"
+   }}
+
+3. MODIFY - Change amount, date, or narration of a specific existing transaction by index.
+   Use for: "change transaction 5 to 8000", "update entry 3 date to 15/03/2026"
+   {{
+     "type": "MODIFY",
+     "index": 5,
+     "fields": {{ "debit": 8000 }}
+   }}
+
+4. DELETE - Remove a transaction (duplicate, incorrect, etc.). DO NOT delete unless specifically asked.
+   {{
+     "type": "DELETE",
+     "matching_criteria": {{ "narration_contains": "keyword or empty", "exact_amount": null, "index": null }}
+   }}
+
+5. SPLIT - Replace one transaction with multiple smaller entries.
+   {{
+     "type": "SPLIT",
+     "matching_criteria": {{ "narration_contains": "keyword", "exact_amount": 10000 }},
+     "splits": [
+       {{"narration": "Rent", "amount": 6000, "debit_account": "Rent Expense", "credit_account": "Bank Account", "category": "Expense"}},
+       {{"narration": "Utilities", "amount": 4000, "debit_account": "Utilities Expense", "credit_account": "Bank Account", "category": "Expense"}}
+     ]
+   }}
+
+\u2501\u2501\u2501 IMPORTANT: TARGET PROFIT / TOTALS \u2501\u2501\u2501
+- If user wants "X as Net Profit", calculate the DELTA from Current Net Profit and use ADD_ENTRY to balance it.
+- DELTA = Target Profit - Current Net Profit.
+- If DELTA is Negative (Target < Current): Add an EXPENSE entry of abs(DELTA) to reduce profit.
+- If DELTA is Positive (Target > Current): Add an INCOME entry of DELTA to increase profit.
+- Account naming: Use "Profit Adjustment Entry" or "Ad-hoc Expense" for these balancing entries.
+
+
+\u2501\u2501\u2501 IMPORTANT RULES \u2501\u2501\u2501
+- AMOUNT INTEGRITY: In a RECLASSIFY, you MUST NOT change the amount of any transaction. Only change its account/category.
+- AD-HOC ENTRIES: If the user says "I want X as profit" or "add Y amount", ALWAYS use ADD_ENTRY with the Delta or specific amount.
+- CATEGORY MATCHING: Use "Income" for all revenue types and "Expense" for all cost types to ensure they sync with the P&L calculator.
+
+
+DOUBLE-ENTRY ACCOUNTING RULES (always follow):
+- Money IN (income, loans, capital received): DEBIT Bank/Cash \u2192 CREDIT Income/Liability/Capital
+- Money OUT (expenses, payments): DEBIT Expense/Asset \u2192 CREDIT Bank/Cash
+- Depreciation: DEBIT Depreciation Expense \u2192 CREDIT Accumulated Depreciation
+- Contra (cash to bank): DEBIT Bank Account \u2192 CREDIT Cash Account
+- Opening balance (asset): DEBIT Asset Account \u2192 CREDIT Capital/Opening Balance
+- GST payable: DEBIT Input/Sales Account \u2192 CREDIT GST Payable
+
+CATEGORIES TO USE:
+- "Income" for revenue, sales, fees received
+- "Expense" for costs, purchases, depreciation, salaries
+- "Current Assets" for Bank, Cash, Debtors, Stock
+- "Fixed Assets" for machinery, equipment, furniture, vehicles
+- "Liability" for loans, creditors, GST payable, TDS payable
+- "Equity" for capital, reserves, retained earnings, drawings
+
+OUTPUT FORMAT (JSON only, no explanation outside JSON):
+{{
+  "reasoning": "brief explanation of what you understood and why you chose these mutations",
+  "mutations": [
+    {{ ...mutation 1... }},
+    {{ ...mutation 2... }}
+  ]
+}}
+"""
+
+            mutation_plan = {}
             try:
-                res = await self.llm.ainvoke(refine_discovery_prompt)
-                plan = self.ai_service._extract_json(res.content)
-                if not isinstance(plan, dict): plan = {}
-                print(f"[AGENT-7] Plan Discovered: Intent={plan.get('intent')} | Reasoning: {plan.get('reasoning')}")
+                res = await retry_with_backoff(self.llm.ainvoke, universal_prompt)
+                mutation_plan = self.ai_service._extract_json(res.content)
+                if not isinstance(mutation_plan, dict):
+                    mutation_plan = {}
+                print(f"[AGENT-7][UNIVERSAL] Reasoning: {mutation_plan.get('reasoning', 'N/A')}")
+                print(f"[AGENT-7][UNIVERSAL] Mutations planned: {len(mutation_plan.get('mutations', []))}")
             except Exception as e:
-                print(f"[AGENT-7][ERROR] Orchestration failed: {e}")
-                plan = {"intent": "GENERAL"}
+                print(f"[AGENT-7][UNIVERSAL][ERROR] LLM mutation planning failed: {e}")
+                mutation_plan = {"mutations": []}
 
-            intent = plan.get('intent', 'GENERAL')
-            meta = plan.get('rule_metadata', {})
-            matches_for_reclassification = []
-            modified_indices = set()
+            mutations = mutation_plan.get("mutations", [])
+            new_entries_to_add = []
+            modified_count = 0
             
-            # Use matching criteria from Agent 7 to find targets in Python (for scalability)
-            m = plan.get('matching_criteria', plan.get('match', {})) # Backward compatibility during transition
-            
-            if m:
-                for i, t in enumerate(input_transactions):
-                    amt = float(t.get('debit', 0) or t.get('credit', 0) or 0)
-                    is_dr = float(t.get('debit', 0)) > 0
-                    t_type = "DEBIT" if is_dr else "CREDIT"
-                    
-                    # Match conditions
-                    if m.get('type') and m.get('type') != t_type: continue
-                    if m.get('min_amount') is not None and amt < m.get('min_amount'): continue
-                    if m.get('max_amount') is not None and amt > m.get('max_amount'): continue
-                    
-                    narr_match = m.get('narration_contains', '').lower()
-                    if narr_match and narr_match not in str(t.get('narration', '')).lower(): continue
-                        
-                    matches_for_reclassification.append(t)
-                    modified_indices.add(i)
+            # --- UNIVERSAL MUTATION EXECUTOR ---
+            # Python applies each mutation generically. LLM handles all accounting intelligence.
+            for mut in mutations:
+                mtype = mut.get("type", "").upper()
 
-            modified_count = len(matches_for_reclassification)
-            
-            # --- EXECUTION BRANCHES ---
-            if intent == "CLASSIFICATION" and modified_count > 0:
-                yield {"status": f"Agent 7: Identified {modified_count} targets. Agent 2 (Expert): Re-classifying..."}
-                
-                # Agent 2 gets the USER'S ORIGINAL COMMAND as the law
-                refine_as_rule = f"\n━━━ USER REFINEMENT COMMAND (MANDATORY) ━━━\n{question}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                
-                re_classify_batches = [
-                    matches_for_reclassification[i:i + 50] 
-                    for i in range(0, len(matches_for_reclassification), 50)
-                ]
-                
-                total_recl = 0
-                for b_idx, batch in enumerate(re_classify_batches):
-                    prompt = f"""
-                    {AGENT_SYSTEM_PROMPTS['classifier']}
-                    {CLASSIFIER_RULES}
-                    {refine_as_rule}
-                    
-                    TRANSACTIONS TO RE-CLASSIFY:
-                    """
-                    for j, t in enumerate(batch):
-                        dr = float(t.get('debit', 0) or 0)
-                        cr = float(t.get('credit', 0) or 0)
-                        direction = f"DEBIT ₹{dr:,.2f}" if dr > 0 else f"CREDIT ₹{cr:,.2f}"
-                        prompt += f"{j+1}. [{direction}] {t.get('narration', 'Unknown')}\n"
-                    
-                    try:
-                        res = await retry_with_backoff(self.llm.ainvoke, prompt)
-                        raw_recl = self.ai_service._extract_json(res.content)
-                        if isinstance(raw_recl, dict) and "transactions" in raw_recl:
-                            updated_results = raw_recl["transactions"]
-                        elif isinstance(raw_recl, list):
-                            updated_results = raw_recl
+                # ── ADD_ENTRY ────────────────────────────────────────────────────
+                if mtype == "ADD_ENTRY":
+                    amt = float(mut.get("amount", 0))
+                    if amt <= 0:
+                        print(f"[AGENT-7][UNIVERSAL] ADD_ENTRY skipped: amount is 0 or missing.")
+                        continue
+                    dr_acc = str(mut.get("debit_account", "Bank Account")).strip().title()
+                    cr_acc = str(mut.get("credit_account", "Unclassified Income")).strip().title()
+                    cat    = str(mut.get("category", "Income")).strip()
+                    narr   = str(mut.get("narration", "Manual Entry")).strip()
+                    date   = str(mut.get("date", today_str)).strip()
+                    is_income_side = any(k in cat.upper() for k in ["INCOME", "LIAB", "EQUITY"])
+                    new_txn = {
+                        "date": date, "narration": narr, "balance": 0.0, "_manual": True,
+                        "debit": 0.0 if is_income_side else amt,
+                        "credit": amt if is_income_side else 0.0,
+                        "entries": [
+                            {"account": dr_acc, "type": "DEBIT", "amount": amt,
+                             "category": "Current Assets" if any(k in dr_acc.upper() for k in ["BANK","CASH"]) else cat},
+                            {"account": cr_acc, "type": "CREDIT", "amount": amt,
+                             "category": "Current Assets" if any(k in cr_acc.upper() for k in ["BANK","CASH"]) else cat},
+                        ]
+                    }
+                    new_entries_to_add.append(new_txn)
+                    modified_count += 1
+                    print(f"[AGENT-7][UNIVERSAL] ADD_ENTRY: {narr} | Dr:{dr_acc} Cr:{cr_acc} ₹{amt:,.2f}")
+
+                # ── RECLASSIFY ───────────────────────────────────────────────────
+                elif mtype == "RECLASSIFY":
+                    mc = mut.get("matching_criteria", {})
+                    new_dr  = str(mut.get("new_debit_account", "")).strip().title()
+                    new_cr  = str(mut.get("new_credit_account", "Bank Account")).strip().title()
+                    new_cat = str(mut.get("new_category", "Expense")).strip()
+                    reclassified = 0
+                    for t in input_transactions:
+                        # Extract the ORIGINAL amount strictly to prevent accidental changes
+                        # Priority: entries[0].amount > debit > credit
+                        orig_amt = 0.0
+                        if t.get('entries'):
+                            orig_amt = float(t['entries'][0].get('amount', 0))
                         else:
-                            updated_results = []
+                            orig_amt = float(t.get('debit', 0) or t.get('credit', 0) or 0)
                         
-                        if isinstance(updated_results, list) and len(updated_results) == len(batch):
-                            for k, updated_cls in enumerate(updated_results):
-                                orig_t = batch[k]
-                                dr_acc = updated_cls.get('debit_account', 'Unclassified')
-                                cr_acc = updated_cls.get('credit_account', 'Unclassified')
-                                cat = updated_cls.get('category', 'Indirect Expense')
-                                
-                                amt = float(orig_t.get('debit', 0) or orig_t.get('credit', 0) or 0)
-                                orig_t['entries'] = [
-                                    {"account": dr_acc, "type": "DEBIT", "amount": amt, "category": cat if "Bank" not in dr_acc else "Current Assets"},
-                                    {"account": cr_acc, "type": "CREDIT", "amount": amt, "category": cat if "Bank" not in cr_acc else "Current Assets"}
+                        t_type = "DEBIT" if float(t.get('debit', 0)) > 0 else "CREDIT"
+                        if mc.get('type') and mc['type'].upper() != t_type: continue
+                        if mc.get('min_amount') is not None and orig_amt < float(mc['min_amount']): continue
+                        if mc.get('max_amount') is not None and orig_amt > float(mc['max_amount']): continue
+                        narr_kw = str(mc.get('narration_contains', '')).lower()
+                        if narr_kw and narr_kw not in str(t.get('narration', '')).lower(): continue
+                        
+                        # Apply new classification WHILE PRESERVING ORIGINAL AMOUNT
+                        t['entries'] = [
+                            {"account": new_dr, "type": "DEBIT", "amount": orig_amt,
+                             "category": "Current Assets" if any(k in new_dr.upper() for k in ["BANK","CASH"]) else new_cat},
+                            {"account": new_cr, "type": "CREDIT", "amount": orig_amt,
+                             "category": "Current Assets" if any(k in new_cr.upper() for k in ["BANK","CASH"]) else new_cat},
+                        ]
+                        reclassified += 1
+                    modified_count += reclassified
+                    print(f"[AGENT-7][UNIVERSAL] RECLASSIFY: {reclassified} transactions (amount preserved) → Dr:{new_dr} Cr:{new_cr}")
+
+                # ── MODIFY ───────────────────────────────────────────────────────
+                elif mtype == "MODIFY":
+                    idx    = mut.get("index")
+                    fields = mut.get("fields", {})
+                    if idx is not None and 0 <= int(idx) < len(input_transactions):
+                        t = input_transactions[int(idx)]
+                        for field, val in fields.items():
+                            if field in ['debit', 'credit']:
+                                t[field] = float(val)
+                                for e in t.get('entries', []): e['amount'] = float(val)
+                            elif field in ['date', 'narration']:
+                                t[field] = str(val)
+                        modified_count += 1
+                        print(f"[AGENT-7][UNIVERSAL] MODIFY: txn[{idx}] updated fields={list(fields.keys())}")
+
+                # ── DELETE ───────────────────────────────────────────────────────
+                elif mtype == "DELETE":
+                    mc  = mut.get("matching_criteria", {})
+                    idx = mc.get("index")
+                    deleted = 0
+                    if idx is not None and 0 <= int(idx) < len(input_transactions):
+                        input_transactions[int(idx)]['_deleted'] = True
+                        deleted += 1
+                    else:
+                        for t in input_transactions:
+                            amt     = float(t.get('debit', 0) or t.get('credit', 0) or 0)
+                            narr_kw = str(mc.get('narration_contains', '')).lower()
+                            exact   = mc.get('exact_amount')
+                            if narr_kw and narr_kw not in str(t.get('narration', '')).lower(): continue
+                            if exact is not None and abs(amt - float(exact)) > 0.01: continue
+                            t['_deleted'] = True
+                            deleted += 1
+                    modified_count += deleted
+                    print(f"[AGENT-7][UNIVERSAL] DELETE: {deleted} transactions marked for removal")
+
+                # ── SPLIT ────────────────────────────────────────────────────────
+                elif mtype == "SPLIT":
+                    mc     = mut.get("matching_criteria", {})
+                    splits = mut.get("splits", [])
+                    for t in input_transactions:
+                        orig_amt = float(t.get('debit', 0) or t.get('credit', 0) or 0)
+                        narr_kw  = str(mc.get('narration_contains', '')).lower()
+                        exact    = mc.get('exact_amount')
+                        if narr_kw and narr_kw not in str(t.get('narration', '')).lower(): continue
+                        if exact is not None and abs(orig_amt - float(exact)) > 0.01: continue
+                        t['_deleted'] = True
+                        for sp in splits:
+                            sp_amt = float(sp.get('amount', 0))
+                            sp_dr  = str(sp.get('debit_account', 'Expense Account')).strip().title()
+                            sp_cr  = str(sp.get('credit_account', 'Bank Account')).strip().title()
+                            sp_cat = str(sp.get('category', 'Expense')).strip()
+                            new_entries_to_add.append({
+                                "date": t.get('date', today_str),
+                                "narration": sp.get('narration', t.get('narration', '')),
+                                "debit": sp_amt if float(t.get('debit', 0)) > 0 else 0,
+                                "credit": sp_amt if float(t.get('credit', 0)) > 0 else 0,
+                                "balance": 0.0, "_manual": True,
+                                "entries": [
+                                    {"account": sp_dr, "type": "DEBIT",  "amount": sp_amt, "category": sp_cat},
+                                    {"account": sp_cr, "type": "CREDIT", "amount": sp_amt, "category": sp_cat},
                                 ]
-                                total_recl += 1
-                    except Exception as e:
-                        print(f"[RE-CLASSIFY][ERROR] Batch {b_idx} failed: {e}")
-                
-            elif intent == "MATHEMATICAL":
-                yield {"status": "Agent 7: Identified Mathematical updates. Applying changes..."}
-                updates = plan.get('math_updates', [])
-                for u in updates:
-                    idx = u.get('index')
-                    if idx is not None and 0 <= idx < len(input_transactions):
-                        t = input_transactions[idx]
-                        field = u.get('field')
-                        if field in ['debit', 'credit', 'amount']:
-                            val = float(u.get('new_value', 0))
-                            if field == 'amount':
-                                # Determine which column to update based on existing values
-                                if float(t.get('debit', 0)) > 0: t['debit'] = val
-                                else: t['credit'] = val
-                            else:
-                                t[field] = val
-                            print(f"[MATH] Updated txn {idx} {field} to {val}")
-                        elif field == 'date':
-                            t['date'] = u.get('new_value')
+                            })
+                        modified_count += 1
+                        print(f"[AGENT-7][UNIVERSAL] SPLIT: '{t.get('narration')}' → {len(splits)} entries")
+                        break  # Only split first match
+
+                else:
+                    print(f"[AGENT-7][UNIVERSAL] Unknown mutation type: '{mtype}' — skipping.")
+
+            # Apply deletes, then append new entries to transaction list
+            input_transactions[:] = [t for t in input_transactions if not t.get('_deleted')]
+            input_transactions.extend(new_entries_to_add)
 
             # --- PERSIST VERBATIM RULES (LEARNING) ---
-            if modified_count > 0 or intent == "MATHEMATICAL":
+            # Rule is stored as the verbatim USER COMMAND for maximum fidelity.
+            # We persist it for all refinement commands regardless of mutation type.
+            if is_refinement:
                 try:
-                    from app.core.supabase import supabase
-                    scope = meta.get('scope', 'CUSTOMER')
-                    # Use verbatim command if available, else user's instruction
-                    rule_desc = meta.get('rule_description', question)
-                    verbatim = meta.get('verbatim_command', question)
+                    from app.core.supabase import supabase_admin
+                    # Force scope to CUSTOMER for all user-defined overrides as per latest requirement
+                    scope = "CUSTOMER"
+                    # User's verbatim question IS the absolute rule. 
+                    # We store it cleanly so it can be injected next time.
+                    full_rule_desc = f"USER COMMAND: {question}"
                     
                     save_data = {
-                        "rule_description": f"{rule_desc} (User Command: {verbatim})",
-                        "business_type": business_type if scope == "INDUSTRY" else None,
-                        "customer_id": customer_id if scope == "CUSTOMER" else None,
-                        "is_active": True
+                        "rule_description": full_rule_desc,
+                        #"business_type": business_type, # Commented out as per user request to keep it customer-specific
+                        "customer_id": customer_id, # Always specific to this customer
+                        "company_id": company_id,
                     }
                     
-                    # Duplicate check
-                    check = supabase.table("accounting_rules").select("id").eq("rule_description", save_data["rule_description"])
-                    if scope == "INDUSTRY": check = check.eq("business_type", business_type).is_("customer_id", "null")
-                    else: check = check.eq("customer_id", customer_id)
+                    print(f"[DEBUG][LEARNING] Persisting verbatim rule for CUSTOMER scope...")
+                    print(f"[DEBUG][LEARNING] Content: {full_rule_desc}")
                     
-                    if not check.execute().data:
-                        supabase.table("accounting_rules").insert(save_data).execute()
-                        print(f"[LEARNING] Saved {scope} rule: {save_data['rule_description']}")
+                    # Duplicate check: check if THIS exact command already exists for THIS specific customer
+                    check_query = supabase_admin.table("accounting_rules").select("id").eq("rule_description", full_rule_desc).eq("customer_id", customer_id)
+                    
+                    check_res = check_query.execute()
+                    if not check_res.data:
+                        print(f"[DEBUG][LEARNING] No duplicate. Inserting...")
+                        insert_res = supabase_admin.table("accounting_rules").insert(save_data).execute()
+                        if insert_res.data:
+                            print(f"[LEARNING][SUCCESS] Verbose rule saved: {full_rule_desc}")
+                            # Yield metadata so the endpoint can also see/store it if needed
+                            yield {"rule_persisted": save_data}
+                        else:
+                            print(f"[LEARNING][ERROR] Insert failed (no data returned). Response: {insert_res}")
+                    else:
+                        print(f"[LEARNING][SKIP] Rule already exists (ID: {check_res.data[0].get('id')}).")
+                        
                 except Exception as e:
-                    print(f"[LEARNING][ERROR] Failed: {e}")
+                    import traceback
+                    print(f"[LEARNING][ERROR] Persistence failed: {str(e)}")
+                    traceback.print_exc()
 
             all_transactions = input_transactions # Preserve changes
 
-            yield {"status": f"Refinement complete. {modified_count} transactions targetted and re-classified."}
-            print(f"[AGENT-7] Pipeline: Filtered {modified_count} txns for Agent 2.")
+            yield {"status": f"Agent 7 (Universal): Done. {modified_count} mutation(s) applied. {len(new_entries_to_add)} new entries added."}
+            print(f"[AGENT-7][UNIVERSAL] Pipeline complete. Mutations applied: {modified_count}. New entries: {len(new_entries_to_add)}.")
 
             # Reconciliation logging
             expected_deposits = len([t for t in all_transactions if float(t.get('credit', 0) or 0) > 0])
@@ -538,7 +758,8 @@ class AccountingService:
                 """
                 summary_task = asyncio.create_task(self.llm.ainvoke(summary_prompt))
 
-            BATCH_SIZE = 10
+            # INCREASED batch size for speed: 20 chunks per batch (Reduced total LLM calls)
+            BATCH_SIZE = 20
             batches = [context_chunks[i:i + BATCH_SIZE] for i in range(0, len(context_chunks), BATCH_SIZE)]
             total_batches = len(batches)
 
@@ -552,9 +773,12 @@ class AccountingService:
             async def process_batch(index, batch_data, batch_metas):
                 async with sem:
                     slot = index % N_EXTRACTORS
-                    # Stagger to avoid huge initial burst
-                    if index < N_EXTRACTORS:
-                        await asyncio.sleep(slot * WORKER_DELAY_SEC)
+                    # Skip stagger delay if this batch is already cached (cache hits are instant)
+                    import hashlib as _hl
+                    _batch_str = "\n---\n".join(batch_data)
+                    _batch_hash = _hl.sha256(_batch_str.encode()).hexdigest()
+                    if _batch_hash not in self.extraction_cache:
+                        await asyncio.sleep(WORKER_DELAY_SEC * (index % N_EXTRACTORS + 1) / N_EXTRACTORS)
 
                     print(f"[AGENT-1][Worker-{slot+1}] → Batch {index + 1}/{total_batches} starting... ({len(batch_data)} chunks)")
                     txns = await self._extract_transactions_from_batch(
@@ -606,35 +830,37 @@ class AccountingService:
                 except Exception as e:
                     print(f"[RECONCILE] Summary background task failed: {e}")
 
-            # --- RECONCILIATION LOOP (NEW) ---
-            # If we missed transactions compared to the bank summary, retry empty batches meticulously
+            # --- STRICT RECONCILIATION LOOP ---
+            # Target: extracted count == bank summary total (zero tolerance)
+            # Strategy: retry every batch individually until counts match or max attempts reached
             total_extracted = len(all_transactions)
             total_expected = (expected_deposits or 0) + (expected_withdrawals or 0)
             
-            if total_expected > total_extracted + 5: # 5 txn buffer for footer/header noise
+            if total_expected > 0 and total_extracted != total_expected:
                 missing_count = total_expected - total_extracted
-                print(f"[RECONCILE] Detected missing data: Found {total_extracted}, Expected {total_expected}. Retrying empty batches...")
-                yield {"status": f"⚠️ Missing {missing_count} transactions. Agent 1 (Reconciliation): Retrying empty areas..."}
+                direction = "missing" if missing_count > 0 else "extra"
+                print(f"[RECONCILE] COUNT MISMATCH: Found {total_extracted}, Expected {total_expected} ({direction}={abs(missing_count)}). Starting aggressive reconciliation...")
+                yield {"status": f"⚠️ {direction.title()} {abs(missing_count)} transactions (found {total_extracted}, expected {total_expected}). Reconciling..."}
                 
-                # Identify batches that returned 0
-                failed_indices = [idx for idx, res in batch_results.items() if not res]
-                if failed_indices:
-                    print(f"[RECONCILE] Retrying {len(failed_indices)} batches. Flattening chunks for parallel extraction...")
-                    
-                    # Flatten into a single chunk pool for maximum parallelism
-                    missing_tasks = []
-                    for f_idx in failed_indices:
-                        f_batch = batches[f_idx]
-                        f_metas = context_metadatas[f_idx*BATCH_SIZE:(f_idx+1)*BATCH_SIZE] if context_metadatas else [None] * len(f_batch)
+                # Retry ALL batches that are likely underperforming (empty OR small)
+                # Sort by result size ascending — smallest first as most likely culprits
+                sorted_batches = sorted(batch_results.items(), key=lambda x: len(x[1]))
+                retry_tasks = []
+                for b_idx, b_res in sorted_batches:
+                    # Retry empty batches always; retry small batches if still mismatched
+                    if len(b_res) == 0 or (missing_count > 0 and len(b_res) < 3):
+                        f_batch = batches[b_idx]
+                        f_metas = context_metadatas[b_idx*BATCH_SIZE:(b_idx+1)*BATCH_SIZE] if context_metadatas else [None] * len(f_batch)
                         for c_idx, chunk in enumerate(f_batch):
-                            missing_tasks.append((chunk, f_metas[c_idx]))
+                            retry_tasks.append((chunk, f_metas[c_idx] if f_metas else None))
+
+                if retry_tasks:
+                    print(f"[RECONCILE] Retrying {len(retry_tasks)} chunks individually...")
 
                     async def retry_chunk(c_idx_global, chunk_data, meta):
-                        async with sem: # Use the same extractor semaphore
+                        async with sem:
                             slot = c_idx_global % N_EXTRACTORS
-                            # Add stagger even for reconciliation to avoid bursts
                             await asyncio.sleep(slot * WORKER_DELAY_SEC)
-                            
                             r_txns = await self._extract_transactions_from_batch(
                                 chunk_data, 
                                 context_query=question, 
@@ -642,23 +868,22 @@ class AccountingService:
                                 feedback_context=feedback_context
                             )
                             if r_txns and meta:
-                                src_doc = meta.get('document_name')
+                                src_doc = meta.get('document_name') if meta else None
                                 for t in r_txns:
                                     t['_source_docs'] = [src_doc] if src_doc else []
                             return r_txns
 
-                    reconcile_results = await asyncio.gather(*[retry_chunk(i, c, m) for i, (c, m) in enumerate(missing_tasks)])
-                    
+                    reconcile_results = await asyncio.gather(*[retry_chunk(i, c, m) for i, (c, m) in enumerate(retry_tasks)])
                     new_txns_count = 0
                     for r_list in reconcile_results:
                         if r_list:
                             all_transactions.extend(r_list)
                             new_txns_count += len(r_list)
                     
-                    print(f"[RECONCILE] Done. Recovered {new_txns_count} missing transactions.")
-                    yield {"status": f"Reconciliation successful: recovered {new_txns_count} transactions."}
+                    print(f"[RECONCILE] Recovery done. Recovered {new_txns_count} additional transactions.")
+                    yield {"status": f"Reconciliation: recovered {new_txns_count} transactions (total now: {len(all_transactions)})."}
                 else:
-                    print(f"[RECONCILE] No empty batches to retry, but count still mismatches.")
+                    print(f"[RECONCILE] No obvious retry candidates found. Proceeding with {total_extracted} transactions.")
 
         if not all_transactions:
             yield "No transactions could be identified in the provided documents. Please check the file has clear financial data.\n"
@@ -681,25 +906,26 @@ class AccountingService:
                 amt = sum(float(e.get('amount', 0)) for e in entries if str(e.get('type')).upper() == 'CREDIT')
             return (d, amt, narr)
 
-        # Improved deduplication: include occurrence counter so that two legitimately
-        # identical transactions (same date + amount + narration) are NOT dropped.
-        # We only drop exact cross-batch duplicates from overlapping chunk windows.
+        # DEDUPLICATION: use raw debit/credit fields (always available after extraction,
+        # unlike entries[] which only exist post-classification). Also include balance
+        # in fingerprint to distinguish identical narration+amount on same day.
         all_transactions.sort(key=_sort_key)  # chronological order first
         from collections import Counter as _Counter
         narr_count: _Counter = _Counter()
         seen_fps: set = set()
         unique_txns: List[Dict] = []
         for t in all_transactions:
-            ds = str(t.get('date', '')).strip()
+            ds   = str(t.get('date', '')).strip()
             narr = str(t.get('narration', '')).strip()
-            entries = t.get('entries', [])
-            amt = sum(float(e.get('amount', 0)) for e in entries if str(e.get('type')).upper() == 'DEBIT')
-            if amt == 0 and entries:
-                amt = sum(float(e.get('amount', 0)) for e in entries if str(e.get('type')).upper() == 'CREDIT')
+            dr   = float(t.get('debit', 0) or 0)
+            cr   = float(t.get('credit', 0) or 0)
+            amt  = dr if dr > 0 else cr
+            bal  = float(t.get('balance', 0) or 0)
             norm = _re.sub(r'[^a-zA-Z0-9]', '', narr).lower()
-            base_fp = f"{ds}_{amt:.2f}_{norm}"
-            # Count how many times this exact fingerprint has appeared across ALL batches.
-            # Only drop if this is the 2nd+ time we've seen it (true cross-batch duplicate).
+            # Include balance in fingerprint for high-precision dedup
+            # (two transactions with same date+amount+narration but different running balances are different)
+            base_fp = f"{ds}_{amt:.2f}_{norm}_{bal:.2f}"
+            # Count occurrences — only drop if this is a TRUE cross-batch duplicate
             narr_count[base_fp] += 1
             fp = f"{base_fp}#{narr_count[base_fp]}"
             if fp not in seen_fps:
@@ -729,7 +955,7 @@ class AccountingService:
         # ===================================================================
         # AGENT 2: BATCH CLASSIFIER POOL (LLM — N parallel classifier workers)
         # ===================================================================
-        CLASSIFY_BATCH_SIZE = 50     # transactions per LLM call
+        CLASSIFY_BATCH_SIZE = 100     # Optimized for reliability and speed (100 txns per LLM call)
         N_CLASSIFIERS = self.n_classifiers
         CLASSIFIER_DELAY_SEC = self.worker_delay
 
@@ -752,11 +978,6 @@ class AccountingService:
         async def classify_batch(bidx: int, c_batch: List[Dict]):
             async with cls_sem:
                 slot = bidx % N_CLASSIFIERS
-                # Small stagger on first round to avoid burst
-                if bidx >= N_CLASSIFIERS:
-                    await asyncio.sleep(CLASSIFIER_DELAY_SEC * (slot % 3))
-                if dynamic_business_rules:
-                    print(f"[AGENT-2][Worker-{slot+1}] Injecting {len(dynamic_business_rules)} chars of custom business rules into prompt.")
                 
                 known_accs = ", ".join(list(self.shared_accounts)[:50]) if self.shared_accounts else "None yet"
                 
@@ -766,6 +987,11 @@ class AccountingService:
                     cr = float(t.get('credit', 0) or 0)
                     direction = f"DEBIT \u20b9{dr:,.2f}" if dr > 0 else f"CREDIT \u20b9{cr:,.2f}"
                     narrations_list += f"{j+1}. [{direction}] {t.get('narration', 'Unknown')}\n"
+
+                # Stagger later batches to avoid burst — skip for cache hits (they are instant)
+                _pre_fp = hashlib.sha256((narrations_list + dynamic_business_rules).encode()).hexdigest()
+                if bidx >= N_CLASSIFIERS and _pre_fp not in self.classification_cache:
+                    await asyncio.sleep(CLASSIFIER_DELAY_SEC * (slot % 3))
 
                 classify_prompt = f"""
                 {AGENT_SYSTEM_PROMPTS['classifier']}
@@ -780,14 +1006,14 @@ class AccountingService:
                 TRANSACTIONS TO CLASSIFY:
                 {narrations_list}
 
-                For each transaction, output the double-entry mapping.
-                Return a JSON array with EXACTLY {len(c_batch)} objects (one per transaction, in order):
+                Return a JSON array with EXACTLY {len(c_batch)} objects (one per transaction, in order).
+                Use these exact short keys to save tokens:
                 [{{
-                    "debit_account": "Account to be debited",
-                    "credit_account": "Account to be credited",
-                    "account_type": "income/expense/asset/liability/equity",
-                    "category": "One of the mandatory categories",
-                    "confidence": 0.85
+                    "dr_acc": "Debit Account",
+                    "cr_acc": "Credit Account",
+                    "type": "income/expense/asset/liability/equity",
+                    "cat": "One of the mandatory categories",
+                    "conf": 0.85
                 }}]
 
                 Bank Account Logic (NON-NEGOTIABLE):
@@ -800,12 +1026,41 @@ class AccountingService:
                 try:
                     if dynamic_business_rules:
                         print(f"[AGENT-2][Worker-{slot+1}] Batch {bidx+1}/{total_classify_batches}: Injecting dynamic business rules.")
-                    response = await self.llm.ainvoke(classify_prompt)
-                    results = self.ai_service._extract_json(response.content)
-                    if isinstance(results, dict):
-                        results = list(results.values())[0] if results else []
-                    if not isinstance(results, list):
-                        results = []
+
+                    # --- CLASSIFICATION CACHE (speed: skip LLM if same batch seen before) ---
+                    batch_fp = hashlib.sha256(
+                        (narrations_list + dynamic_business_rules).encode()
+                    ).hexdigest()
+                    if batch_fp in self.classification_cache:
+                        results = self.classification_cache[batch_fp]
+                        print(f"[AGENT-2][CACHE HIT] Batch {bidx+1}/{total_classify_batches}: {len(results)} cached classifications.")
+                    else:
+                        async def _run_classify(hint: str = "") -> list:
+                            """Run one classify LLM call and parse results."""
+                            resp = await retry_with_backoff(self.llm.ainvoke, classify_prompt + hint)
+                            raw = self.ai_service._extract_json(resp.content)
+                            if isinstance(raw, dict):
+                                # LLM wrapped array in a dict — unwrap first list value
+                                for v in raw.values():
+                                    if isinstance(v, list):
+                                        return v
+                                return []
+                            if isinstance(raw, list):
+                                return raw
+                            return []
+
+                        results = await _run_classify()
+
+                        # Retry once if we got 0 results (JSON likely truncated)
+                        if len(results) == 0 and len(c_batch) > 0:
+                            print(f"[AGENT-2][Worker-{slot+1}] Batch {bidx+1}/{total_classify_batches}: 0 classifications — retrying...")
+                            retry_hint = f"\n\n⚠️ RETRY: You returned 0 items. Return a JSON ARRAY with EXACTLY {len(c_batch)} objects. No extra text."
+                            results = await _run_classify(retry_hint)
+
+                        # Cache successful results
+                        if results:
+                            self.classification_cache[batch_fp] = results
+
                     print(f"[AGENT-2][Worker-{slot+1}] Batch {bidx+1}/{total_classify_batches}: {len(results)} classifications")
 
                     for j, t in enumerate(c_batch):
@@ -813,15 +1068,16 @@ class AccountingService:
                         cr = float(t.get('credit', 0) or 0)
                         amt = dr if dr > 0 else cr
                         
-                        if j < len(results):
-                            res = results[j]
-                            debit_acc  = res.get('debit_account', 'Bank Account').strip().title()
-                            credit_acc = res.get('credit_account', 'Bank Account').strip().title()
-                            category   = res.get('category', 'Unclassified')
+                        # RELIABILITY FIX: Match by index only if results exist for it.
+                        res = results[j] if j < len(results) else None
+                        
+                        if res:
+                            debit_acc  = res.get('dr_acc', res.get('debit_account', 'Bank Account')).strip().title()
+                            credit_acc = res.get('cr_acc', res.get('credit_account', 'Bank Account')).strip().title()
+                            category   = res.get('cat', res.get('category', 'Unclassified'))
                             
-                            # Apply double-entry logic with correct category mapping
-                            # If CREDIT (money IN) -> Bank is DEBITED, Income/Liability is CREDITED
-                            # If DEBIT (money OUT) -> Expense/Asset is DEBITED, Bank is CREDITED
+                            # Bank Account always Current Assets
+                            # The OTHER account gets the AI-detected category
                             if cr > 0: # Money IN (Credit in Statement, Debit in Bank A/c)
                                 t['entries'] = [
                                     {"account": "Bank Account", "type": "DEBIT",  "amount": amt, "category": "Current Assets"},
@@ -832,9 +1088,10 @@ class AccountingService:
                                     {"account": debit_acc,  "type": "DEBIT",  "amount": amt, "category": category},
                                     {"account": "Bank Account", "type": "CREDIT", "amount": amt, "category": "Current Assets"},
                                 ]
-                            t['confidence'] = res.get('confidence', 1.0)
+                            t['confidence'] = res.get('conf', res.get('confidence', 1.0))
                         else:
-                            # Fallback for missing LLM result: Preserve if exists!
+                            # Fallback if LLM truncated output (didn't return object for this index)
+                            print(f"[AGENT-2][WARNING] Truncation detected at index {j} in batch {bidx+1}. Using fallback.")
                             if t.get('entries'):
                                 batch_classified.append(t)
                                 continue
@@ -968,22 +1225,35 @@ class AccountingService:
         pnl_dr = 0.0
         pnl_cr = 0.0
 
+        # --- PROFIT & LOSS GENERATION ---
         for acc, bal in ledger_balances.items():
             cat = account_categories.get(acc, "").upper()
             if abs(bal) < 0.01:
                 continue
 
-            # Filter based on PNL_CONFIG rules
+            # Skip Bank Account and specific exclusions
             should_exclude = any(excl.upper() in cat or excl.upper() in acc.upper() for excl in PNL_CONFIG['exclude_types'])
             if should_exclude:
-                print(f"[AGENT-4] Excluding from P&L: {acc} (cat={cat})")
+                if "BANK" not in acc.upper():
+                    print(f"[AGENT-4][PNL-FILTER] Excluded from P&L: {acc} (cat={cat})")
                 continue
-            if "INCOME" in cat:
+
+            # Categorize based on type substring (Unified with Agent 7)
+            pnl_inc_kws = ["INCOME", "SALES", "REVENUE", "DIRECT INCOME"]
+            pnl_exp_kws = ["EXPENSE", "DIRECT EXPENSE", "CHGS", "FEE", "TAX", "PURCHASE", "COST"]
+            
+            is_income = any(kw in cat for kw in pnl_inc_kws)
+            is_expense = any(kw in cat for kw in pnl_exp_kws)
+
+            if is_income:
                 pnl_cr_rows.append((f"By {acc}", abs(bal)))
                 pnl_cr += abs(bal)
-            elif "EXPENSE" in cat:
+            elif is_expense or "EXPENSE" in cat: # Extra safety check for "EXPENSE"
                 pnl_dr_rows.append((f"To {acc}", abs(bal)))
                 pnl_dr += abs(bal)
+            else:
+                if "BANK" not in acc.upper():
+                    print(f"[AGENT-4][PNL-FILTER] Categorization gap: {acc} (cat={cat}) -> not in Income or Expense.")
 
         net_profit = pnl_cr - pnl_dr
         if net_profit > 0:
@@ -993,8 +1263,9 @@ class AccountingService:
             pnl_cr_rows.append(("By Net Loss (c/d)", abs(net_profit)))
             pnl_cr += abs(net_profit)
 
-        if not pnl_dr_rows and not pnl_cr_rows:
-            pass  # No P&L data — card will simply not appear
+        if not pnl_dr_rows and not pnl_cr_rows or (pnl_dr == 0 and pnl_cr == 0):
+            print("[AGENT-4] P&L Empty - No Income/Expense accounts found.")
+            pass
         else:
             pnl_table_rows: List[List] = []
             for i in range(max(len(pnl_dr_rows), len(pnl_cr_rows))):
@@ -1012,6 +1283,13 @@ class AccountingService:
             })
             result_label = f"Net Profit: \u20b9{net_profit:,.2f}" if net_profit > 0 else f"Net Loss: \u20b9{abs(net_profit):,.2f}"
             print(f"[AGENT-4] P&L done \u2192 Income: \u20b9{pnl_cr:,.2f} | Expense: \u20b9{pnl_dr - (net_profit if net_profit > 0 else 0):,.2f} | {result_label}")
+            
+            # --- INCREMENTAL STREAMING: Yield P&L as soon as ready ---
+            if 'profit_loss' in _show_tables:
+                yield {
+                    "structured_tables": [t for t in local_structured_tables if t.get('type') == 'profit_loss'],
+                    "all_tables": local_structured_tables
+                }
 
         # ===================================================================
         # AGENT 5: BALANCE SHEET AGENT (Pure Math — no LLM)
@@ -1061,9 +1339,23 @@ class AccountingService:
             "rows": bs_table_rows
         })
         print(f"[AGENT-5] Balance Sheet done → Assets: ₹{asset_total:,.2f} | Liabilities+Equity: ₹{liab_total:,.2f}")
+        
+        # --- INCREMENTAL STREAMING: Yield Balance Sheet as soon as ready ---
+        if 'balance_sheet' in _show_tables:
+            yield {
+                "structured_tables": [t for t in local_structured_tables if t.get('type') in ['profit_loss', 'balance_sheet']],
+                "all_tables": local_structured_tables
+            }
 
-        # Filter local_structured_tables to only expose what the user asked for
-        requested_tables = [t for t in local_structured_tables if t.get('type') in _show_tables]
+        # --- AGENT-SPECIFIC TABLE FILTERING ---
+        # Exclude 'generic' (Financial Report) tables if they weren't explicitly requested.
+        # This keeps the UI clean and only shows structured accounting cards.
+        allowed_types = _show_tables.copy()
+        if 'generic' not in allowed_types:
+            # We only show 'generic' if specifically mentioned like "show reasoning table"
+            pass 
+
+        requested_tables = [t for t in local_structured_tables if t.get('type') in allowed_types]
         print(f"[INTENT] Exposing {len(requested_tables)} table(s): {[t.get('type') for t in requested_tables]}")
 
         # Yield structured tables directly over the stream.
@@ -1163,4 +1455,3 @@ class AccountingService:
                 "rows": body
             })
         return tables
-

@@ -151,68 +151,60 @@ async def login(credentials: UserLogin):
             
         print(f"[DEBUG] Login successful for {response.user.email}")
 
-        # Try to get company_id and company_name from user_metadata first
+        # Try to get company_id, company_name, first_name, last_name from user_metadata first
         company_id = None
         company_name = None
+        first_name = None
+        last_name = None
+
         if hasattr(response.user, 'user_metadata') and response.user.user_metadata:
             company_id = response.user.user_metadata.get("company_id")
+            first_name = response.user.user_metadata.get("first_name")
+            last_name = response.user.user_metadata.get("last_name")
         
-        # Fallback/Refresh: Check company table
-        if company_id:
-            try:
-                comp_res = supabase_admin.table("company") \
-                    .select("name") \
-                    .eq("id", company_id) \
-                    .single() \
-                    .execute()
-                if comp_res.data:
-                    company_name = comp_res.data.get("name")
-            except Exception as e:
-                print(f"[WARNING] Could not fetch company name: {str(e)}")
-
-        # If still missing info, check profiles (legacy fallback)
-        if not company_id or not company_name:
-            try:
-                profile_res = supabase_admin.table("profiles") \
-                    .select("company_id") \
-                    .eq("id", response.user.id) \
-                    .execute()
-                
-                if profile_res.data and len(profile_res.data) > 0:
-                    profile = profile_res.data[0]
-                    company_id = company_id or profile.get("company_id")
-                    # company_name will be fetched from company table below or is already None
-                else:
-                    # Create default company and profile if nothing exists
-                    company_id = company_id or f"company-{response.user.id[:8]}"
-                    company_name = company_name or "My Company"
-                    
-                    # 1. UPSERT Company
-                    supabase_admin.table("company").upsert({
-                        "id": company_id,
-                        "name": company_name
-                    }).execute()
-
-                    # 2. UPSERT Profile
-                    supabase_admin.table("profiles").upsert({
-                        "id": response.user.id,
-                        "email": response.user.email,
-                        "company_id": company_id,
-                        "first_name": response.user.email.split("@")[0],
-                        "last_name": "",
-                        "role": "admin"
-                    }).execute()
-            except Exception as profile_e:
-                print(f"[WARNING] Profile/Company sync failed: {str(profile_e)}")
+        # Fallback/Refresh: Check company and profile tables
+        try:
+            profile_res = supabase_admin.table("profiles") \
+                .select("company_id, first_name, last_name, company(name)") \
+                .eq("id", response.user.id) \
+                .single() \
+                .execute()
             
-            # Final check: If we have company_id but still no name, try fetching from company table
-            if company_id and not company_name:
-                try:
-                    c_res = supabase_admin.table("company").select("name").eq("id", company_id).single().execute()
-                    if c_res.data:
-                        company_name = c_res.data.get("name")
-                except:
-                    pass
+            if profile_res.data:
+                profile = profile_res.data
+                company_id = company_id or profile.get("company_id")
+                first_name = first_name or profile.get("first_name")
+                last_name = last_name or profile.get("last_name")
+                company_name = company_name or (profile.get("company", {}).get("name") if profile.get("company") else None)
+        except Exception as profile_e:
+            print(f"[WARNING] Profile/Company fetch failed: {str(profile_e)}")
+
+        # Legacy fallback/creation logic if profile doesn't exist
+        if not company_id:
+            try:
+                # Create default company and profile if nothing exists
+                company_id = company_id or f"company-{response.user.id[:8]}"
+                company_name = company_name or "My Company"
+                first_name = first_name or response.user.email.split("@")[0]
+                last_name = last_name or ""
+                
+                # 1. UPSERT Company
+                supabase_admin.table("company").upsert({
+                    "id": company_id,
+                    "name": company_name
+                }).execute()
+
+                # 2. UPSERT Profile
+                supabase_admin.table("profiles").upsert({
+                    "id": response.user.id,
+                    "email": response.user.email,
+                    "company_id": company_id,
+                    "first_name": first_name,
+                    "last_name": last_name,
+                    "role": "admin"
+                }).execute()
+            except Exception as create_e:
+                print(f"[ERROR] Failed to create fallback profile: {str(create_e)}")
 
         if not company_id:
             raise HTTPException(
@@ -248,6 +240,8 @@ async def login(credentials: UserLogin):
             email=str(response.user.email),
             company_id=str(company_id),
             company_name=str(company_name) if company_name else None,
+            first_name=first_name,
+            last_name=last_name,
             role=role,
             permissions=permissions
         )
@@ -268,16 +262,20 @@ async def get_me(user=Depends(get_current_user)):
     # Fetch profile and company info
     # Joining with company table for the name
     profile_res = supabase_admin.table("profiles") \
-        .select("company_id, company(name)") \
+        .select("company_id, first_name, last_name, company(name)") \
         .eq("id", user.id) \
         .single() \
         .execute()
     
     company_id = None
     company_name = None
+    first_name = None
+    last_name = None
 
     if profile_res.data:
         company_id = profile_res.data.get("company_id")
+        first_name = profile_res.data.get("first_name")
+        last_name = profile_res.data.get("last_name")
         # Prefer name from company table
         company_name = profile_res.data.get("company", {}).get("name") if profile_res.data.get("company") else None
 
@@ -298,6 +296,8 @@ async def get_me(user=Depends(get_current_user)):
         "email": user.email,
         "companyId": company_id,
         "companyName": company_name,
+        "firstName": first_name,
+        "lastName": last_name,
         "lastSignIn": user.last_sign_in_at,
         "role": role,
         "permissions": permissions
@@ -351,29 +351,28 @@ async def refresh_token(data: TokenRefreshRequest):
         # Get company info from metadata or tables
         company_id = None
         company_name = None
+        first_name = None
+        last_name = None
+
         if hasattr(response.user, 'user_metadata') and response.user.user_metadata:
             company_id = response.user.user_metadata.get("company_id")
+            first_name = response.user.user_metadata.get("first_name")
+            last_name = response.user.user_metadata.get("last_name")
         
-        if company_id:
-            try:
-                comp_res = supabase_admin.table("company").select("name").eq("id", company_id).single().execute()
-                if comp_res.data:
-                    company_name = comp_res.data.get("name")
-            except:
-                pass
-
-        if not company_id or not company_name:
-            try:
-                profile_res = supabase_admin.table("profiles") \
-                    .select("company_id, company(name)") \
-                    .eq("id", response.user.id) \
-                    .execute()
-                if profile_res.data:
-                    profile = profile_res.data[0]
-                    company_id = company_id or profile.get("company_id")
-                    company_name = company_name or (profile.get("company", {}).get("name") if profile.get("company") else None)
-            except Exception as e:
-                print(f"[AUTH] Failed to fetch company_info in refresh: {str(e)}")
+        try:
+            profile_res = supabase_admin.table("profiles") \
+                .select("company_id, first_name, last_name, company(name)") \
+                .eq("id", response.user.id) \
+                .single() \
+                .execute()
+            if profile_res.data:
+                profile = profile_res.data
+                company_id = company_id or profile.get("company_id")
+                first_name = first_name or profile.get("first_name")
+                last_name = last_name or profile.get("last_name")
+                company_name = company_name or (profile.get("company", {}).get("name") if profile.get("company") else None)
+        except Exception as e:
+            print(f"[AUTH] Failed to fetch company_info in refresh: {str(e)}")
  
         # Fetch role
         role = "user"
@@ -392,6 +391,8 @@ async def refresh_token(data: TokenRefreshRequest):
             email=str(response.user.email),
             company_id=str(company_id) if company_id else "",
             company_name=str(company_name) if company_name else None,
+            first_name=first_name,
+            last_name=last_name,
             role=role
         )
     except Exception as e:

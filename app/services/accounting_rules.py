@@ -181,7 +181,7 @@ PNL_RULES = {
         "Current Assets", "Current Liabilities", "Equity",
         # Specific exclusions that must NEVER appear in P&L
         "Opening Balance", "Capital", "Drawings", "Loan", "GST",
-        "Suspense",
+        "Suspense", "BANK", "CASH",
     ],
     "formula": "Net Profit = Total Income - Total Expense",
     "if_negative": "Net Loss",
@@ -352,7 +352,7 @@ ROLE: Translate user natural language requests into structured execution plans.
   },
   "math_updates": [
     { "index": 0, "field": "debit" | "credit" | "date", "new_value": "..." }
-  ]
+   ]
 }
 
 ━━━ RULE 4: BULK VS SPECIFIC ━━━
