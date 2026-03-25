@@ -20,23 +20,18 @@ async def submit_feedback(
     This stores the correction in the vector database so the agent can learn from it next time.
     """
     try:
-        # Step 0: Get user's verified company_id from profile
+
         profile_res = supabase.table("profiles").select("company_id").eq("id", user.id).single().execute()
         company_id = profile_res.data["company_id"]
-        
+
         print(f"[INFO] Receiving feedback from user {user.id} for company {company_id} (requested: {feedback.company_id})")
-        
-        # 1. Create a "Rule" string that the AI can understand
-        # Format: "When queried about '{original_query}', the user corrected the response '{ai_response}' with '{user_correction}'. Explanation: {explanation}"
+
         rule_text = f"USER CORRECTION: When asked '{feedback.original_query}', the correct validation/category is '{feedback.user_correction}'."
         if feedback.explanation:
             rule_text += f" Reason: {feedback.explanation}"
-            
-        # 2. Generate embedding for the ORIGINAL QUERY
-        # We want to retrieve this rule when a SIMILAR query is asked in the future.
+
         embedding = embedding_service.generate_embedding(feedback.original_query)
-        
-        # 3. Store in Vector Store
+
         metadata = {
             "company_id": company_id,
             "user_id": str(user.id),
@@ -44,39 +39,37 @@ async def submit_feedback(
             "type": "correction",
             "original_query": feedback.original_query
         }
-        
+
         vector_store.add_feedback(
             text=rule_text,
             embedding=embedding,
             metadata=metadata
         )
-        
-        # 4. Also save to structured accounting_rules table if it's tied to a customer
+
         if feedback.customer_id:
             try:
-                # Fetch business_type to associate with rule
+
                 cust_res = supabase.table("customers").select("business_type").eq("id", feedback.customer_id).single().execute()
                 business_type = cust_res.data.get("business_type") if cust_res.data else None
-                
+
                 rule_record = {
                     "customer_id": feedback.customer_id,
                     "business_type": business_type,
                     "rule_description": rule_text
                 }
-                
-                # Only add company_id if it's a valid UUID to avoid DB type errors
+
                 try:
                     uuid.UUID(str(company_id))
                     rule_record["company_id"] = company_id
                 except ValueError:
-                    # company_id is a custom string (e.g. comp-xxxx), skip for this table
+
                     pass
 
                 supabase.table("accounting_rules").insert(rule_record).execute()
                 print(f"[INFO] Saved custom rule to database for customer {feedback.customer_id}")
             except Exception as e:
                 print(f"[WARNING] Failed to save rule to accounting_rules table: {e}")
-        
+
         return FeedbackResponse(
             id=uuid.uuid4(),
             original_query=feedback.original_query,
@@ -99,17 +92,17 @@ async def clear_feedback(user=Depends(get_current_user)):
     This effectively resets the AI's "learning" for this company.
     """
     try:
-        # Step 0: Get user's verified company_id
+
         profile_res = supabase.table("profiles").select("company_id").eq("id", user.id).single().execute()
         company_id = profile_res.data["company_id"]
-        
+
         success = vector_store.clear_company_feedback(company_id)
-        
+
         if success:
             return {"message": "All feedback cleared successfully. AI memory reset for this company."}
         else:
             raise HTTPException(status_code=500, detail="Failed to clear feedback")
-            
+
     except Exception as e:
         print(f"[ERROR] Failed to clear feedback: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))

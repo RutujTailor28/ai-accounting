@@ -14,9 +14,6 @@ AGENTS:
   6. TALLY_RULES             — final audit / validation (deterministic)
 """
 
-# =============================================================================
-# AGENT 1 — EXTRACTION AGENT RULES
-# =============================================================================
 EXTRACTOR_RULES = """
 ### AGENT 1 — EXTRACTION RULES (MANDATORY)
 
@@ -70,9 +67,6 @@ ROLE: Convert raw bank statement text into clean structured transactions.
 }
 """
 
-# =============================================================================
-# AGENT 2 — CLASSIFICATION AGENT RULES
-# =============================================================================
 CLASSIFIER_RULES = """
 ### AGENT 2 — CLASSIFICATION RULES (MANDATORY)
 
@@ -129,20 +123,14 @@ Narration: "CASH WITHDRAWAL / ATM" [DEBIT ₹5,000]
 Result: {"debit_account": "Cash in Hand", "credit_account": "Bank Account", "category": "Current Assets"}
 """
 
-# =============================================================================
-# AGENT 3 — JOURNAL AGENT RULES  (enforced in code, not via LLM)
-# =============================================================================
 JOURNAL_RULES = {
-    "must_balance": True,           # Total Debit MUST equal Total Credit
-    "exactly_two_entries": False,   # Allow compound entries (multi-line debits/credits)
-    "update_ledger": True,          # Every valid entry updates the Ledger Store
-    "skip_on_imbalance": True,      # Skip transaction if Dr ≠ Cr (log warning)
-    "modify_classification": False, # Journal Agent NEVER changes account names/categories
+    "must_balance": True,
+    "exactly_two_entries": False,
+    "update_ledger": True,
+    "skip_on_imbalance": True,
+    "modify_classification": False,
     "ledger_structure": {
-        # Ledger Store format: account → {debit: float, credit: float}
-        # Debit  always += for debit entries
-        # Credit always += for credit entries
-        # Net balance = debit - credit
+
     },
     "entry_format": [
         {"account": "Account Name", "debit": 0.0, "credit": 0.0}
@@ -172,20 +160,17 @@ LEDGER STRUCTURE:
   }
 """
 
-# =============================================================================
-# AGENT 4 — PROFIT & LOSS AGENT RULES  (pure math, no LLM)
-# =============================================================================
 PNL_RULES = {
     "include_types": ["Direct Income", "Indirect Income", "Direct Expense", "Indirect Expense"],
     "exclude_types": [
         "Current Assets", "Current Liabilities", "Equity",
-        # Specific exclusions that must NEVER appear in P&L
+
         "Opening Balance", "Capital", "Drawings", "Loan", "GST",
         "Suspense", "BANK", "CASH",
     ],
     "formula": "Net Profit = Total Income - Total Expense",
     "if_negative": "Net Loss",
-    "use_llm": False,  # NEVER use LLM for P&L calculation
+    "use_llm": False,
 }
 
 PNL_RULES_TEXT = """
@@ -214,9 +199,6 @@ FORMULA:
 RULE: NEVER use an LLM for this calculation. Pure arithmetic only.
 """
 
-# =============================================================================
-# AGENT 5 — BALANCE SHEET AGENT RULES  (pure math, no LLM)
-# =============================================================================
 BALANCE_SHEET_RULES = {
     "assets": [
         "Bank Account", "Cash", "Receivables", "Advances",
@@ -230,7 +212,7 @@ BALANCE_SHEET_RULES = {
         "Less: Net Loss", "Less: Drawings",
     ],
     "equation": "Assets = Liabilities + Equity",
-    "net_profit_injection": True,   # Net Profit from Agent 4 is injected into Equity
+    "net_profit_injection": True,
     "use_llm": False,
 }
 
@@ -263,14 +245,11 @@ MUST SATISFY:
 RULE: NEVER use an LLM for this calculation. Pure arithmetic only.
 """
 
-# =============================================================================
-# AGENT 6 — TALLY / AUDITOR AGENT RULES  (pure math)
-# =============================================================================
 TALLY_RULES = {
     "bank_reconciliation": True,
     "balance_sheet_check": True,
     "trial_balance_check": True,
-    "auto_capital_adjustment": True,  # Add Capital Adjustment if BS doesn't balance
+    "auto_capital_adjustment": True,
 }
 
 TALLY_RULES_TEXT = """
@@ -304,9 +283,6 @@ ROLE: Final validation of all financial statements.
       Suspense Cr  (if Debits > Credits)
 """
 
-# =============================================================================
-# COMBINED RULE SUMMARY (for logging / debugging)
-# =============================================================================
 ALL_AGENT_RULES = {
     "agent_1_extractor":    EXTRACTOR_RULES,
     "agent_2_classifier":   CLASSIFIER_RULES,
@@ -316,9 +292,6 @@ ALL_AGENT_RULES = {
     "agent_6_tally":        TALLY_RULES_TEXT,
 }
 
-# =============================================================================
-# AGENT 7 — REFINEMENT LOGIC AGENT RULES (LLM -> Python Code)
-# =============================================================================
 REFINEMENT_RULES = """
 ### AGENT 7 — REFINEMENT ORCHESTRATOR (STRICT)
 
@@ -362,15 +335,11 @@ ROLE: Translate user natural language requests into structured execution plans.
 Available Categories: Direct Income, Indirect Income, Direct Expense, Indirect Expense, Current Assets, Current Liabilities, Equity, Fixed Assets.
 """
 
-# Deterministic rule dicts (used directly in Python code)
 JOURNAL_CONFIG      = JOURNAL_RULES
 PNL_CONFIG          = PNL_RULES
 BALANCE_SHEET_CONFIG = BALANCE_SHEET_RULES
 TALLY_CONFIG        = TALLY_RULES
 
-# =============================================================================
-# AGENT SYSTEM PROMPTS — concise identity block injected into each agent
-# =============================================================================
 AGENT_SYSTEM_PROMPTS = {
     "extractor": """\
 You are Agent 1 — the EXTRACTION AGENT.

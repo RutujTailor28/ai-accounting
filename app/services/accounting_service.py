@@ -15,7 +15,7 @@ from app.services.accounting_rules import (
 
 class AccountingService:
     """Specialized service for accounting report generation (Journal Entries, Balance Sheets)."""
-    
+
     def __init__(self, model_name: str = None):
         """Initialize with a more capable model for financial synthesis."""
         model = model_name or settings.openrouter_model_accounting
@@ -23,36 +23,32 @@ class AccountingService:
             model=model,
             openai_api_key=settings.openrouter_api_key,
             openai_api_base=settings.openrouter_base_url,
-            temperature=0, # Strict for financial data
+            temperature=0,
             streaming=True
         )
-        self.ai_service = LLMService() # Reuse AI service for extraction helpers
-        self.shared_accounts = set() # Track account names across batches for consistency
-        self.extraction_cache: Dict[str, List[Dict]] = {} # Cache: content_hash -> extracted transactions
-        self.classification_cache: Dict[str, List[Dict]] = {} # Cache: batch_hash -> classification results
-        
-        # --- SMART CONCURRENCY DETECTION ---
-        # User requested 10 workers maximum. 
-        # We still auto-throttle for ":free" models to avoid 429s.
+        self.ai_service = LLMService()
+        self.shared_accounts = set()
+        self.extraction_cache: Dict[str, List[Dict]] = {}
+        self.classification_cache: Dict[str, List[Dict]] = {}
+
         self.model_name = model.lower()
         self.is_free_model = ":free" in self.model_name
-        
-        # Unified high-performance settings for all models 
+
         self.n_extractors = 10
-        self.n_classifiers = 10           # Throttled to 10 for reliability + rate-limit safety (especially for :free models)
-        self.worker_delay = 0.2           # Balanced delay
+        self.n_classifiers = 10
+        self.worker_delay = 0.2
         print(f"[INFO] AccountingService initialized with {self.n_extractors} extractors, {self.n_classifiers} classifiers.")
-            
+
         print(f"[INFO] AccountingService initialized with model={model}")
-    
+
     async def _get_base_doc_name(self, filename: str) -> str:
         """Strip extension and then duplicates like (1) or copy."""
         import re
         if not filename:
              return ""
-        # Remove extension FIRST
+
         base = re.sub(r'\.\w+$', '', filename)
-        # THEN remove common "duplicate" suffixes
+
         base = re.sub(r'\s*\(\d+\)$', '', base, flags=re.IGNORECASE)
         base = re.sub(r'\s+copy$', '', base, flags=re.IGNORECASE)
         return base.strip().lower()
@@ -80,7 +76,7 @@ class AccountingService:
         }}
         """
         try:
-            # Wrap in retry_with_backoff to handle transient provider errors
+
             res = await retry_with_backoff(self.llm.ainvoke, prompt)
             data = self.ai_service._extract_json(res.content)
             print(f"[INFO] Intent Discovery: query='{question[:50]}...' -> intent={data.get('intent')}")
@@ -97,7 +93,7 @@ class AccountingService:
         import re
         if not narration:
             return ""
-        # Remove special characters and extra whitespace, then lowercase
+
         normalized = re.sub(r'[^a-zA-Z0-9]', '', narration).lower()
         return normalized
 
@@ -107,11 +103,11 @@ class AccountingService:
         Generates everything internally but only shows the asked-for cards.
         """
         import re
-        # Normalize: collapse "p & l" → "p&l", "p & l statement" → "p&l", etc.
+
         q = question.lower()
-        q = re.sub(r'p\s*&\s*l', 'p&l', q)  # "p & l" → "p&l"
-        q = re.sub(r'p\s+and\s+l\b', 'p&l', q)  # "p and l" → "p&l"
-        
+        q = re.sub(r'p\s*&\s*l', 'p&l', q)
+        q = re.sub(r'p\s+and\s+l\b', 'p&l', q)
+
         q_words = re.sub(r'[^a-z0-9]', ' ', q).split()
 
         wants_bs  = any(kw in q for kw in [
@@ -128,13 +124,13 @@ class AccountingService:
             return {'balance_sheet'}
         if wants_pnl:
             return {'profit_loss'}
-        # Default: show all financial statements (no journal)
+
         return {'profit_loss', 'balance_sheet'}
 
     async def _extract_transactions_from_batch(
-        self, 
-        context: Union[str, List[str]], 
-        context_query: str = None, 
+        self,
+        context: Union[str, List[str]],
+        context_query: str = None,
         company_id: str = None,
         feedback_context: str = ""
     ) -> List[Dict]:
@@ -145,14 +141,13 @@ class AccountingService:
         """
         if isinstance(context, list):
             context = "\n---\n".join(context)
-            
+
         content_hash = hashlib.sha256(context.encode()).hexdigest()
-        
-        # Check cache
+
         if content_hash in self.extraction_cache:
             print(f"[CACHE HIT] Reusing cached extraction for batch (hash: {content_hash[:8]}...)")
             return self.extraction_cache[content_hash]
-        
+
         query_instruction = ""
         if context_query:
             query_instruction = f"""
@@ -162,9 +157,6 @@ class AccountingService:
         - Only filter if user explicitly asked for a specific type (e.g., "only cash").
         """
 
-        # ── SINGLE PASS: Count + Extract in ONE LLM call ──────────────────
-        # Returns both row_count_detected (for verification) and transactions[] in one response.
-        # This halves LLM calls per batch vs the previous two-step approach.
         prompt = f"""
         {AGENT_SYSTEM_PROMPTS['extractor']}
 
@@ -223,7 +215,6 @@ class AccountingService:
                 stated_count = int(stated_count)
                 print(f"[AGENT-1][EXTRACT] Got {extracted_count} / {stated_count} rows")
 
-                # ── Auto-retry if mismatch (only 1 extra call, not 2) ──────
                 if extracted_count != stated_count:
                     diff = abs(stated_count - extracted_count)
                     direction = "missing" if stated_count > extracted_count else "extra"
@@ -238,12 +229,11 @@ Go line-by-line. Find and include every skipped row. Output full JSON again. ━
                             print(f"[AGENT-1][RETRY] Improved: {extracted_count} → {len(retried)} (target={stated_count})")
                             transactions = retried
                         else:
-                            # Merge — pipeline dedup will clean up any cross-batch dupes
+
                             transactions = transactions + retried
             else:
                 print(f"[AGENT-1][EXTRACT] Got {extracted_count} transactions (no count target)")
 
-            # Cache only when count matches or no target
             if transactions:
                 if stated_count is None or len(transactions) == stated_count:
                     self.extraction_cache[content_hash] = transactions
@@ -258,7 +248,6 @@ Go line-by-line. Find and include every skipped row. Output full JSON again. ━
             print(f"[AGENT-1][ERROR] Fatal extraction error: {e}")
             return []
 
-
     async def _get_broad_type(self, acc_name: str, cat_name: str, balance: float) -> str:
         """Helper to categorize account nature based on AI category and balance sign."""
         cat_upper = cat_name.upper()
@@ -266,9 +255,8 @@ Go line-by-line. Find and include every skipped row. Output full JSON again. ━
         if "EXPENSE" in cat_upper: return "EXPENSE"
         if "ASSET" in cat_upper: return "ASSET"
         if "LIABIL" in cat_upper or "EQUITY" in cat_upper: return "LIABILITY"
-        
-        # Fallback based on sign (Dr=Asset/Exp, Cr=Liab/Inc)
-        if balance > 0: return "ASSET_OR_EXP" 
+
+        if balance > 0: return "ASSET_OR_EXP"
         return "LIAB_OR_INC"
 
     async def stream_accounting_synthesis(
@@ -289,15 +277,14 @@ Go line-by-line. Find and include every skipped row. Output full JSON again. ━
           -> Agent 4: P&L (pure math) + Agent 5: Balance Sheet (pure math)
           -> Tally Agent (audit/verify)
         """
-        
-        # --- DYNAMIC RULES FETCHING ---
+
         dynamic_business_rules = ""
         business_type = None
         if customer_id:
             print(f"[RULES] Fetching dynamic rules for customer_id: {customer_id}")
             try:
                 from app.core.supabase import supabase_admin
-                # Get business type
+
                 cust_res = supabase_admin.table("customers").select("business_type, name").eq("id", customer_id).single().execute()
                 if cust_res.data and cust_res.data.get("business_type"):
                     business_type = cust_res.data.get("business_type")
@@ -315,7 +302,7 @@ Go line-by-line. Find and include every skipped row. Output full JSON again. ━
                     print(f"[RULES] Successfully fetched {len(rules_res.data)} custom accounting rules.")
                     for r in rules_res.data:
                         rule_text = r['rule_description']
-                        # Remove "USER COMMAND:" prefix if it exists for cleaner injection
+
                         clean_rule = rule_text.replace("USER COMMAND: ", "")
                         dynamic_business_rules += f"- {clean_rule}\n"
                         print(f"[RULES] -> Applied Rule: {clean_rule}")
@@ -325,11 +312,10 @@ Go line-by-line. Find and include every skipped row. Output full JSON again. ━
             except Exception as e:
                 print(f"[RULES] Failed to fetch dynamic accounting rules: {e}")
 
-        # --- REFINEMENT MODE (ITERATION) ---
         if previous_context or feedback_history:
             yield {"status": "Refining report with new user instruction..."}
             print(f"[REFINEMENT] Injecting user feedback as dynamic rule: {question}")
-            # Add the user's specific refinement instruction as a CRITICAL rule
+
             ctx_text = f"\nPREVIOUS CONTEXT:\n{feedback_history}" if feedback_history else ""
             dynamic_business_rules += f"""
             ━━━ CRITICAL COMMAND: USER AD-HOC REFINEMENT (ABSOLUTE PRIORITY) ━━━
@@ -339,28 +325,17 @@ Go line-by-line. Find and include every skipped row. Output full JSON again. ━
             - IF THIS RULE SPECIFIES AN ACCOUNT OR CATEGORY FOR A CERTAIN RANGE/KEYWORD, APPLY IT STRICTLY.
             ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             """
-            # We don't return here anymore; we let the pipeline re-run with this new rule.
 
-        # =====================================================================
-        # --- STANDARD GENERATION MODE  (5-Agent Pipeline) ---
-        # =====================================================================
-
-        # Local structured tables track instead of singleton variables
         local_structured_tables = []
-        
-        # --- AGENT 0: INTENT DISCOVERY ---
+
         intent_data = await self._discover_intent(question)
         intent = intent_data.get('intent', 'EXTRACTION')
-        
-        # STRICTOR FILTERING: Use the helper to determine which tables to actually SHOW in the UI cards.
-        # This prevents redundant "Financial Report" or "Balance Sheet" cards if only P&L was asked for.
+
         _show_tables = self._detect_requested_tables(question)
-        
-        # If intent is refinement/analysis, always show what was asked. 
-        # If extraction and no specific mention, default to P&L + BS.
+
         if not _show_tables:
             _show_tables = set(intent_data.get('report_types', ['profit_loss', 'balance_sheet']))
-            
+
         print(f"[INTENT] User asked for: {_show_tables} | ID Intent: {intent}")
 
         if not context_chunks and not input_transactions:
@@ -369,7 +344,6 @@ Go line-by-line. Find and include every skipped row. Output full JSON again. ━
 
         yield {"status": f"Agent 0 (Guard): input validated. Starting pipeline..."}
 
-        # --- PRE-FETCH ANALYTICS FEEDBACK (Learning Agent) ---
         feedback_context = ""
         if company_id:
             try:
@@ -385,30 +359,25 @@ Go line-by-line. Find and include every skipped row. Output full JSON again. ━
                 print(f"[WARNING] Pre-fetch Feedback failed: {e}")
 
         all_transactions: List[Dict] = []
-        
-        # Determine Routing: If it's a REFINEMENT intent AND we have data, use Agent 7.
+
         is_refinement = (intent == "REFINEMENT" or intent == "ANALYSIS") and input_transactions is not None
-        
+
         if is_refinement:
             print(f"[AGENT-7] REFINEMENT MODE: LLM Universal Mutation Engine triggered for {len(input_transactions)} transactions.")
-            
-            # --- CALCULATE CURRENT LEDGER TOTALS FOR LLM CONTEXT ---
-            # Unify keywords with Agent 4 (P&L) for mathematical precision
+
             pnl_inc_kws = ["INCOME", "SALES", "REVENUE", "DIRECT INCOME"]
             pnl_exp_kws = ["EXPENSE", "DIRECT EXPENSE", "CHGS", "FEE", "TAX", "PURCHASE", "COST"]
-            
-            cur_income = sum(float(e.get('amount', 0)) for t in input_transactions for e in t.get('entries', []) 
+
+            cur_income = sum(float(e.get('amount', 0)) for t in input_transactions for e in t.get('entries', [])
                             if any(k in str(e.get('category', '')).upper() for k in pnl_inc_kws))
-            cur_expense = sum(float(e.get('amount', 0)) for t in input_transactions for e in t.get('entries', []) 
+            cur_expense = sum(float(e.get('amount', 0)) for t in input_transactions for e in t.get('entries', [])
                              if any(k in str(e.get('category', '')).upper() for k in pnl_exp_kws))
             cur_profit = cur_income - cur_expense
-            
+
             yield {"status": f"Agent 7 (Universal): Calculating adjustments (Current Profit: \u20b9{cur_profit:,.2f})..."}
             from datetime import date as _date_today
             today_str = _date_today.today().strftime("%d/%m/%Y")
 
-
-            # Build numbered transaction list for LLM context (first 100)
             txn_sample_text = ""
             for i, t in enumerate(input_transactions[:100]):
                 amt = float(t.get('debit', 0) or t.get('credit', 0) or 0)
@@ -432,7 +401,6 @@ CURRENT FINANCIAL STATE:
 
 SAMPLE TRANSACTIONS (first 100 shown by index):
 {txn_sample_text}
-
 
 \u2501\u2501\u2501 YOUR TASK \u2501\u2501\u2501
 Analyze the user command and return a JSON object with a list of "mutations".
@@ -499,12 +467,10 @@ MUTATION TYPES AND WHEN TO USE THEM:
 - If DELTA is Positive (Target > Current): Add an INCOME entry of DELTA to increase profit.
 - Account naming: Use "Profit Adjustment Entry" or "Ad-hoc Expense" for these balancing entries.
 
-
 \u2501\u2501\u2501 IMPORTANT RULES \u2501\u2501\u2501
 - AMOUNT INTEGRITY: In a RECLASSIFY, you MUST NOT change the amount of any transaction. Only change its account/category.
 - AD-HOC ENTRIES: If the user says "I want X as profit" or "add Y amount", ALWAYS use ADD_ENTRY with the Delta or specific amount.
 - CATEGORY MATCHING: Use "Income" for all revenue types and "Expense" for all cost types to ensure they sync with the P&L calculator.
-
 
 DOUBLE-ENTRY ACCOUNTING RULES (always follow):
 - Money IN (income, loans, capital received): DEBIT Bank/Cash \u2192 CREDIT Income/Liability/Capital
@@ -547,13 +513,10 @@ OUTPUT FORMAT (JSON only, no explanation outside JSON):
             mutations = mutation_plan.get("mutations", [])
             new_entries_to_add = []
             modified_count = 0
-            
-            # --- UNIVERSAL MUTATION EXECUTOR ---
-            # Python applies each mutation generically. LLM handles all accounting intelligence.
+
             for mut in mutations:
                 mtype = mut.get("type", "").upper()
 
-                # ── ADD_ENTRY ────────────────────────────────────────────────────
                 if mtype == "ADD_ENTRY":
                     amt = float(mut.get("amount", 0))
                     if amt <= 0:
@@ -580,7 +543,6 @@ OUTPUT FORMAT (JSON only, no explanation outside JSON):
                     modified_count += 1
                     print(f"[AGENT-7][UNIVERSAL] ADD_ENTRY: {narr} | Dr:{dr_acc} Cr:{cr_acc} ₹{amt:,.2f}")
 
-                # ── RECLASSIFY ───────────────────────────────────────────────────
                 elif mtype == "RECLASSIFY":
                     mc = mut.get("matching_criteria", {})
                     new_dr  = str(mut.get("new_debit_account", "")).strip().title()
@@ -588,22 +550,20 @@ OUTPUT FORMAT (JSON only, no explanation outside JSON):
                     new_cat = str(mut.get("new_category", "Expense")).strip()
                     reclassified = 0
                     for t in input_transactions:
-                        # Extract the ORIGINAL amount strictly to prevent accidental changes
-                        # Priority: entries[0].amount > debit > credit
+
                         orig_amt = 0.0
                         if t.get('entries'):
                             orig_amt = float(t['entries'][0].get('amount', 0))
                         else:
                             orig_amt = float(t.get('debit', 0) or t.get('credit', 0) or 0)
-                        
+
                         t_type = "DEBIT" if float(t.get('debit', 0)) > 0 else "CREDIT"
                         if mc.get('type') and mc['type'].upper() != t_type: continue
                         if mc.get('min_amount') is not None and orig_amt < float(mc['min_amount']): continue
                         if mc.get('max_amount') is not None and orig_amt > float(mc['max_amount']): continue
                         narr_kw = str(mc.get('narration_contains', '')).lower()
                         if narr_kw and narr_kw not in str(t.get('narration', '')).lower(): continue
-                        
-                        # Apply new classification WHILE PRESERVING ORIGINAL AMOUNT
+
                         t['entries'] = [
                             {"account": new_dr, "type": "DEBIT", "amount": orig_amt,
                              "category": "Current Assets" if any(k in new_dr.upper() for k in ["BANK","CASH"]) else new_cat},
@@ -614,7 +574,6 @@ OUTPUT FORMAT (JSON only, no explanation outside JSON):
                     modified_count += reclassified
                     print(f"[AGENT-7][UNIVERSAL] RECLASSIFY: {reclassified} transactions (amount preserved) → Dr:{new_dr} Cr:{new_cr}")
 
-                # ── MODIFY ───────────────────────────────────────────────────────
                 elif mtype == "MODIFY":
                     idx    = mut.get("index")
                     fields = mut.get("fields", {})
@@ -629,7 +588,6 @@ OUTPUT FORMAT (JSON only, no explanation outside JSON):
                         modified_count += 1
                         print(f"[AGENT-7][UNIVERSAL] MODIFY: txn[{idx}] updated fields={list(fields.keys())}")
 
-                # ── DELETE ───────────────────────────────────────────────────────
                 elif mtype == "DELETE":
                     mc  = mut.get("matching_criteria", {})
                     idx = mc.get("index")
@@ -649,7 +607,6 @@ OUTPUT FORMAT (JSON only, no explanation outside JSON):
                     modified_count += deleted
                     print(f"[AGENT-7][UNIVERSAL] DELETE: {deleted} transactions marked for removal")
 
-                # ── SPLIT ────────────────────────────────────────────────────────
                 elif mtype == "SPLIT":
                     mc     = mut.get("matching_criteria", {})
                     splits = mut.get("splits", [])
@@ -678,78 +635,71 @@ OUTPUT FORMAT (JSON only, no explanation outside JSON):
                             })
                         modified_count += 1
                         print(f"[AGENT-7][UNIVERSAL] SPLIT: '{t.get('narration')}' → {len(splits)} entries")
-                        break  # Only split first match
+                        break
 
                 else:
                     print(f"[AGENT-7][UNIVERSAL] Unknown mutation type: '{mtype}' — skipping.")
 
-            # Apply deletes, then append new entries to transaction list
             input_transactions[:] = [t for t in input_transactions if not t.get('_deleted')]
             input_transactions.extend(new_entries_to_add)
 
-            # --- PERSIST VERBATIM RULES (LEARNING) ---
-            # Rule is stored as the verbatim USER COMMAND for maximum fidelity.
-            # We persist it for all refinement commands regardless of mutation type.
             if is_refinement:
                 try:
                     from app.core.supabase import supabase_admin
-                    # Force scope to CUSTOMER for all user-defined overrides as per latest requirement
+
                     scope = "CUSTOMER"
-                    # User's verbatim question IS the absolute rule. 
-                    # We store it cleanly so it can be injected next time.
+
                     full_rule_desc = f"USER COMMAND: {question}"
-                    
+
                     save_data = {
                         "rule_description": full_rule_desc,
-                        #"business_type": business_type, # Commented out as per user request to keep it customer-specific
-                        "customer_id": customer_id, # Always specific to this customer
+
+                        "customer_id": customer_id,
                         "company_id": company_id,
                     }
-                    
+
                     print(f"[DEBUG][LEARNING] Persisting verbatim rule for CUSTOMER scope...")
                     print(f"[DEBUG][LEARNING] Content: {full_rule_desc}")
-                    
-                    # Duplicate check: check if THIS exact command already exists for THIS specific customer
+
                     check_query = supabase_admin.table("accounting_rules").select("id").eq("rule_description", full_rule_desc).eq("customer_id", customer_id)
-                    
+
                     check_res = check_query.execute()
                     if not check_res.data:
                         print(f"[DEBUG][LEARNING] No duplicate. Inserting...")
                         insert_res = supabase_admin.table("accounting_rules").insert(save_data).execute()
                         if insert_res.data:
                             print(f"[LEARNING][SUCCESS] Verbose rule saved: {full_rule_desc}")
-                            # Yield metadata so the endpoint can also see/store it if needed
+
                             yield {"rule_persisted": save_data}
                         else:
                             print(f"[LEARNING][ERROR] Insert failed (no data returned). Response: {insert_res}")
                     else:
                         print(f"[LEARNING][SKIP] Rule already exists (ID: {check_res.data[0].get('id')}).")
-                        
+
                 except Exception as e:
                     import traceback
                     print(f"[LEARNING][ERROR] Persistence failed: {str(e)}")
                     traceback.print_exc()
 
-            all_transactions = input_transactions # Preserve changes
+            all_transactions = input_transactions
 
             yield {"status": f"Agent 7 (Universal): Done. {modified_count} mutation(s) applied. {len(new_entries_to_add)} new entries added."}
             print(f"[AGENT-7][UNIVERSAL] Pipeline complete. Mutations applied: {modified_count}. New entries: {len(new_entries_to_add)}.")
 
-            # Reconciliation logging
             expected_deposits = len([t for t in all_transactions if float(t.get('credit', 0) or 0) > 0])
             expected_withdrawals = len([t for t in all_transactions if float(t.get('debit', 0) or 0) > 0])
         else:
-            # --- TRANSACTION SUMMARY EXTRACTION (Parallelized) ---
+
             summary_task = None
             if not is_refinement:
                 summary_context = "\n".join(context_chunks[-3:])
                 summary_prompt = f"""
                 Read the following bank statement footer and extract the TRANSACTION SUMMARY table.
                 Look for "Transaction Summary", "No. of Transactions", "Deposits", and "Withdrawals".
-                
+
                 TEXT:
                 {summary_context}
-                
+
                 JSON OUTPUT:
                 {{
                     "deposits_count": 0,
@@ -758,12 +708,10 @@ OUTPUT FORMAT (JSON only, no explanation outside JSON):
                 """
                 summary_task = asyncio.create_task(self.llm.ainvoke(summary_prompt))
 
-            # INCREASED batch size for speed: 20 chunks per batch (Reduced total LLM calls)
             BATCH_SIZE = 20
             batches = [context_chunks[i:i + BATCH_SIZE] for i in range(0, len(context_chunks), BATCH_SIZE)]
             total_batches = len(batches)
 
-            # Parallel workers for speed - Auto-scaled based on model tier
             N_EXTRACTORS = self.n_extractors
             WORKER_DELAY_SEC = self.worker_delay
             sem = asyncio.Semaphore(N_EXTRACTORS)
@@ -773,7 +721,7 @@ OUTPUT FORMAT (JSON only, no explanation outside JSON):
             async def process_batch(index, batch_data, batch_metas):
                 async with sem:
                     slot = index % N_EXTRACTORS
-                    # Skip stagger delay if this batch is already cached (cache hits are instant)
+
                     import hashlib as _hl
                     _batch_str = "\n---\n".join(batch_data)
                     _batch_hash = _hl.sha256(_batch_str.encode()).hexdigest()
@@ -782,8 +730,8 @@ OUTPUT FORMAT (JSON only, no explanation outside JSON):
 
                     print(f"[AGENT-1][Worker-{slot+1}] → Batch {index + 1}/{total_batches} starting... ({len(batch_data)} chunks)")
                     txns = await self._extract_transactions_from_batch(
-                        batch_data, 
-                        context_query=question, 
+                        batch_data,
+                        context_query=question,
                         company_id=company_id,
                         feedback_context=feedback_context
                     )
@@ -795,7 +743,6 @@ OUTPUT FORMAT (JSON only, no explanation outside JSON):
                             t['_source_docs'] = src_docs
                     return index, txns
 
-            # Store batch results for potential reconciliation
             batch_results: Dict[int, List[Dict]] = {}
             tasks = [
                 process_batch(i, b, context_metadatas[i*BATCH_SIZE:(i+1)*BATCH_SIZE] if context_metadatas else None)
@@ -816,7 +763,6 @@ OUTPUT FORMAT (JSON only, no explanation outside JSON):
                     completed += 1
                     print(f"[AGENT-1][ERROR] Extractor batch failed: {e}")
 
-            # Now finalize the summary task if it was running in background
             expected_deposits = None
             expected_withdrawals = None
             if summary_task:
@@ -830,24 +776,19 @@ OUTPUT FORMAT (JSON only, no explanation outside JSON):
                 except Exception as e:
                     print(f"[RECONCILE] Summary background task failed: {e}")
 
-            # --- STRICT RECONCILIATION LOOP ---
-            # Target: extracted count == bank summary total (zero tolerance)
-            # Strategy: retry every batch individually until counts match or max attempts reached
             total_extracted = len(all_transactions)
             total_expected = (expected_deposits or 0) + (expected_withdrawals or 0)
-            
+
             if total_expected > 0 and total_extracted != total_expected:
                 missing_count = total_expected - total_extracted
                 direction = "missing" if missing_count > 0 else "extra"
                 print(f"[RECONCILE] COUNT MISMATCH: Found {total_extracted}, Expected {total_expected} ({direction}={abs(missing_count)}). Starting aggressive reconciliation...")
                 yield {"status": f"⚠️ {direction.title()} {abs(missing_count)} transactions (found {total_extracted}, expected {total_expected}). Reconciling..."}
-                
-                # Retry ALL batches that are likely underperforming (empty OR small)
-                # Sort by result size ascending — smallest first as most likely culprits
+
                 sorted_batches = sorted(batch_results.items(), key=lambda x: len(x[1]))
                 retry_tasks = []
                 for b_idx, b_res in sorted_batches:
-                    # Retry empty batches always; retry small batches if still mismatched
+
                     if len(b_res) == 0 or (missing_count > 0 and len(b_res) < 3):
                         f_batch = batches[b_idx]
                         f_metas = context_metadatas[b_idx*BATCH_SIZE:(b_idx+1)*BATCH_SIZE] if context_metadatas else [None] * len(f_batch)
@@ -862,8 +803,8 @@ OUTPUT FORMAT (JSON only, no explanation outside JSON):
                             slot = c_idx_global % N_EXTRACTORS
                             await asyncio.sleep(slot * WORKER_DELAY_SEC)
                             r_txns = await self._extract_transactions_from_batch(
-                                chunk_data, 
-                                context_query=question, 
+                                chunk_data,
+                                context_query=question,
                                 company_id=company_id,
                                 feedback_context=feedback_context
                             )
@@ -879,7 +820,7 @@ OUTPUT FORMAT (JSON only, no explanation outside JSON):
                         if r_list:
                             all_transactions.extend(r_list)
                             new_txns_count += len(r_list)
-                    
+
                     print(f"[RECONCILE] Recovery done. Recovered {new_txns_count} additional transactions.")
                     yield {"status": f"Reconciliation: recovered {new_txns_count} transactions (total now: {len(all_transactions)})."}
                 else:
@@ -889,7 +830,6 @@ OUTPUT FORMAT (JSON only, no explanation outside JSON):
             yield "No transactions could be identified in the provided documents. Please check the file has clear financial data.\n"
             return
 
-        # Deduplication + chronological sort
         import re as _re
         from datetime import datetime as _dt
 
@@ -906,10 +846,7 @@ OUTPUT FORMAT (JSON only, no explanation outside JSON):
                 amt = sum(float(e.get('amount', 0)) for e in entries if str(e.get('type')).upper() == 'CREDIT')
             return (d, amt, narr)
 
-        # DEDUPLICATION: use raw debit/credit fields (always available after extraction,
-        # unlike entries[] which only exist post-classification). Also include balance
-        # in fingerprint to distinguish identical narration+amount on same day.
-        all_transactions.sort(key=_sort_key)  # chronological order first
+        all_transactions.sort(key=_sort_key)
         from collections import Counter as _Counter
         narr_count: _Counter = _Counter()
         seen_fps: set = set()
@@ -922,10 +859,9 @@ OUTPUT FORMAT (JSON only, no explanation outside JSON):
             amt  = dr if dr > 0 else cr
             bal  = float(t.get('balance', 0) or 0)
             norm = _re.sub(r'[^a-zA-Z0-9]', '', narr).lower()
-            # Include balance in fingerprint for high-precision dedup
-            # (two transactions with same date+amount+narration but different running balances are different)
+
             base_fp = f"{ds}_{amt:.2f}_{norm}_{bal:.2f}"
-            # Count occurrences — only drop if this is a TRUE cross-batch duplicate
+
             narr_count[base_fp] += 1
             fp = f"{base_fp}#{narr_count[base_fp]}"
             if fp not in seen_fps:
@@ -934,10 +870,9 @@ OUTPUT FORMAT (JSON only, no explanation outside JSON):
         all_transactions = unique_txns
         print(f"[DEDUP] Raw extracted: {len(seen_fps)} fingerprints → {len(all_transactions)} unique transactions kept")
 
-        # --- RECONCILIATION LOGGING ---
         extracted_deposits = len([t for t in all_transactions if float(t.get('credit', 0) or 0) > 0])
         extracted_withdrawals = len([t for t in all_transactions if float(t.get('debit', 0) or 0) > 0])
-        
+
         print(f"[RECONCILE] Extraction Results: Deposits={extracted_deposits}, Withdrawals={extracted_withdrawals}")
         if expected_deposits is not None or expected_withdrawals is not None:
             if expected_deposits == extracted_deposits and expected_withdrawals == extracted_withdrawals:
@@ -945,17 +880,13 @@ OUTPUT FORMAT (JSON only, no explanation outside JSON):
             else:
                 warning = f"[RECONCILE] WARNING: Counts MISMATCH! Bank Summary: D={expected_deposits}, W={expected_withdrawals} | Extracted: D={extracted_deposits}, W={extracted_withdrawals}"
                 print(warning)
-                # yield error/warning message to UI optionally if it's too bad
+
                 if abs(len(all_transactions) - ((expected_deposits or 0) + (expected_withdrawals or 0))) > 10:
                     yield {"status": f"⚠️ Extraction mismatch: found {len(all_transactions)} transactions, but summary expected {(expected_deposits or 0) + (expected_withdrawals or 0)}."}
 
-        # Signal the API to store these transactions for future refinement
         yield {"all_transactions": all_transactions}
 
-        # ===================================================================
-        # AGENT 2: BATCH CLASSIFIER POOL (LLM — N parallel classifier workers)
-        # ===================================================================
-        CLASSIFY_BATCH_SIZE = 100     # Optimized for reliability and speed (100 txns per LLM call)
+        CLASSIFY_BATCH_SIZE = 100
         N_CLASSIFIERS = self.n_classifiers
         CLASSIFIER_DELAY_SEC = self.worker_delay
 
@@ -973,14 +904,14 @@ OUTPUT FORMAT (JSON only, no explanation outside JSON):
             yield {"status": f"Agent 2 (Classifier ×{N_CLASSIFIERS}): classifying {len(all_transactions)} transactions..."}
 
         cls_sem = asyncio.Semaphore(N_CLASSIFIERS)
-        classified_results: Dict[int, List[Dict]] = {}  # bidx → list of classified transactions
+        classified_results: Dict[int, List[Dict]] = {}
 
         async def classify_batch(bidx: int, c_batch: List[Dict]):
             async with cls_sem:
                 slot = bidx % N_CLASSIFIERS
-                
+
                 known_accs = ", ".join(list(self.shared_accounts)[:50]) if self.shared_accounts else "None yet"
-                
+
                 narrations_list = ""
                 for j, t in enumerate(c_batch):
                     dr = float(t.get('debit', 0) or 0)
@@ -988,7 +919,6 @@ OUTPUT FORMAT (JSON only, no explanation outside JSON):
                     direction = f"DEBIT \u20b9{dr:,.2f}" if dr > 0 else f"CREDIT \u20b9{cr:,.2f}"
                     narrations_list += f"{j+1}. [{direction}] {t.get('narration', 'Unknown')}\n"
 
-                # Stagger later batches to avoid burst — skip for cache hits (they are instant)
                 _pre_fp = hashlib.sha256((narrations_list + dynamic_business_rules).encode()).hexdigest()
                 if bidx >= N_CLASSIFIERS and _pre_fp not in self.classification_cache:
                     await asyncio.sleep(CLASSIFIER_DELAY_SEC * (slot % 3))
@@ -997,7 +927,7 @@ OUTPUT FORMAT (JSON only, no explanation outside JSON):
                 {AGENT_SYSTEM_PROMPTS['classifier']}
 
                 {CLASSIFIER_RULES}
-                
+
                 {dynamic_business_rules}
 
                 PREVIOUSLY IDENTIFIED ACCOUNTS (Consistency):
@@ -1027,7 +957,6 @@ OUTPUT FORMAT (JSON only, no explanation outside JSON):
                     if dynamic_business_rules:
                         print(f"[AGENT-2][Worker-{slot+1}] Batch {bidx+1}/{total_classify_batches}: Injecting dynamic business rules.")
 
-                    # --- CLASSIFICATION CACHE (speed: skip LLM if same batch seen before) ---
                     batch_fp = hashlib.sha256(
                         (narrations_list + dynamic_business_rules).encode()
                     ).hexdigest()
@@ -1040,7 +969,7 @@ OUTPUT FORMAT (JSON only, no explanation outside JSON):
                             resp = await retry_with_backoff(self.llm.ainvoke, classify_prompt + hint)
                             raw = self.ai_service._extract_json(resp.content)
                             if isinstance(raw, dict):
-                                # LLM wrapped array in a dict — unwrap first list value
+
                                 for v in raw.values():
                                     if isinstance(v, list):
                                         return v
@@ -1051,13 +980,11 @@ OUTPUT FORMAT (JSON only, no explanation outside JSON):
 
                         results = await _run_classify()
 
-                        # Retry once if we got 0 results (JSON likely truncated)
                         if len(results) == 0 and len(c_batch) > 0:
                             print(f"[AGENT-2][Worker-{slot+1}] Batch {bidx+1}/{total_classify_batches}: 0 classifications — retrying...")
                             retry_hint = f"\n\n⚠️ RETRY: You returned 0 items. Return a JSON ARRAY with EXACTLY {len(c_batch)} objects. No extra text."
                             results = await _run_classify(retry_hint)
 
-                        # Cache successful results
                         if results:
                             self.classification_cache[batch_fp] = results
 
@@ -1067,35 +994,32 @@ OUTPUT FORMAT (JSON only, no explanation outside JSON):
                         dr = float(t.get('debit', 0) or 0)
                         cr = float(t.get('credit', 0) or 0)
                         amt = dr if dr > 0 else cr
-                        
-                        # RELIABILITY FIX: Match by index only if results exist for it.
+
                         res = results[j] if j < len(results) else None
-                        
+
                         if res:
                             debit_acc  = res.get('dr_acc', res.get('debit_account', 'Bank Account')).strip().title()
                             credit_acc = res.get('cr_acc', res.get('credit_account', 'Bank Account')).strip().title()
                             category   = res.get('cat', res.get('category', 'Unclassified'))
-                            
-                            # Bank Account always Current Assets
-                            # The OTHER account gets the AI-detected category
-                            if cr > 0: # Money IN (Credit in Statement, Debit in Bank A/c)
+
+                            if cr > 0:
                                 t['entries'] = [
                                     {"account": "Bank Account", "type": "DEBIT",  "amount": amt, "category": "Current Assets"},
                                     {"account": credit_acc,      "type": "CREDIT", "amount": amt, "category": category},
                                 ]
-                            else: # Money OUT (Debit in Statement, Credit in Bank A/c)
+                            else:
                                 t['entries'] = [
                                     {"account": debit_acc,  "type": "DEBIT",  "amount": amt, "category": category},
                                     {"account": "Bank Account", "type": "CREDIT", "amount": amt, "category": "Current Assets"},
                                 ]
                             t['confidence'] = res.get('conf', res.get('confidence', 1.0))
                         else:
-                            # Fallback if LLM truncated output (didn't return object for this index)
+
                             print(f"[AGENT-2][WARNING] Truncation detected at index {j} in batch {bidx+1}. Using fallback.")
                             if t.get('entries'):
                                 batch_classified.append(t)
                                 continue
-                            
+
                             if dr > 0:
                                 t['entries'] = [
                                     {"account": "Suspense Account", "type": "DEBIT",  "amount": dr, "category": "Current Assets"},
@@ -1111,11 +1035,11 @@ OUTPUT FORMAT (JSON only, no explanation outside JSON):
                 except Exception as e:
                     print(f"[AGENT-2][Worker-{slot+1}][ERROR] Batch {bidx+1} failed: {e}")
                     for t in c_batch:
-                        # CRITICAL: Preserve previous classification if it exists!
+
                         if t.get('entries'):
                             batch_classified.append(t)
                             continue
-                            
+
                         dr = float(t.get('debit', 0) or 0)
                         cr = float(t.get('credit', 0) or 0)
                         amt = dr if dr > 0 else cr
@@ -1142,22 +1066,15 @@ OUTPUT FORMAT (JSON only, no explanation outside JSON):
             if cls_completed % 5 == 0 or cls_completed == total_classify_batches:
                 yield {"status": f"Agent 2 (Classifier ×{N_CLASSIFIERS}): {cls_completed}/{total_classify_batches} batches done..."}
 
-        # Reconstruct in original order (as_completed gives out-of-order results)
         classified: List[Dict] = []
         for i in range(total_classify_batches):
             classified.extend(classified_results.get(i, []))
 
         print(f"[AGENT-2] Parallel classification complete: {len(classified)} transactions classified")
 
-        # ===================================================================
-        # LEDGER STORE (Shared State)
-        # ===================================================================
         ledger_balances: Dict[str, float] = {}
         account_categories: Dict[str, str] = {}
 
-        # ===================================================================
-        # AGENT 3: JOURNAL AGENT (Deterministic) — also populates Ledger
-        # ===================================================================
         print(f"[AGENT-3] {AGENT_SYSTEM_PROMPTS['journal']}")
         yield {"status": "Agent 3 (Journal): Writing double-entry journal & populating Ledger Store..."}
         journal_rows_data: List[List] = []
@@ -1179,14 +1096,13 @@ OUTPUT FORMAT (JSON only, no explanation outside JSON):
 
             tx_count += 1
 
-            # Update Ledger Store and Shared Accounts
             for entry in entries:
                 acc = str(entry.get('account', 'Unclassified')).strip().title()
                 cat = str(entry.get('category', 'Unclassified')).strip()
                 amt = float(entry.get('amount', 0))
                 etype = str(entry.get('type')).upper()
                 ledger_balances.setdefault(acc, 0.0)
-                self.shared_accounts.add(acc) # Track for next classification batch
+                self.shared_accounts.add(acc)
                 if cat and cat != 'Unclassified':
                     account_categories[acc] = cat
                 if etype == 'DEBIT':
@@ -1194,7 +1110,6 @@ OUTPUT FORMAT (JSON only, no explanation outside JSON):
                 else:
                     ledger_balances[acc] -= amt
 
-            # Yield journal rows unconditionally
             first = True
             for entry in entries:
                 acc = str(entry.get('account', 'Unclassified')).strip().title()
@@ -1205,11 +1120,10 @@ OUTPUT FORMAT (JSON only, no explanation outside JSON):
                 d_cr = f"{amt:,.2f}" if etype == 'CREDIT' else ""
                 d_date = date_val if first else ""
                 d_narr = narration if first else ""
-                # journal row collected — not streamed as token
+
                 journal_rows_data.append([d_date, d_acc, "", d_dr, d_cr, d_narr])
                 first = False
 
-        # Journal computed for internal ledger use — NOT added to structured_tables (not shown to user)
         print(f"[AGENT-3] Journal done: {tx_count} valid transactions written.")
         print(f"[AGENT-3] Ledger Store populated: {len(ledger_balances)} accounts.")
         for acc, bal in ledger_balances.items():
@@ -1225,30 +1139,27 @@ OUTPUT FORMAT (JSON only, no explanation outside JSON):
         pnl_dr = 0.0
         pnl_cr = 0.0
 
-        # --- PROFIT & LOSS GENERATION ---
         for acc, bal in ledger_balances.items():
             cat = account_categories.get(acc, "").upper()
             if abs(bal) < 0.01:
                 continue
 
-            # Skip Bank Account and specific exclusions
             should_exclude = any(excl.upper() in cat or excl.upper() in acc.upper() for excl in PNL_CONFIG['exclude_types'])
             if should_exclude:
                 if "BANK" not in acc.upper():
                     print(f"[AGENT-4][PNL-FILTER] Excluded from P&L: {acc} (cat={cat})")
                 continue
 
-            # Categorize based on type substring (Unified with Agent 7)
             pnl_inc_kws = ["INCOME", "SALES", "REVENUE", "DIRECT INCOME"]
             pnl_exp_kws = ["EXPENSE", "DIRECT EXPENSE", "CHGS", "FEE", "TAX", "PURCHASE", "COST"]
-            
+
             is_income = any(kw in cat for kw in pnl_inc_kws)
             is_expense = any(kw in cat for kw in pnl_exp_kws)
 
             if is_income:
                 pnl_cr_rows.append((f"By {acc}", abs(bal)))
                 pnl_cr += abs(bal)
-            elif is_expense or "EXPENSE" in cat: # Extra safety check for "EXPENSE"
+            elif is_expense or "EXPENSE" in cat:
                 pnl_dr_rows.append((f"To {acc}", abs(bal)))
                 pnl_dr += abs(bal)
             else:
@@ -1283,17 +1194,13 @@ OUTPUT FORMAT (JSON only, no explanation outside JSON):
             })
             result_label = f"Net Profit: \u20b9{net_profit:,.2f}" if net_profit > 0 else f"Net Loss: \u20b9{abs(net_profit):,.2f}"
             print(f"[AGENT-4] P&L done \u2192 Income: \u20b9{pnl_cr:,.2f} | Expense: \u20b9{pnl_dr - (net_profit if net_profit > 0 else 0):,.2f} | {result_label}")
-            
-            # --- INCREMENTAL STREAMING: Yield P&L as soon as ready ---
+
             if 'profit_loss' in _show_tables:
                 yield {
                     "structured_tables": [t for t in local_structured_tables if t.get('type') == 'profit_loss'],
                     "all_tables": local_structured_tables
                 }
 
-        # ===================================================================
-        # AGENT 5: BALANCE SHEET AGENT (Pure Math — no LLM)
-        # ===================================================================
         print(f"[AGENT-5] {AGENT_SYSTEM_PROMPTS['balance_sheet']}")
         yield {"status": "Agent 5 (Balance Sheet Agent): Building Balance Sheet from Ledger..."}
 
@@ -1306,17 +1213,16 @@ OUTPUT FORMAT (JSON only, no explanation outside JSON):
             cat = account_categories.get(acc, "").upper()
             if abs(bal) < 0.01:
                 continue
-            # P&L accounts excluded — their net is captured via Net Profit/Loss
+
             if "INCOME" in cat or "EXPENSE" in cat:
                 continue
-            if bal > 0:  # Debit balance → Asset
+            if bal > 0:
                 bs_assets.append((acc, bal))
                 asset_total += bal
-            else:  # Credit balance → Liability / Equity
+            else:
                 bs_liab.append((acc, abs(bal)))
                 liab_total += abs(bal)
 
-        # Inject Net Profit/Loss into Equity side
         if net_profit > 0:
             bs_liab.append(("Add: Net Profit", net_profit))
             liab_total += net_profit
@@ -1339,38 +1245,27 @@ OUTPUT FORMAT (JSON only, no explanation outside JSON):
             "rows": bs_table_rows
         })
         print(f"[AGENT-5] Balance Sheet done → Assets: ₹{asset_total:,.2f} | Liabilities+Equity: ₹{liab_total:,.2f}")
-        
-        # --- INCREMENTAL STREAMING: Yield Balance Sheet as soon as ready ---
+
         if 'balance_sheet' in _show_tables:
             yield {
                 "structured_tables": [t for t in local_structured_tables if t.get('type') in ['profit_loss', 'balance_sheet']],
                 "all_tables": local_structured_tables
             }
 
-        # --- AGENT-SPECIFIC TABLE FILTERING ---
-        # Exclude 'generic' (Financial Report) tables if they weren't explicitly requested.
-        # This keeps the UI clean and only shows structured accounting cards.
         allowed_types = _show_tables.copy()
         if 'generic' not in allowed_types:
-            # We only show 'generic' if specifically mentioned like "show reasoning table"
-            pass 
+
+            pass
 
         requested_tables = [t for t in local_structured_tables if t.get('type') in allowed_types]
         print(f"[INTENT] Exposing {len(requested_tables)} table(s): {[t.get('type') for t in requested_tables]}")
 
-        # Yield structured tables directly over the stream.
-        # 'structured_tables' is what gets shown to the user this turn.
-        # 'all_tables' is cached in the DB for instant retrieval on follow-up questions.
         yield {"structured_tables": requested_tables, "all_tables": local_structured_tables}
 
-        # ===================================================================
-        # AGENT 6 — TALLY / AUDITOR AGENT  (uses TALLY_CONFIG rules)
-        # ===================================================================
         print(f"[AGENT-6] {AGENT_SYSTEM_PROMPTS['tally']}")
         print(f"[AGENT-6] Config: {TALLY_CONFIG}")
         yield {"status": "Agent 6 (Tally Auditor): Running all 3 validation checks..."}
 
-        # --- CHECK 1: TRIAL BALANCE ---
         tb_total_dr = sum(v for v in ledger_balances.values() if v > 0)
         tb_total_cr = sum(abs(v) for v in ledger_balances.values() if v < 0)
         tb_diff = abs(tb_total_dr - tb_total_cr)
@@ -1382,12 +1277,11 @@ OUTPUT FORMAT (JSON only, no explanation outside JSON):
                 print(f"[AGENT-6] Trial Balance PASSED: \u20b9{tb_total_dr:,.2f}")
                 yield f"\n> \u2705 **Trial Balance PASSED** \u2014 Total Dr = Total Cr = \u20b9{tb_total_dr:,.2f}\n"
 
-        # --- CHECK 2: BALANCE SHEET EQUATION ---
         diff = abs(asset_total - liab_total)
         if TALLY_CONFIG.get('balance_sheet_check'):
             if diff > 0.01:
                 if TALLY_CONFIG.get('auto_capital_adjustment'):
-                    # Add Capital Adjustment entry under Equity to absorb gap
+
                     cap_adj = asset_total - liab_total
                     bs_liab.append(("Capital Adjustment", cap_adj))
                     liab_total += cap_adj
@@ -1412,34 +1306,32 @@ OUTPUT FORMAT (JSON only, no explanation outside JSON):
         """Extract structured data from markdown tables in text."""
         import re
         tables = []
-        # Regex for markdown tables
+
         table_regex = r"((?:\|[^\n]+\|(?:\n|$))+)"
         matches = re.finditer(table_regex, text)
-        
+
         for match in matches:
             table_str = match.group(1).strip()
-            # Split and filter out empty strings from splitting
+
             rows = [r.strip() for r in table_str.split("\n") if r.strip()]
-            
-            # Clean rows and remove separator
+
             parsed_rows = []
             for row in rows:
                 if re.match(r"^\|?[-:| ]+\|?$", row.strip()):
                     continue
-                # Split by | and filter results
+
                 cells = [c.strip() for c in row.split("|")]
-                # Filter out empty cells at edges
+
                 if row.startswith("|"): cells = cells[1:]
                 if row.endswith("|") and cells: cells = cells[:-1]
                 parsed_rows.append(cells)
-            
+
             if len(parsed_rows) < 2:
                 continue
-                
+
             headers = parsed_rows[0]
             body = parsed_rows[1:]
-            
-            # Detect type
+
             table_type = "generic"
             headers_lower = [h.lower() for h in headers]
             if any("debit" in h or "credit" in h for h in headers_lower):
@@ -1448,7 +1340,7 @@ OUTPUT FORMAT (JSON only, no explanation outside JSON):
                 table_type = "balance_sheet"
             elif any("particulars" in h and "amount" in h for h in headers_lower):
                 table_type = "profit_loss"
-                
+
             tables.append({
                 "type": table_type,
                 "headers": headers,

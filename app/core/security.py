@@ -1,4 +1,3 @@
-# Security utilities (Placeholder for JWT, hashing, etc.)
 from passlib.context import CryptContext
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")

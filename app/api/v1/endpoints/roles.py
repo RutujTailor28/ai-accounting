@@ -6,7 +6,6 @@ from typing import List
 
 router = APIRouter()
 
-# All routes here require 'admin' or 'superadmin' role
 admin_dep = Depends(require_role(["admin", "superadmin"]))
 from app.api.deps import get_user_context
 
@@ -15,13 +14,11 @@ async def list_roles(ctx: dict = Depends(get_user_context)):
     """List all available roles. Filters by company for admins."""
     try:
         query = supabase_admin.table("roles").select("*")
-        
+
         if not ctx["is_superadmin"]:
-            # Show global roles (company_id is null) OR company-specific roles
-            # Wait, Supabase syntax for OR is complex. Let's just allow all for now or filter simply.
-            # Actually, standard roles are global.
+
             pass
-            
+
         response = query.execute()
         return response.data
     except Exception as e:
@@ -34,17 +31,17 @@ async def create_role(data: RoleCreate, ctx: dict = Depends(get_user_context)):
         target_company_id = data.company_id
         if not ctx["is_superadmin"]:
             target_company_id = ctx["company_id"]
-            
+
         response = supabase_admin.table("roles").insert({
             "name": data.name,
             "description": data.description,
             "company_id": target_company_id,
             "permissions": data.permissions
         }).execute()
-        
+
         if not response.data:
             raise HTTPException(status_code=400, detail="Failed to create role")
-            
+
         return response.data[0]
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -53,11 +50,11 @@ async def create_role(data: RoleCreate, ctx: dict = Depends(get_user_context)):
 async def update_role(role_id: int, data: RoleUpdate, ctx: dict = Depends(get_user_context)):
     """Update a role's name or description."""
     try:
-        # Check ownership
+
         target_res = supabase_admin.table("roles").select("company_id").eq("id", role_id).single().execute()
         if not target_res.data:
             raise HTTPException(status_code=404, detail="Role not found")
-            
+
         if not ctx["is_superadmin"] and target_res.data.get("company_id") != ctx["company_id"]:
             raise HTTPException(status_code=403, detail="Access denied")
 
@@ -65,12 +62,12 @@ async def update_role(role_id: int, data: RoleUpdate, ctx: dict = Depends(get_us
         if data.name is not None: update_data["name"] = data.name
         if data.description is not None: update_data["description"] = data.description
         if data.permissions is not None: update_data["permissions"] = data.permissions
-        
+
         response = supabase_admin.table("roles").update(update_data).eq("id", role_id).execute()
-        
+
         if not response.data:
             raise HTTPException(status_code=404, detail="Role not found")
-            
+
         return response.data[0]
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -79,15 +76,14 @@ async def update_role(role_id: int, data: RoleUpdate, ctx: dict = Depends(get_us
 async def delete_role(role_id: int, ctx: dict = Depends(get_user_context)):
     """Delete a role definition."""
     try:
-        # Check ownership
+
         target_res = supabase_admin.table("roles").select("company_id").eq("id", role_id).single().execute()
         if not target_res.data:
-             return None # Silent success
-             
+             return None
+
         if not ctx["is_superadmin"] and target_res.data.get("company_id") != ctx["company_id"]:
              raise HTTPException(status_code=403, detail="Access denied")
 
-        # Protect system roles
         if target_res.data.get("company_id") is None:
              raise HTTPException(status_code=400, detail="Cannot delete system roles")
 

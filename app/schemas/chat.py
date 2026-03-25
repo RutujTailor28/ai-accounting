@@ -4,7 +4,6 @@ from uuid import UUID
 from pydantic import Field
 from app.schemas.base import CamelModel
 
-
 class ChatQueryRequest(CamelModel):
     workspace_id: Optional[UUID] = Field(None, description="Filter by workspace ID")
     customer_id: Optional[UUID] = Field(None, description="Filter by customer ID")
@@ -18,7 +17,6 @@ class ChatQueryRequest(CamelModel):
     end_date: Optional[str] = Field(None, description="End date for filtering documents (ISO format)")
     tags: Optional[List[str]] = Field(None, description="Filter by tags")
     transactions: Optional[List[Dict[str, Any]]] = Field(None, description="Optional raw transactions for refinement/analysis")
-
 
 class ChatMessageResponse(CamelModel):
     id: UUID
@@ -37,7 +35,6 @@ class ChatMessageResponse(CamelModel):
     class Config:
         from_attributes = True
 
-
 class ChatHistoryItem(CamelModel):
     session_id: UUID
     session_title: Optional[str] = None
@@ -46,11 +43,9 @@ class ChatHistoryItem(CamelModel):
     customer_id: Optional[UUID] = None
     file_names: Optional[List[str]] = Field(default_factory=list)
 
-
 class ChatSaveRequest(CamelModel):
     session_id: UUID
     file_names: List[str] = Field(default_factory=list)
-
 
 class ChatFeedbackCreate(CamelModel):
     message_id: UUID

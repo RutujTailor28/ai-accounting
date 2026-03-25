@@ -8,10 +8,8 @@ from datetime import date
 import re
 from app.ai.rag.retriever import vector_store
 
-
-# Helper for rate limit retries
 async def retry_with_backoff(func, *args, **kwargs):
-    retries = 20 # Effectively infinite retries to guarantee success
+    retries = 20
     for i in range(retries):
         try:
             return await func(*args, **kwargs)
@@ -19,8 +17,7 @@ async def retry_with_backoff(func, *args, **kwargs):
             if "429" in str(e) or "Rate limit" in str(e):
                 if i == retries - 1:
                     raise e
-                # Reduced wait time for faster retries
-                # Base wait (10s) + Jitter (1-3s) to prevent thundering herd
+
                 wait_time = 10 + random.uniform(1, 3)
                 print(f"[WARNING] Rate limit hit. Waiting {wait_time:.1f}s to reset quota... (Attempt {i+1}/{retries})")
                 await asyncio.sleep(wait_time)
@@ -29,25 +26,25 @@ async def retry_with_backoff(func, *args, **kwargs):
 
 class LLMService:
     """Service for generating answers using OpenRouter LLM."""
-    
+
     def __init__(self):
         """Initialize LLM service with OpenRouter model."""
         if not settings.openrouter_api_key:
             print("[WARNING] OpenRouter API key not configured. AI features may fail.")
-            
+
         self.llm = ChatOpenAI(
             model=settings.openrouter_model,
             openai_api_key=settings.openrouter_api_key,
             openai_api_base=settings.openrouter_base_url,
             temperature=0.0,
-            max_tokens=50000,  # Increased to allow complete extraction of all matching records without truncation
+            max_tokens=50000,
             default_headers={
-                "HTTP-Referer": "https://localhost:8000", # Optional: Your site URL
-                "X-Title": "Accounting RAG System", # Optional: Your site name
+                "HTTP-Referer": "https://localhost:8000",
+                "X-Title": "Accounting RAG System",
             }
         )
         print(f"[INFO] LLMService initialized with OpenRouter model={settings.openrouter_model}")
-    
+
     async def classify_query_intent(self, question: str) -> Dict[str, Any]:
         """
         Use the LLM to categorize the user's query intent.
@@ -60,13 +57,13 @@ class LLMService:
         """
         prompt = f"""You are an intent discovery agent for a financial RAG system.
         Categorize the user's question into one of three intents:
-        
-        1. **SUMMARY**: The user is asking for a high-level overview, a balance, financial health, or a specific structured report (Balance Sheet, P&L, Statement, Computation). 
+
+        1. **SUMMARY**: The user is asking for a high-level overview, a balance, financial health, or a specific structured report (Balance Sheet, P&L, Statement, Computation).
            Examples: "what is my closing balance?", "give me balance sheet", "how are my finances?", "summary of account".
-        
+
         2. **EXTRACTION**: The user is asking for specific transactional data points, a list of records, or has provided an explicit limit (e.g., "last 5 upi").
            Examples: "list upi transactions", "show last 10 records", "extract all atm withdrawals".
-        
+
         3. **GENERAL**: General questions about the system or accounting practices that don't directly require document data extraction.
            Examples: "how do I upload?", "what is a balance sheet?".
 
@@ -87,7 +84,7 @@ class LLMService:
             return intent_data
         except Exception as e:
             print(f"[ERROR] Intent Discovery failed: {e}")
-            # Robust fallback
+
             return {"intent": "EXTRACTION", "explicit_limit": None, "report_types": [], "target_keywords": []}
 
     def _extract_json(self, text: str) -> Dict[str, Any]:
@@ -97,23 +94,22 @@ class LLMService:
         """
 
         def clean_json_string(s):
-            # Remove markdown code blocks if present
+
             s = re.sub(r'```json\s*', '', s)
             s = re.sub(r'```\s*', '', s)
             return s.strip()
 
         text = clean_json_string(text)
-        
-        # Step 1: Direct full parse
+
         try:
             parsed = json.loads(text)
             print(f"[DEBUG] JSON parsed successfully. Type: {type(parsed)}")
-            
+
             if isinstance(parsed, list):
                 print(f"[DEBUG] Parsed as list with {len(parsed)} items")
                 return {"transactions": parsed}
             elif isinstance(parsed, dict):
-                # Check if it's a single transaction object (has fields like date, amount, description)
+
                 transaction_indicators = ['date', 'amount', 'description', 'transaction_id', 'type']
                 if any(key in parsed for key in transaction_indicators) and 'transactions' not in parsed:
                     print(f"[DEBUG] Detected single transaction object, wrapping in array")
@@ -123,11 +119,9 @@ class LLMService:
         except json.JSONDecodeError as e:
             print(f"[DEBUG] Direct JSON parse failed: {e}")
 
-        # Step 2: Iterative search for all possible JSON objects/arrays
         all_found = []
         decoder = json.JSONDecoder()
-        
-        # We try to find any substring that starts with { or [ and parses as valid JSON
+
         for i in range(len(text)):
             if text[i] in '{[':
                 try:
@@ -138,11 +132,10 @@ class LLMService:
 
         print(f"[DEBUG] Iterative search found {len(all_found)} JSON objects")
 
-        # Step 3: Parse recovery for incomplete JSON (simple closer appending)
         if not all_found:
-             # Try appending closing braces/brackets
+
             temp_text = text
-            for _ in range(3): 
+            for _ in range(3):
                 temp_text += "}"
                 try:
                     match = re.search(r'(\{.*\})', temp_text, re.DOTALL)
@@ -150,7 +143,7 @@ class LLMService:
                         all_found.append(json.loads(match.group(0)))
                         break
                 except: pass
-                
+
                 temp_text_sq = text + "]"
                 try:
                     match = re.search(r'(\[.*\])', temp_text_sq, re.DOTALL)
@@ -159,43 +152,37 @@ class LLMService:
                         break
                 except: pass
 
-        # Step 4: Logic to pick the "best" object
         if all_found:
             print(f"[DEBUG] Processing {len(all_found)} found objects")
-            
-            # Prioritize dicts containing "transactions" or "data"
+
             for item in all_found:
                 if isinstance(item, dict):
                     if "transactions" in item or "data" in item:
                         print(f"[DEBUG] Found dict with transactions/data key")
                         return item
-            
-            # Check if we have transaction-like objects
+
             transaction_objects = []
             for item in all_found:
                 if isinstance(item, dict):
                     transaction_indicators = ['date', 'amount', 'description', 'transaction_id', 'type']
                     if any(key in item for key in transaction_indicators):
                         transaction_objects.append(item)
-            
+
             if transaction_objects:
                 print(f"[DEBUG] Found {len(transaction_objects)} transaction objects, wrapping in array")
                 return {"transactions": transaction_objects}
-            
-            # If we found a standalone list, wrap it
+
             for item in all_found:
                 if isinstance(item, list):
                     print(f"[DEBUG] Found standalone list with {len(item)} items")
                     return {"transactions": item}
-                    
-            # Fallback: just return the first valid object found
+
             print(f"[DEBUG] Using fallback: returning first found object")
             return all_found[0] if isinstance(all_found[0], dict) else {"data": all_found[0]}
 
-        # Final Fallback
         print(f"[WARNING] No valid JSON found in response, returning empty")
         return {
-            "message": text.strip()[:200],  # Only keep first 200 chars to avoid bloat
+            "message": text.strip()[:200],
             "transactions": []
         }
 
@@ -206,32 +193,29 @@ class LLMService:
         instead of relying only on the random chunks retrieved for the query.
         """
         unique_docs = list(set([d for d in source_documents if d and d != "Unknown"]))
-        
+
         async def scan_single_doc(doc):
             try:
-                # 1. Fetch HEADER chunks explicitly from Vector Store
-                # We need the top of the file to see the Bank Name/Logo
+
                 header_text = ""
                 if company_id:
                     try:
-                        # Query for the first 3 chunks of this document (indices 0, 1, 2)
-                        # We use a loose filter because chunk naming might vary, but standard is {doc_name}_0, {doc_name}_1
-                        # safest is to get by metadata
+
                         v_res = vector_store.collection.get(
                             where={
                                 "$and": [
                                     {"company_id": {"$eq": company_id}},
                                     {"document_name": {"$eq": doc}},
-                                    {"chunk_index": {"$lt": 3}} # Get first 3 chunks
+                                    {"chunk_index": {"$lt": 3}}
                                 ]
                             },
                             include=["documents", "metadatas"]
                         )
-                        
+
                         if v_res and v_res.get("documents"):
-                            # Sort by chunk index to ensure order
+
                             sorted_chunks = sorted(
-                                zip(v_res["documents"], v_res["metadatas"]), 
+                                zip(v_res["documents"], v_res["metadatas"]),
                                 key=lambda x: x[1].get("chunk_index", 999)
                             )
                             header_chunks = [c[0] for c in sorted_chunks]
@@ -240,18 +224,15 @@ class LLMService:
                     except Exception as ve:
                         print(f"[WARNING] Failed to fetch headers for {doc} from DB: {ve}")
 
-                # 2. Also include the chunks provided in the context (which might be from middle of file)
-                # Find indices in the provided context
                 all_doc_indices = [i for i, x in enumerate(source_documents) if x == doc]
-                # Take up to 5 context chunks
+
                 context_indices = all_doc_indices[:5]
                 context_text = "\n".join([context_chunks[i] for i in context_indices])
 
-                # Combine: Header (Priority) + Context
                 full_peek_content = f"--- DOCUMENT HEADER (Start of File) ---\n{header_text}\n\n--- RELEVANT EXTRACTS_FROM_QUERY ---\n{context_text}"
 
                 prompt = f"""You are a professional financial document analyzer. Your goal is to identify the Issuing Bank Name, the Main Account Holder Name, and the DOCUMENT TYPE.
-                
+
                 I have provided two sections:
                 1. THE HEADER (Start of file) - Look here for Bank Name/Logo.
                 2. RELEVANT EXTRACTS - Look here for context if header is unclear.
@@ -265,7 +246,7 @@ class LLMService:
                    - **CRITICAL**: If you cannot find an explicit issuing bank name, return "Unknown".
 
                 2. Identify Account Holder Name (e.g., "Name of the Assessee", "Beneficiary Name:", "Account Name:").
-                
+
                 3. IDENTIFY DOCUMENT TYPE:
                    - **Bank Statement**: Transaction lists, withdrawals, deposits.
                    - **Balance Sheet**: Assets, Liabilities, Equity.
@@ -277,31 +258,30 @@ class LLMService:
                 ---
 
                 Return ONLY a JSON object: {{"bank_name": "IDENTIFIED BANK NAME", "account_holder": "IDENTIFIED NAME", "document_type": "TYPE"}}
-                
+
                 **RULES FOR BANK NAME**:
-                - Extract the **Full Official Name** (e.g. "State Bank of India", "HDFC Bank"). 
+                - Extract the **Full Official Name** (e.g. "State Bank of India", "HDFC Bank").
                 - Do not abbreviate.
                 """
                 response = await self.llm.ainvoke(prompt)
                 meta = self._extract_json(response.content)
-                
+
                 bank_name = str(meta.get("bank_name", "Unknown")).strip()
                 account_holder = meta.get("account_holder", "Unknown")
                 doc_type = meta.get("document_type", "Unknown")
-                
+
                 return doc, {"bank_name": bank_name, "account_holder": account_holder, "document_type": doc_type}
             except Exception as e:
                 print(f"[ERROR] Failed to extract metadata for {doc}: {e}")
                 return doc, {"bank_name": "Unknown", "account_holder": "Unknown"}
 
-        # Extract all unique docs in parallel
         tasks = [scan_single_doc(doc) for doc in unique_docs]
         results = await asyncio.gather(*tasks)
-        
+
         doc_metadata = dict(results)
         for doc, meta in doc_metadata.items():
             print(f"[INFO] Detected metadata for {doc}: {meta}")
-            
+
         return doc_metadata
 
     async def generate_answer(
@@ -321,39 +301,34 @@ class LLMService:
                 "answer": "Information not available in uploaded records",
                 "sources": []
             }
-        
-        # Step 1: Pre-scan for document metadata if not provided
+
         if doc_metadata is None:
             doc_metadata = await self._extract_document_metadata(context_chunks, source_documents, company_id=company_id)
-        # Build context from chunks WITH source document information and preset metadata
+
         context_parts = []
         for i, chunk in enumerate(context_chunks):
             doc_name = source_documents[i] if i < len(source_documents) else "Unknown"
-            
-            # Add metadata hint to the context block if available
+
             meta_str = ""
             if doc_metadata and doc_name in doc_metadata:
                 m = doc_metadata[doc_name]
                 meta_str = f" [TYPE: {m.get('document_type', 'Unknown')}, STATEMENT_BANK: {m['bank_name']}, HOLDER: {m['account_holder']}]"
-                
+
             context_parts.append(f"[Context {i+1} - Source: {doc_name}{meta_str}]\n{chunk}")
-        
+
         context = "\n\n".join(context_parts)
-        
-        # Get current date for relative time queries
+
         today = date.today()
         current_date_str = today.strftime("%d-%m-%Y")
         current_year = today.year
-        
-        # Retrieve relevant feedback/corrections for this query
-        # This is the "Learning" part of the Agent
+
         feedback_context = ""
         try:
             if company_id:
-                # Generate embedding for the query to find similar past mistakes
+
                 from app.services.deps import embedding_service
                 q_emb = embedding_service.generate_embedding(question)
-                
+
                 relevant_feedback = vector_store.query_feedback(q_emb, company_id)
                 if relevant_feedback:
                     feedback_context = "\n**LESSONS LEARNED (PAST USER CORRECTIONS):**\n"
@@ -366,7 +341,6 @@ class LLMService:
             print(f"[WARNING] Failed to retrieve feedback: {e}")
             feedback_context = ""
 
-        # Enhanced Financial Assistant Prompt
         prompt = f"""You are an expert financial assistant designed to analyze and extract information from uploaded bank documents such as statements, ledgers, journals, Balance Sheets, and Profit & Loss statements. Your task is to help users find specific transactions or understand financial summaries by interpreting their queries.
 
 **CURRENT SYSTEM DATE:** {current_date_str} (Use this to resolve "this year", "previous year", "last month", etc. Previous year = {current_year - 1})
@@ -408,16 +382,16 @@ class LLMService:
      - Then process the entire "ASSETS" column/side first.
      - Output them as TWO SEPARATE TABLES, one after the other.
    - **BALANCE SHEET COMPLETENESS**: For a Balance Sheet, you MUST provide BOTH an "ASSETS" table AND an "EQUITY AND LIABILITIES" table. DO NOT stop after the first table.
-   - **STRICT FORMATTING**: 
+   - **STRICT FORMATTING**:
      - **START DIRECTLY** with the first markdown table.
      - **DO NOT** include any report titles, headers, or introductory text (e.g. NO "BALANCE SHEET").
      - **DO NOT** use markdown headers (#) or bolding (**).
      - **DO NOT** wrap the entire response in markdown code blocks (```markdown or ```).
-   - **REPORT FORMAT**: 
+   - **REPORT FORMAT**:
       | Particulars | Amount |
       | :--- | :--- |
       | [Row Data] | [Amount] |
-      
+
       {{"transactions": []}}
    - If the request is for a report and you found NO such report in the context, return:
      "{{"transactions": [], "message": "I could not find a structured [Report Type] table in the provided documents."}}"
@@ -426,7 +400,7 @@ class LLMService:
    - Identify the SPECIFIC INTENT: Is the user asking for "Cash", "UPI", "ATM", "NEFT", etc.?
    - **CASH FILTER**: If the user asks for "Cash", you MUST EXCLUDE any transaction that contains UPI identifiers, VPA IDs, or NEFT/IMPS markers. ONLY include "CASH", "ATM", "WITHDRAWAL", "SELF", or "WDL".
    - **UPI FILTER**: If the user asks for "UPI", you MUST EXCLUDE any transaction that contains "CASH" or "ATM" identifiers.
-   - **STRICT EXCLUSION**: Your goal is NOT to find "similar" things, but to find EXACT matches for the requested type. 
+   - **STRICT EXCLUSION**: Your goal is NOT to find "similar" things, but to find EXACT matches for the requested type.
    - If a transaction is ambiguous or does not explicitly match the requested type, **SKIP IT**.
 
 5. **HANDLING TRANSACTION QUERIES:**
@@ -436,7 +410,7 @@ class LLMService:
    - UPI IDs, reference numbers, or payee names
    - Transaction types (UPI, NEFT, cash, etc.)
    - **BALANCE VALUES** - These are CRITICAL for determining transaction direction
-   
+
    **DATE PARSING & FILTERING (CRITICAL):**
    - **User Input Format:** The user provides dates in **YYYY-MM-DD** format (e.g., 2024-03-01).
    - **Document Format:** Bank statements often use **DD/MM/YYYY** or **DD-MM-YYYY** (e.g., 01/03/2024).
@@ -472,20 +446,20 @@ class LLMService:
    - If there are 100 matching records, return all 100
    - If there are 1000 matching records, return all 1000
    - COMPLETENESS is more important than brevity
-   
+
    **🚨 CRITICAL: CREDIT TRANSACTION IDENTIFICATION (HIGHEST PRIORITY) 🚨**
-   
+
    **CREDITS ARE MONEY COMING IN - THEY MUST BE EXTRACTED AND VISIBLE:**
    - **CREDIT = Money INCOMING** (Deposits, Receipts, Salary, Interest, Refunds, Dividends, Transfers Received, etc.)
    - **DEBIT = Money OUTGOING** (Withdrawals, Payments, Expenses, Transfers Sent, etc.)
-   
+
    **BANK STATEMENT COLUMN STRUCTURE:**
    - Bank statements typically have THREE numeric columns: **[Withdrawal/Debit] [Deposit/Credit] [Balance]**
    - In plain text, these appear as three consecutive numbers separated by spaces
    - **THE SECOND NUMBER IS ALMOST ALWAYS THE CREDIT COLUMN**
-   
+
    **CREDIT IDENTIFICATION RULES (MANDATORY - FOLLOW THIS EXACT ORDER):**
-   
+
    **STEP 1: BALANCE COMPARISON (PRIMARY & MANDATORY METHOD - USE THIS FIRST):**
    - **FOR EVERY TRANSACTION, YOU MUST:**
      1. Identify the balance value on the current line
@@ -493,85 +467,85 @@ class LLMService:
      3. Compare: Current Balance vs Previous Balance
      4. If Current Balance > Previous Balance → **CREDIT** (balance increased = money came in)
      5. If Current Balance < Previous Balance → **DEBIT** (balance decreased = money went out)
-   
+
    - **Examples:**
      - Previous line balance: 19,773.73
      - Current line: "22/11/24 TXN-NARRATION-DATA 350.00 20,123.73"
      - Current balance: 20,123.73
      - Comparison: 20,123.73 > 19,773.73 → Balance INCREASED → **CREDIT**
-     
+
      - Previous line balance: 20,123.73
      - Current line: "22/11/24 PAYMENT-DETAIL 500.00 19,623.73"
      - Current balance: 19,623.73
      - Comparison: 19,623.73 < 20,123.73 → Balance DECREASED → **DEBIT**
-   
+
    - **CRITICAL**: This method works for ALL bank statement formats, even when columns are unclear
    - **CRITICAL**: If you cannot find a previous balance, look for the opening balance or use the first transaction's balance as reference
-   
+
    **STEP 2: COLUMN POSITION CHECK (SECONDARY METHOD - USE IF BALANCE COMPARISON IS UNCLEAR):**
       - If you see: "Date Description 0.00 500.00 Balance" → The 500.00 is in the 2nd column = **CREDIT**
       - If you see: "Date Description 500.00 0.00 Balance" → The 500.00 is in the 1st column = **DEBIT**
       - **ALWAYS check BOTH columns - never assume the first number is the only transaction**
-   
+
    **STEP 3: KEYWORD DETECTION (TERTIARY METHOD - USE AS CONFIRMATION):**
       - **CREDIT keywords**: "Deposit", "CR", "Credit", "Interest", "Received", "Refund", "Salary", "Inward", "Credit to", "Received from", "NEFT-CREDIT", "IMPS-CREDIT", "RTGS-CREDIT", "Dividend", "Bonus", "Reversal", "Reversal of", "Refund of"
       - **DEBIT keywords**: "Withdrawal", "DR", "Debit", "Payment", "Paid", "Outward", "Payment to", "Transfer to", "NEFT-DEBIT", "IMPS-DEBIT", "RTGS-DEBIT"
       - If description contains CREDIT keywords → **direction = "CREDIT"**
       - If description contains DEBIT keywords → **direction = "DEBIT"**
-   
+
    **STEP 4: ZERO VALUE MARKERS**:
       - **DO NOT IGNORE 0.00 VALUES** - They indicate which column has the actual transaction
       - Pattern: "0.00 500.00" → 500.00 is a **CREDIT** (first column is 0, second has value)
       - Pattern: "500.00 0.00" → 500.00 is a **DEBIT** (first column has value, second is 0)
-   
+
    **STEP 5: SINGLE AMOUNT DETECTION**:
       - If only ONE amount appears on a line (format: "Date Description Amount Balance"):
         - **FIRST**: Compare balance with previous line → If increased = **CREDIT**, if decreased = **DEBIT**
         - **THEN**: Check for CREDIT keywords in description → "Received", "Credit", "Interest", "CR" → **CREDIT**
         - **THEN**: Check for DEBIT keywords → "Paid", "Payment", "Debit", "DR" → **DEBIT**
         - **DEFAULT**: If balance increased, it's a **CREDIT** (this is the most reliable indicator)
-   
+
    **STEP 6: SMOOSHED NUMBERS**:
       - If numbers appear together like "100.005000.00", split them
       - First number = Transaction amount
       - Second number = Balance
       - Compare with previous balance to determine direction
-   
+
    **CREDIT EXTRACTION EXAMPLES (REAL BANK STATEMENT FORMATS):**
-   
+
    **Example 1 - Two Number Format (Amount + Balance):**
    - Previous balance: 19,773.73
    - Line: "22/11/24 TXN-NARRATION-DATA SINGH-PAYTMQR1LJPTAZGXV@PAYTM 350.00 20,123.73"
    - Current balance: 20,123.73
-   - Comparison: 20,123.73 > 19,773.73 → Balance INCREASED → **CREDIT** 
-   
+   - Comparison: 20,123.73 > 19,773.73 → Balance INCREASED → **CREDIT**
+
    **Example 2 - Three Number Format (Debit + Credit + Balance):**
    - Line: "22/11/24 Salary Credit 0.00 50000.00 60000.00"
    - Previous balance: 10,000.00
    - Current balance: 60,000.00
-   - Comparison: 60,000.00 > 10,000.00 → Balance INCREASED → **CREDIT** 
-   - Also: 50,000.00 is in 2nd column (Credit column) → Confirms **CREDIT** 
-   
+   - Comparison: 60,000.00 > 10,000.00 → Balance INCREASED → **CREDIT**
+   - Also: 50,000.00 is in 2nd column (Credit column) → Confirms **CREDIT**
+
    **Example 3 - Single Amount with Balance:**
    - Previous balance: 10,000.00
    - Line: "22/11/24 RECEIVED-DATA from John 1000.00 11000.00"
    - Current balance: 11,000.00
-   - Comparison: 11,000.00 > 10,000.00 → Balance INCREASED → **CREDIT** 
-   - Also: Keyword "RECEIVED" → Confirms **CREDIT** 
-   
+   - Comparison: 11,000.00 > 10,000.00 → Balance INCREASED → **CREDIT**
+   - Also: Keyword "RECEIVED" → Confirms **CREDIT**
+
    **Example 4 - Interest Payment:**
    - Previous balance: 10,000.00
    - Line: "22/11/24 Interest 500.00 10500.00"
    - Current balance: 10,500.00
-   - Comparison: 10,500.00 > 10,000.00 → Balance INCREASED → **CREDIT** 
-   
+   - Comparison: 10,500.00 > 10,000.00 → Balance INCREASED → **CREDIT**
+
    **Example 5 - Refund:**
    - Previous balance: 10,000.00
    - Line: "22/11/24 Refund 0.00 2000.00 12000.00"
    - Current balance: 12,000.00
-   - Comparison: 12,000.00 > 10,000.00 → Balance INCREASED → **CREDIT** 
-   - Also: 2,000.00 is in 2nd column (Credit column) → Confirms **CREDIT** 
-   
+   - Comparison: 12,000.00 > 10,000.00 → Balance INCREASED → **CREDIT**
+   - Also: 2,000.00 is in 2nd column (Credit column) → Confirms **CREDIT**
+
    **MANDATORY VALIDATION FOR EVERY TRANSACTION:**
    - **BEFORE marking direction, you MUST:**
      1.  Find the balance on the current line
@@ -580,13 +554,13 @@ class LLMService:
      4.  If Current > Previous → Mark as **CREDIT**
      5.  If Current < Previous → Mark as **DEBIT**
      6.  If Current = Previous → Check for other indicators (rare case)
-   
+
    - **AFTER extracting each transaction, verify:**
      1. Did I compare the balance with the previous line? (REQUIRED)
      2. Did I check BOTH amount columns if present?
      3. Did I look for CREDIT/DEBIT keywords as confirmation?
      4. If balance increased, did I mark it as "CREDIT"? (DO NOT mark as DEBIT if balance increased!)
-   
+
    - **CRITICAL RULES:**
      - **DO NOT SKIP CREDITS** - They are just as important as debits
    - **BALANCE INCREASE = CREDIT** - This is the most reliable indicator
@@ -609,7 +583,7 @@ class LLMService:
         }}
       ]
     }}
-   
+
    **DIRECTION DETERMINATION (MANDATORY FOR EVERY TRANSACTION):**
    - Before setting "direction", you MUST:
      1. Identify the balance on the current transaction line
@@ -618,12 +592,12 @@ class LLMService:
         - If current balance > previous balance → "direction": "CREDIT"
         - If current balance < previous balance → "direction": "DEBIT"
      4. If you cannot find previous balance, look for opening balance or use column position/keywords
-   
+
    - **CRITICAL**: If you found NO records in this specific context block, return an empty list: {{"transactions": []}}.
    - **CRITICAL**: Do NOT list "0.00" as the transaction amount. Use the actual numeric value from the other column.
    - **CRITICAL**: Do NOT default all transactions to "DEBIT". Many transactions are CREDITS - use balance comparison to determine.
 
-**GOAL**: Be helpful, comprehensive, and professional. Provide a **detailed and thorough analysis** of the found information. Do not give short or one-line answers. Explain the context, any trends you see, and all relevant details found in the documents. 
+**GOAL**: Be helpful, comprehensive, and professional. Provide a **detailed and thorough analysis** of the found information. Do not give short or one-line answers. Explain the context, any trends you see, and all relevant details found in the documents.
 
 **MANDATORY FORMATTING**:
 - Your response **MUST** be structured with multiple bullet points.
@@ -636,36 +610,30 @@ class LLMService:
 
 **RESPONSE**:
 """
-        
+
         try:
             print(f"[INFO] Generating answer for question: {question[:100]}...")
             print(f"[DEBUG] Context chunks count: {len(context_chunks)}")
             print(f"[DEBUG] [Sending to AI] Input context preview: {context_chunks[0][:200] if context_chunks else 'NO CONTEXT'}...")
-            
-            # Use ainvoke for asynchronous LLM call
+
             response = await self.llm.ainvoke(prompt)
             print(f"[DEBUG] [Received from AI] Response length: {len(response.content)} chars")
-            
+
             if not response.content or not response.content.strip():
                 print(f"[WARNING] Received empty response from LLM (0 chars). Triggering retry...")
                 raise ValueError("Empty response from LLM")
-            
-            # Clean up the response
+
             answer = response.content.strip()
-            
-            # Use robust JSON extraction
+
             parsed_json = self._extract_json(answer)
-            
-            # CRITICAL: If _extract_json hit its fallback (indicated by "message" key and empty transactions),
-            # we must treat this as a FAILURE and retry, rather than silently returning 0 results.
+
             if "message" in parsed_json and not parsed_json.get("transactions"):
                 print(f"[WARNING] JSON extraction failed (Fallback triggered). Raw response preview: {answer[:100]}...")
                 raise ValueError("Failed to extract valid JSON from LLM response")
-            
+
             if "data" in parsed_json and "transactions" not in parsed_json:
                 parsed_json["transactions"] = parsed_json.pop("data")
-            
-            # Applying secondary Python filter
+
             if "transactions" in parsed_json:
                 initial_count = len(parsed_json["transactions"])
                 parsed_json["transactions"] = [tx for tx in parsed_json["transactions"] if not self._should_filter_transaction(tx, question)]
@@ -674,41 +642,29 @@ class LLMService:
 
             sources = list(set(source_documents))
 
-            # For summary-style questions, make the "where did it come from?" explicit in the
-            # human-readable answer shown in Search UI.
             intent_data = await self.classify_query_intent(question)
             is_summary = (intent_data.get("intent") == "SUMMARY")
-            # Clean up the human-readable answer (remove raw JSON blobs)
+
             human_answer = answer
-            
-            # 1. Remove markdown code blocks (```json ... ```)
+
             human_answer = re.sub(r'```(?:json)?\s*[\{\[][\s\S]*?[\}\]]\s*```', '', human_answer, flags=re.DOTALL)
-            
-            # 2. Remove raw JSON objects or arrays that might be leaked outside code blocks
-            # Surgical removal: Only remove blocks that look like structural JSON (keys, braces, lists)
-            # but preserve narrative text even if it contains braces.
+
             human_answer = re.sub(r'(?m)^[\{\[]\s*".*?"\s*:[\s\S]*?[\}\]]\s*$', '', human_answer, flags=re.DOTALL)
-            
-            # Robust fallback: If we still see multi-line JSON artifacts, we'll catch them in the line-by-line phase below.
-            
-            # 3. Final line-by-line check to remove any lines that look like JSON noise or keys
+
             human_lines = []
             for line in human_answer.split('\n'):
                 line_strip = line.strip()
-                # Skip lines that are purely JSON structural components or key-value pairs
+
                 if not line_strip:
                     human_lines.append(line)
                     continue
-                    
-                # Skip lines that are just a brace or bracket
+
                 if line_strip in ['{', '}', '[', ']', '},', '],']:
                     continue
-                
-                # Skip lines that look like "key": "value"
+
                 if re.match(r'^\s*"\w+"\s*:\s*.*?,?\s*$', line_strip):
                     continue
-                    
-                # Skip lines that are just JSON arrays or objects
+
                 if (line_strip.startswith('{') and line_strip.endswith('}')) or \
                    (line_strip.startswith('[') and line_strip.endswith(']')):
                     try:
@@ -719,7 +675,6 @@ class LLMService:
                 human_lines.append(line)
             human_answer = "\n".join(human_lines).strip()
 
-            # Fallback for human_answer if it was purely JSON that got scrubbed
             if not human_answer and "message" in parsed_json:
                 human_answer = parsed_json["message"]
             elif not human_answer and "transactions" in parsed_json and parsed_json["transactions"]:
@@ -729,7 +684,7 @@ class LLMService:
 
             return {
                 "answer": json.dumps(parsed_json),
-                "full_answer": human_answer, 
+                "full_answer": human_answer,
                 "sources": sources
             }
         except Exception as e:
@@ -756,31 +711,27 @@ class LLMService:
 
         sem = asyncio.Semaphore(6)
         print(f"[INFO] Starting parallel exhaustive extraction across {len(context_chunks)} chunks")
-        
-        # Step 1: Pre-scan for document metadata
+
         doc_metadata = await self._extract_document_metadata(context_chunks, source_documents, company_id=company_id)
 
-        # Intent-based document filtering
         intent_data = await self.classify_query_intent(question)
         intent = intent_data.get("intent")
         is_summary = (intent == "SUMMARY")
-        
+
         if is_summary and doc_metadata:
             wanted_types = set(intent_data.get("report_types", []))
-            
+
             def _doc_matches(doc_name: str) -> bool:
                 meta = doc_metadata.get(doc_name) or {}
                 doc_type = str(meta.get("document_type", "")).lower()
                 name = (doc_name or "").lower()
-                
-                # Rule 1: Match by AI-classified type
+
                 if wanted_types and any(w in doc_type for w in wanted_types):
                     return True
-                
-                # Rule 2: Match by filename hints (Fallback for summary)
+
                 name_hints = ["balance", "bl.", "bl_", "-bl", "bs.", "p&l", "pl.", "pl_", "-pl", "profit", "loss", "computation", "statement"]
                 if any(h in name for h in name_hints):
-                    return True # More permissive if it's already a SUMMARY intent
+                    return True
                 return False
 
             keep_docs = {d for d in set(source_documents) if _doc_matches(d)}
@@ -793,11 +744,10 @@ class LLMService:
             else:
                 print("[INFO] Summary focus (stream): No document matches found; using full context to avoid missing data.")
         elif doc_metadata:
-             # Transaction search focus: exclude documents that are obviously NOT statements/ledgers
-             # Relaxed: removed 'ledger', 'capital account' from exclusion to be more inclusive.
+
             exclude_types = ["computation", "balance sheet", "p&l", "profit", "loss", "tax", "computation of income"]
             skip_docs = {d for d, m in doc_metadata.items() if any(et in str(m.get("document_type", "")).lower() for et in exclude_types) or any(et in (d or "").lower() for et in ["cp.pdf", "computation"])}
-            
+
             if skip_docs:
                 filtered = [(c, d) for c, d in zip(context_chunks, source_documents) if d not in skip_docs]
                 if filtered:
@@ -806,10 +756,10 @@ class LLMService:
                     print(f"[INFO] Transaction search focus (sync): excluded {len(skip_docs)} non-transaction documents: {list(skip_docs)}")
                 else:
                     print(f"[WARNING] Transaction search focus (sync): All {len(skip_docs)} documents were filtered out. Using original context to avoid empty results.")
-        
+
         async def process_batch_with_sem(batch, batch_source_docs):
             async with sem:
-                # Add overall retry to handle non-429 LLM failures
+
                 for attempt in range(2):
                     try:
                         return await retry_with_backoff(self.generate_answer, question, batch, batch_source_docs, doc_metadata, company_id)
@@ -818,15 +768,13 @@ class LLMService:
                         print(f"[WARNING] Batch failed, retrying once... Error: {e}")
                         await asyncio.sleep(2)
 
-        # Create tasks for each batch
         tasks = []
-        # OVERLAP IMPLEMENTATION: Step size = batch_size - 1 (overlap of 1 chunk)
+
         step = batch_size - 1 if batch_size > 1 else 1
-        
-        # Calculate approximate total batches for progress tracking
+
         total_batches = (len(context_chunks) + step - 1) // step
         print(f"[INFO] Splitting {len(context_chunks)} chunks into ~{total_batches} batches with overlap (step={step}, batch_size={batch_size})")
-        
+
         batch_idx = 0
         for i in range(0, len(context_chunks), step):
             batch = context_chunks[i:i + batch_size]
@@ -835,7 +783,6 @@ class LLMService:
             print(f"[INFO] Batch {batch_idx}: Processing {len(batch)} chunks (start_idx={i})")
             tasks.append(process_batch_with_sem(batch, batch_source_docs))
 
-        # Execute all batches
         results = await asyncio.gather(*tasks)
 
         full_answer = ""
@@ -844,41 +791,36 @@ class LLMService:
 
         seen_answers = set()
         for result in results:
-            # IMPORTANT: Use the raw LLM text (markdown/table) when available so summary
-            # answers like Balance Sheets show up in Search UI.
+
             ans = (result.get('full_answer') or result['answer']).strip()
-            
-            # If it's a generic "no records" JSON, only add it to full_answer if we have NO other content yet
+
             is_empty_msg = '{"transactions": [], "message":' in ans or '{"transactions": []}' in ans
             if is_empty_msg:
                 if not full_answer.strip():
                     full_answer = ans
             else:
-                # If we have a real answer, append it
+
                 if '{"transactions": [], "message":' in full_answer:
-                    full_answer = ans # Replace "no data" message with real data
+                    full_answer = ans
                 else:
                     full_answer += ans + "\n---\n"
 
-
             try:
                 content = json.loads(result['answer'])
-                
-                # Dynamic extraction of the list
+
                 txs = []
                 if "transactions" in content: txs = content["transactions"]
                 elif "data" in content: txs = content["data"]
-                # Fallback scan values for list
+
                 elif not txs:
                      for val in content.values():
                         if isinstance(val, list) and val:
                             txs = val
                             break
-                
+
                 if txs:
                     for t in txs:
-                        # Create a fingerprint to avoid duplicates
-                        # Include direction to prevent credits and debits from being considered duplicates
+
                         desc = str(t.get('description', '')).strip().lower()
                         def _norm(val: str) -> str:
                             try: return f"{float(val.replace(',', '').strip()):.2f}"
@@ -889,16 +831,14 @@ class LLMService:
                         date = str(t.get('date', '')).strip()
                         direction = str(t.get('direction', '')).upper().strip()
                         tx_id = str(t.get('transaction_id', '')).strip()
-                        
-                        # Fingerprint: when a Ref ID exists, use it alone — same physical
-                        # transaction must never appear twice regardless of DEBIT/CREDIT assignment.
+
                         if tx_id:
                             fp = tx_id
                         elif balance and balance != '0.00':
                             fp = f"{date}|{amt}|{direction}|{balance}"
                         else:
                             fp = f"{date}|{amt}|{direction}"
-                        
+
                         if fp not in seen_fingerprints:
                             seen_fingerprints.add(fp)
                             all_transactions.append(t)
@@ -908,33 +848,27 @@ class LLMService:
             except Exception as e:
                 print(f"[DEBUG] Error merging batch result: {str(e)}")
 
-        # Extract source documents ONLY from transactions that made it into final results.
-        # WHITELIST: Only accept source_doc values that are actual filenames from ChromaDB metadata.
-        # This rejects any LLM-hallucinated string (e.g. "Bank Statement", "Context 1").
         valid_source_docs = set(source_documents)
         all_sources = set()
         for tx in all_transactions:
             source_doc = str(tx.get('source_document', '')).strip()
             if source_doc and source_doc in valid_source_docs:
                 all_sources.add(source_doc)
-        # Fallback: if LLM gave no valid source_doc matches, use all real source_documents instead.
+
         if not all_sources and not is_summary:
             all_sources = set([d for d in source_documents if d and d.lower() != 'unknown'])
-        # For summary outputs (no transactions), still expose the documents we actually scanned.
+
         if is_summary and not all_sources:
             all_sources = set([d for d in source_documents if d and d.lower() != "unknown"])
 
-        # Validate credit/debit distribution
         credit_count = sum(1 for tx in all_transactions if str(tx.get('direction', '')).upper() == 'CREDIT')
         debit_count = sum(1 for tx in all_transactions if str(tx.get('direction', '')).upper() == 'DEBIT')
         print(f"[INFO] Exhaustive extraction complete: {len(all_transactions)} total unique records ({credit_count} CREDITS, {debit_count} DEBITS)")
         print(f"[INFO] Source documents with transactions: {len(all_sources)} documents")
-        
-        # Calculate total before deduplication for comparison
+
         total_before_dedup = sum(len(json.loads(r['answer']).get('transactions', [])) for r in results)
         print(f"[INFO] Total transactions before deduplication: {total_before_dedup}, after: {len(all_transactions)}")
-        
-        # Warn if credits seem missing
+
         if len(all_transactions) > 10 and credit_count == 0:
             print(f"[WARNING] Large dataset ({len(all_transactions)} transactions) with zero credits. This may indicate credit extraction issues.")
         elif len(all_transactions) > 0 and credit_count == 0:
@@ -943,7 +877,6 @@ class LLMService:
             credit_percentage = (credit_count / len(all_transactions)) * 100
             print(f"[INFO] Credit transactions: {credit_count} ({credit_percentage:.1f}% of total)")
 
-        # APPLY SECONDARY PYTHON FILTER
         initial_count = len(all_transactions)
         all_transactions = [tx for tx in all_transactions if not self._should_filter_transaction(tx, question)]
         if initial_count > len(all_transactions):
@@ -954,7 +887,6 @@ class LLMService:
             "full_answer": full_answer,
             "sources": list(all_sources)
         }
-
 
     async def generate_summary_report(
         self,
@@ -968,15 +900,12 @@ class LLMService:
         if not context_chunks:
             return {"answer": "No document content provided.", "sources": []}
 
-        # SECONDARY SAFETY CAP: Ensure context doesn't explode if the API caller forgot to cap it.
-        # 250 chunks ~ 125k-150k tokens, which is safe for a 256k limit including response headroom.
         CONTEXT_CAP = 250
         if len(context_chunks) > CONTEXT_CAP:
             print(f"[WARNING] generate_summary_report: Capping context from {len(context_chunks)} to {CONTEXT_CAP} chunks for safety.")
             context_chunks = context_chunks[:CONTEXT_CAP]
             source_documents = source_documents[:CONTEXT_CAP]
 
-        # Combine chunks into a single text block for the LLM
         combined_context = "\n\n".join(context_chunks)
         sources = sorted(set([d for d in source_documents or [] if d and d.lower() != "unknown"]))
 
@@ -1014,49 +943,40 @@ class LLMService:
             answer = response.content.strip() if response.content else ""
             print(f"[DEBUG] [Received from AI] Response length: {len(answer)} chars")
             print(f"[DEBUG] [Raw AI Response Preview]: {answer[:500]}...")
-            
+
             if not answer:
                 print(f"[WARNING] LLM returned empty response for summary report. Retrying with smaller context...")
-                # Fallback: retry with only first 100 chunks if first attempt failed
+
                 if len(context_chunks) > 100:
                     context_chunks = context_chunks[:100]
                     combined_context = "\n\n".join(context_chunks)
-                    # Re-run with smaller context
+
                     response = await self.llm.ainvoke(prompt)
                     answer = response.content.strip() if response.content else ""
                     print(f"[DEBUG] [Retry] Received {len(answer)} chars")
-            
-            # Extract JSON and metadata
+
             parsed_json = self._extract_json(answer)
-            
-            # Clean up the human-readable answer (remove raw JSON blobs)
+
             human_answer = answer
-            
-            # 1. Remove markdown code blocks (```json ... ```)
+
             human_answer = re.sub(r'```(?:json)?\s*[\{\[][\s\S]*?[\}\]]\s*```', '', human_answer, flags=re.DOTALL)
-            
-            # 2. Remove raw JSON objects or arrays that might be leaked outside code blocks
-            # This follows a greedy approach to find the largest { } or [ ] blocks
+
             human_answer = re.sub(r'(?m)^[\{\[].*?[\}\]]$', '', human_answer, flags=re.DOTALL)
-            
-            # 3. Final line-by-line check to remove any lines that look like JSON noise or keys
+
             human_lines = []
             for line in human_answer.split('\n'):
                 line_strip = line.strip()
-                # Skip lines that are purely JSON structural components or key-value pairs
+
                 if not line_strip:
                     human_lines.append(line)
                     continue
-                    
-                # Skip lines that are just a brace or bracket
+
                 if line_strip in ['{', '}', '[', ']', '},', '],']:
                     continue
-                
-                # Skip lines that look like "key": "value"
+
                 if re.match(r'^\s*"\w+"\s*:\s*.*?,?\s*$', line_strip):
                     continue
-                    
-                # Skip lines that are just JSON arrays or objects
+
                 if (line_strip.startswith('{') and line_strip.endswith('}')) or \
                    (line_strip.startswith('[') and line_strip.endswith(']')):
                     try:
@@ -1067,7 +987,6 @@ class LLMService:
                 human_lines.append(line)
             human_answer = "\n".join(human_lines).strip()
 
-            # Ensure the structured data is passed back in the 'answer' field for the frontend
             return {
                 "answer": json.dumps(parsed_json),
                 "full_answer": human_answer,
@@ -1085,23 +1004,21 @@ class LLMService:
         q_lower = (question or "").lower()
         desc = str(t.get("description", "")).lower()
         t_type = str(t.get("type", "")).lower()
-        
-        # 1. CASH/ATM STRICT FILTER
+
         if any(kw in q_lower for kw in ["cash", "atm", "self", "withdrawal", "wdl"]):
-            # If user asks for CASH, block anything that looks like UPI or NEFT
+
             if any(kw in desc for kw in ["upi", "vpa", "@", "paytm", "g-pay", "phonepe", "neft", "imps", "rtgs"]):
                 return True
             if any(kw in t_type for kw in ["upi", "neft", "imps", "rtgs"]):
                 return True
-                
-        # 2. UPI STRICT FILTER
+
         if any(kw in q_lower for kw in ["upi", "vpa"]):
-            # If user asks for UPI, block anything that looks like Cash or ATM
+
             if any(kw in desc for kw in ["cash", "atm", "self", "withdrawal", "wdl"]):
                 return True
             if any(kw in t_type for kw in ["cash", "atm", "withdrawal"]):
                 return True
-                
+
         return False
 
     async def stream_exhaustive_answer(
@@ -1115,19 +1032,17 @@ class LLMService:
         """
         Stream extraction results as they are processed.
         """
-        
+
         if not context_chunks:
             yield json.dumps({"type": "error", "message": "No context provided"})
             return
 
-        # Step 1: Pre-scan for document metadata
         doc_metadata = await self._extract_document_metadata(context_chunks, source_documents, company_id=company_id)
 
-        # Intent-based document filtering
         intent_data = await self.classify_query_intent(question)
         intent = intent_data.get("intent")
         is_summary = (intent == "SUMMARY")
-        
+
         filtered_sources_for_summary = None
         if is_summary and doc_metadata:
             wanted_types = set(intent_data.get("report_types", []))
@@ -1136,12 +1051,10 @@ class LLMService:
                 meta = doc_metadata.get(doc_name) or {}
                 doc_type = str(meta.get("document_type", "")).lower()
                 name = (doc_name or "").lower()
-                
-                # Rule 1: Match by AI-classified type
+
                 if wanted_types and any(w in doc_type for w in wanted_types):
                     return True
-                
-                # Rule 2: Match by filename hints
+
                 name_hints = ["balance", "bl.", "bl_", "-bl", "bs.", "p&l", "pl.", "pl_", "-pl", "profit", "loss", "computation", "statement"]
                 if any(h in name for h in name_hints):
                     return True
@@ -1158,11 +1071,10 @@ class LLMService:
             else:
                 print("[INFO] Summary focus (stream): No document matches found; using full context to avoid missing data.")
         elif doc_metadata:
-            # Transaction focus: exclude documents that are obviously NOT statements/ledgers
-            # Relaxed: removed 'ledger', 'capital account' from exclusion to be more inclusive.
+
             exclude_types = ["computation", "balance sheet", "p&l", "profit", "loss", "tax", "computation of income"]
             skip_docs = {d for d, m in doc_metadata.items() if any(et in str(m.get("document_type", "")).lower() for et in exclude_types) or any(et in (d or "").lower() for et in ["cp.pdf", "computation"])}
-            
+
             if skip_docs:
                 filtered = [(c, d) for c, d in zip(context_chunks, source_documents) if d not in skip_docs]
                 if filtered:
@@ -1171,24 +1083,22 @@ class LLMService:
                     print(f"[INFO] Transaction search focus: excluded {len(skip_docs)} non-transaction documents: {list(skip_docs)}")
                 else:
                     print(f"[WARNING] Transaction search focus: All {len(skip_docs)} documents were filtered out. Using original context to avoid empty results.")
-        
-        # OVERLAP IMPLEMENTATION: Step size = batch_size - 1 (overlap of 1 chunk)
+
         step = batch_size - 1 if batch_size > 1 else 1
         total_batches = (len(context_chunks) + step - 1) // step
         print(f"[INFO] Splitting {len(context_chunks)} chunks into ~{total_batches} batches with overlap (step={step}, batch_size={batch_size})")
 
         tasks = []
-        sem = asyncio.Semaphore(6) # Increased for speed (Higher throughput)
-        
+        sem = asyncio.Semaphore(6)
+
         async def process_batch_with_sem(batch, batch_source_docs):
             async with sem:
-                # Add overall retry to handle non-429 LLM failures and empty responses
-                # Increased retries to 3 to handle flaky free-tier models
+
                 for attempt in range(3):
                     try:
                         return await retry_with_backoff(self.generate_answer, question, batch, batch_source_docs, doc_metadata, company_id)
                     except Exception as e:
-                        if attempt == 2: 
+                        if attempt == 2:
                             print(f"[ERROR] Batch failed after 3 attempts. Last error: {e}")
                             raise e
                         print(f"[WARNING] Stream batch failed (Attempt {attempt+1}/3), retrying... Error: {e}")
@@ -1196,7 +1106,6 @@ class LLMService:
 
         print(f"[INFO] Streaming exhaustive extraction: {len(context_chunks)} chunks")
 
-        # Explicitly create Tasks so we can cancel them if the stream is aborted
         running_tasks = []
         batch_idx = 0
         for i in range(0, len(context_chunks), step):
@@ -1204,7 +1113,7 @@ class LLMService:
             batch_source_docs = source_documents[i:i + batch_size]
             batch_idx += 1
             print(f"[INFO] Stream Batch {batch_idx}: Processing {len(batch)} chunks (start_idx={i})")
-            # Create task directly
+
             task = asyncio.create_task(process_batch_with_sem(batch, batch_source_docs))
             running_tasks.append(task)
 
@@ -1213,52 +1122,46 @@ class LLMService:
         all_credit_count = 0
         all_debit_count = 0
         all_sources = set()
-        seen_fingerprints = set() # For streaming de-duplication
-        all_unique_transactions = []  # Store all transactions to extract sources at end
-        full_answers = [] # Aggregated textual responses
+        seen_fingerprints = set()
+        all_unique_transactions = []
+        full_answers = []
 
         try:
-            # Parallel Processing for Faster Time-to-First-Byte
-            # Use as_completed to yield results as soon as ANY batch finishes
+
             for task in asyncio.as_completed(running_tasks):
                 try:
                     result = await task
                     completed_count += 1
-                
-                    # yield progress
+
                     yield json.dumps({
                         "type": "progress",
                         "completed": completed_count,
                         "total": total_batches,
                         "percent": int((completed_count / total_batches) * 100)
                     })
-                
-                    # Collect textual answer
+
                     if result.get('full_answer'):
                         ans = result['full_answer'].strip()
-                        # Skip if it's just boilerplate "not found" or purely JSON-like
+
                         is_bad = any(kw in ans.lower() for kw in ["not find", "no transactions", "not available"]) or ans.startswith('{') or ans.startswith('[')
-                    
+
                         if is_bad:
-                            # Only keep if we have nothing else yet
+
                             if all_transactions_count == 0 and not full_answers:
                                 full_answers.append(ans)
                         else:
-                            # If we have real data, remove previous placeholders and JSON
+
                             full_answers = [a for a in full_answers if not (any(kw in a.lower() for kw in ["not find", "no transactions", "not available"]) or a.startswith('{') or a.startswith('['))]
                             if ans not in full_answers:
                                 full_answers.append(ans)
 
-                
-                    # Process result
                     try:
                         content = json.loads(result['answer'])
-                    
-                        # DYNAMIC: Find the data list
+
                         txs = []
                         if content.get('transactions'): txs = content['transactions']
                         elif content.get('data'): txs = content['data']
-                        # Fallback scan values for list
+
                         elif not txs:
                              for val in content.values():
                                 if isinstance(val, list) and val:
@@ -1268,8 +1171,7 @@ class LLMService:
                         if txs:
                             unique_txs = []
                             for t in txs:
-                                # Create a fingerprint to avoid duplicates
-                                # Include direction to prevent credits and debits from being considered duplicates
+
                                 desc = str(t.get('description', '')).strip().lower()
                                 def _norm(val: str) -> str:
                                     try: return f"{float(val.replace(',', '').strip()):.2f}"
@@ -1280,27 +1182,25 @@ class LLMService:
                                 date = str(t.get('date', '')).strip()
                                 direction = str(t.get('direction', '')).upper().strip()
                                 tx_id = str(t.get('transaction_id', '')).strip()
-                            
-                                # Fingerprint: when a Ref ID exists, use it alone — same physical
-                                # transaction must never appear twice regardless of DEBIT/CREDIT assignment.
+
                                 if tx_id:
                                     fp = tx_id
                                 elif balance and balance != '0.00':
                                     fp = f"{date}|{amt}|{direction}|{balance}"
                                 else:
                                     fp = f"{date}|{amt}|{direction}"
-                            
+
                                 if fp not in seen_fingerprints:
-                                    # Apply secondary hard-coded filter
+
                                     if self._should_filter_transaction(t, question):
                                         print(f"[FILTER] Dropped non-matching transaction: {desc[:50]}")
                                         continue
-                                    
+
                                     seen_fingerprints.add(fp)
                                     unique_txs.append(t)
-                                    all_unique_transactions.append(t)  # Store for source extraction
+                                    all_unique_transactions.append(t)
                                 else:
-                                    # Log when a transaction is being skipped as duplicate
+
                                     skipped_direction = str(t.get('direction', '')).upper()
                                     if skipped_direction == 'CREDIT':
                                         print(f"[DEBUG] Skipping duplicate CREDIT transaction: {date}|{amt}|{desc[:50]}")
@@ -1320,10 +1220,10 @@ class LLMService:
                                 })
                         else:
                             print(f"[DEBUG] Stream batch {completed_count}: No new transactions found")
-                        
+
                     except Exception as e:
                         print(f"[WARNING] Failed to parse batch result in stream: {e}")
-                        
+
                 except Exception as e:
                     print(f"[ERROR] Stream batch failed: {e}")
                     yield json.dumps({"type": "error", "message": str(e)})
@@ -1332,7 +1232,7 @@ class LLMService:
             print(f"[INFO] Stream interrupted by client. Cancelling {len([ t for t in running_tasks if not t.done()])} pending tasks...")
             raise
         finally:
-            # Ensure all pending tasks are cancelled when the generator exits (success or error)
+
             cancelled_count = 0
             for task in running_tasks:
                 if not task.done():
@@ -1340,29 +1240,26 @@ class LLMService:
                     cancelled_count += 1
             if cancelled_count > 0:
                 print(f"[INFO] Cancelled {cancelled_count} pending background tasks.")
-        # Extract source documents ONLY from transactions that made it into final results.
-        # WHITELIST: Only accept source_doc values that are actual filenames from ChromaDB metadata.
-        # This rejects any LLM-hallucinated string (e.g. "Bank Statement", "Context 1").
+
         valid_source_docs = set(source_documents)
         for tx in all_unique_transactions:
             source_doc = str(tx.get('source_document', '')).strip()
             if source_doc and source_doc in valid_source_docs:
                 all_sources.add(source_doc)
-        # Fallback: if LLM gave no valid source_doc matches, use all real source_documents.
+
         if not all_sources and not is_summary:
             all_sources = set([d for d in source_documents if d and d.lower() != 'unknown'])
-        # For summary outputs (no transactions), still show the documents we scanned.
+
         if is_summary and not all_sources:
             if filtered_sources_for_summary is not None:
-                # If we filtered sources for the summary, use those specific sources
+
                 all_sources = set(filtered_sources_for_summary)
             else:
-                # Otherwise, fallback to all valid source documents
+
                 all_sources = set([d for d in source_documents if d and d.lower() != "unknown"])
 
-        # Final summary with credit/debit breakdown
         final_full_answer = "\n---\n".join(full_answers).strip()
-        # If we found transactions, scrub any remaining "not found" boilerplate from the text
+
         if all_transactions_count > 0:
             not_found_patterns = [
                 "I could not find the requested information in the documents.",
@@ -1384,4 +1281,3 @@ class LLMService:
             "sources": list(all_sources),
             "full_answer": final_full_answer
         })
-            

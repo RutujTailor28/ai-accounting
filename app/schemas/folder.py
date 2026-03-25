@@ -4,20 +4,17 @@ from uuid import UUID
 from pydantic import Field
 from app.schemas.base import CamelModel
 
-
 class FolderBase(CamelModel):
     name: str
     company_id: str
     parent_id: Optional[UUID] = None
     customer_id: Optional[UUID] = None
 
-
 class FolderCreate(CamelModel):
     """Schema for creating a folder - company_id is derived from auth token"""
     name: str
     parent_id: Optional[UUID] = None
     customer_id: Optional[UUID] = None
-
 
 class FolderResponse(FolderBase):
     id: UUID
@@ -29,7 +26,6 @@ class FolderResponse(FolderBase):
     class Config:
         from_attributes = True
 
-
 class FileBase(CamelModel):
     name: str
     folder_id: UUID
@@ -39,7 +35,6 @@ class FileBase(CamelModel):
     company_id: str
     size: Optional[int] = None
 
-
 class FileResponse(FileBase):
     id: UUID
     created_by: UUID
@@ -47,7 +42,6 @@ class FileResponse(FileBase):
 
     class Config:
         from_attributes = True
-
 
 class FolderWithFilesResponse(FolderResponse):
     files: List[FileResponse] = Field(default_factory=list)

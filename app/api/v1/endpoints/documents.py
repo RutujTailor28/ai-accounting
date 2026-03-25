@@ -20,7 +20,6 @@ import gc
 
 router = APIRouter()
 
-# Initialize services
 document_parser = DocumentParser()
 text_chunker = TextChunker()
 
@@ -41,21 +40,19 @@ async def _process_document_background(
     try:
         print(f"[BG-TASK] Starting background processing for: {filename}")
         file_obj = io.BytesIO(file_content)
-        
-        # Parse document
+
         text = document_parser.parse(file_obj, filename)
         if not text or not text.strip():
             print(f"[BG-TASK][ERROR] No text extracted from {filename}")
             return
 
-        # Extract Date from Content
         content_date_ts = None
         date_patterns = [
             r'\b(\d{4})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])\b',
             r'\b(0[1-9]|[12]\d|3[01])-(0[1-9]|1[0-2])-(\d{4})\b',
             r'\b(0[1-9]|[12]\d|3[01])/(0[1-9]|1[0-2])/(\d{4})\b'
         ]
-        
+
         for pattern in date_patterns:
             match = re.search(pattern, text)
             if match:
@@ -68,27 +65,25 @@ async def _process_document_background(
                     content_date_ts = dt.timestamp()
                     break
                 except: continue
-                    
+
         if not content_date_ts:
             content_date_ts = datetime.now(timezone.utc).timestamp()
 
-        # Chunk, Embed, and Store in smaller batches to prevent OOM
         chunks = text_chunker.chunk_text(text)
-        if not chunks: 
+        if not chunks:
             print(f"[BG-TASK] No chunks created for {filename}")
             return
-        
+
         total_chunks = len(chunks)
-        batch_size = 50  # Process in small batches
+        batch_size = 50
         print(f"[BG-TASK] Processing {total_chunks} chunks in batches of {batch_size}...")
 
-        # Move these to top level eventually, but keeping for now as requested
         now_ts = datetime.now(timezone.utc).timestamp()
 
         for i in range(0, total_chunks, batch_size):
             batch_chunks = chunks[i:i + batch_size]
             batch_embeddings = embedding_service.generate_embeddings(batch_chunks)
-            
+
             batch_metadatas = [
                 {
                     "company_id": company_id,
@@ -104,23 +99,22 @@ async def _process_document_background(
                 }
                 for j in range(len(batch_chunks))
             ]
-            
+
             vector_store.add_documents(
-                texts=batch_chunks, 
-                embeddings=batch_embeddings, 
+                texts=batch_chunks,
+                embeddings=batch_embeddings,
                 metadatas=batch_metadatas
             )
-            
+
             print(f"[BG-TASK] Processed batch {i//batch_size + 1}/{(total_chunks-1)//batch_size + 1} ({len(batch_chunks)} chunks)")
-            
-            # Explicit garbage collection to free memory between batches
+
             batch_embeddings = None
             batch_chunks = None
             batch_metadatas = None
             gc.collect()
 
         print(f"[BG-TASK] DONE: Successfully processed {filename} ({total_chunks} chunks in total).")
-        
+
     except Exception as e:
         print(f"[BG-TASK][ERROR] Critical failure for {filename}: {str(e)}")
         import traceback
@@ -130,11 +124,11 @@ async def _process_document_background(
 async def list_all_files(user=Depends(get_current_user)):
     """List all files for the authenticated user's company."""
     try:
-        # Get company_id from profile
+
         profile_res = supabase.table("profiles").select("company_id").eq("id", user.id).single().execute()
         if not profile_res.data or not profile_res.data.get("company_id"):
             raise HTTPException(status_code=400, detail="User profile or company assignment missing")
-        
+
         company_id = profile_res.data["company_id"]
 
         result = supabase.table("files") \
@@ -143,13 +137,13 @@ async def list_all_files(user=Depends(get_current_user)):
             .is_("deleted_at", "null") \
             .order("created_at", desc=True) \
             .execute()
-        
+
         files = result.data or []
         for f in files:
             if f.get("s3_key"):
-                # Use standard 1 hour expiry for listing
+
                 f["s3_url"] = s3_storage.generate_presigned_url(f["s3_key"], expires_in=3600)
-        
+
         return files
     except Exception as e:
         print(f"[ERROR] Error listing all files: {str(e)}")
@@ -168,27 +162,24 @@ async def upload_document(
     Upload and process a document for RAG system with Folder management.
     """
     try:
-        # Step 0: Get user's company_id from profile (Security enforcement)
+
         profile_res = supabase.table("profiles").select("company_id").eq("id", user.id).single().execute()
         if not profile_res.data or not profile_res.data.get("company_id"):
             raise HTTPException(status_code=400, detail="User profile or company assignment missing")
-        
+
         company_id = profile_res.data["company_id"]
 
-        # Sanitize parent_id: "null" string or empty string should be None
         if parent_id and (parent_id.lower() == "null" or parent_id.strip() == ""):
             parent_id = None
-        
-        # Sanitize customer_id
+
         if customer_id and (customer_id.lower() == "null" or customer_id.strip() == ""):
             customer_id = None
 
         print(f"[INFO] Received upload request: file={file.filename}, folder={folder_name}, customer={customer_id}, company_id={company_id}")
-        
-        # Validate file extension
+
         if not file.filename:
             raise HTTPException(status_code=400, detail="Filename is required")
-        
+
         extension = f".{file.filename.split('.')[-1].lower()}"
         if extension not in DocumentParser.SUPPORTED_EXTENSIONS:
             raise HTTPException(
@@ -196,46 +187,40 @@ async def upload_document(
                 detail=f"Unsupported file type. Supported types: {', '.join(DocumentParser.SUPPORTED_EXTENSIONS)}"
             )
 
-        # Read file content
         file_content = await file.read()
         print(f"[INFO] File read complete: {len(file_content)} bytes")
         file_obj = io.BytesIO(file_content)
-        
-        # Step 1: Resolve Folder
+
         print(f"[INFO] Step 1: Resolving folder '{folder_name}' (parent_id: {parent_id}, customer_id: {customer_id})...")
-        
+
         target_folder_id = None
-        
-        # Folder Refinement Logic:
-        # If parent_id is provided, check if the parent folder's name matches the target folder_name
+
         if parent_id:
             parent_res = supabase.table("folders").select("name").eq("id", parent_id).single().execute()
             if parent_res.data and parent_res.data.get("name") == folder_name:
                 print(f"[INFO] Parent folder name matches target. Using parent folder directly: {parent_id}")
                 target_folder_id = parent_id
-        
+
         if not target_folder_id:
-            # Look for existing folder with same name and parent
-            # If parent_id is None, it's a root folder
+
             query = supabase.table("folders").select("id").eq("name", folder_name).eq("company_id", company_id)
             if parent_id:
                 query = query.eq("parent_id", parent_id)
             else:
                 query = query.is_("parent_id", "null")
-            
-            # Filter by customer_id if provided
+
             if customer_id:
                 query = query.eq("customer_id", customer_id)
             else:
                 query = query.is_("customer_id", "null")
-            
+
             check_folder = query.execute()
-            
+
             if check_folder.data:
                 target_folder_id = check_folder.data[0]['id']
                 print(f"[INFO] Using existing folder: {folder_name} (ID: {target_folder_id})")
             else:
-                # Create it
+
                 print(f"[INFO] Folder not found. Creating new folder: {folder_name}")
                 new_folder_data = {
                     "name": folder_name,
@@ -250,7 +235,6 @@ async def upload_document(
                 target_folder_id = new_folder.data[0]['id']
                 print(f"[INFO] Created new folder with ID: {target_folder_id}")
 
-        # Step 2: Upload to S3
         print(f"[INFO] Step 2: Uploading to S3 path: aiAccounting/{folder_name}/{file.filename}")
         s3_key = await s3_storage.upload_file(
             file_content=file_content,
@@ -260,8 +244,7 @@ async def upload_document(
         )
         s3_url = s3_storage.get_static_url(s3_key) if s3_key else None
         print(f"[INFO] DONE: Permanent S3 URL stored: {s3_url}")
-        
-        # Step 3: Save File Record (DB)
+
         print(f"[INFO] Step 3: Saving file record to database...")
         file_record = {
             "name": file.filename,
@@ -273,15 +256,14 @@ async def upload_document(
             "size": len(file_content),
             "created_by": user.id if hasattr(user, 'id') else None
         }
-        
+
         file_db_res = supabase_admin.table("files").insert(file_record).execute()
         if not file_db_res.data:
             print(f"[ERROR] Failed to save file record: {file_db_res}")
             raise HTTPException(status_code=500, detail="Failed to save file metadata to database")
-            
+
         print(f"[INFO] DONE: File record saved to database (Size: {len(file_content)} bytes).")
 
-        # Schedule background processing to prevent 502 timeouts
         background_tasks.add_task(
             _process_document_background,
             file_content=file_content,
@@ -293,16 +275,16 @@ async def upload_document(
             s3_key=s3_key,
             file_id=file_db_res.data[0]['id']
         )
-        
+
         return UploadResponse(
             message="Document uploaded. AI processing started in background.",
             document_name=file.filename,
-            chunks_created=0, 
+            chunks_created=0,
             company_id=company_id,
             s3_key=s3_key or "",
             s3_url=s3_url or ""
         )
-        
+
     except HTTPException:
         raise
     except Exception as e:
@@ -317,10 +299,10 @@ async def reset_vector_db(user=Depends(get_current_user)):
     """
     print(f"[WARNING] User {user.id} requested Vector DB reset")
     success = vector_store.reset_collection()
-    
+
     if not success:
         raise HTTPException(status_code=500, detail="Failed to reset vector database")
-        
+
     return {"message": "Vector database has been successfully reset. All AI memory is cleared."}
 
 @router.get("/{file_id}", response_model=FileResponse)
@@ -332,31 +314,30 @@ async def get_document(
     Get detailed metadata for a specific document.
     """
     try:
-        # Step 0: Get user's company_id
+
         profile_res = supabase.table("profiles").select("company_id").eq("id", user.id).single().execute()
         if not profile_res.data or not profile_res.data.get("company_id"):
             raise HTTPException(status_code=400, detail="User profile or company assignment missing")
-        
+
         company_id = profile_res.data["company_id"]
 
-        # 1. Get File Metadata and verify ownership
         result = supabase.table("files") \
             .select("*") \
             .eq("id", file_id) \
             .eq("company_id", company_id) \
             .is_("deleted_at", "null") \
             .execute()
-        
+
         if not result.data:
             raise HTTPException(status_code=404, detail="File not found or access denied")
-            
+
         file_data = result.data[0]
-        
+
         if file_data.get("s3_key"):
             file_data["s3_url"] = s3_storage.generate_presigned_url(file_data["s3_key"], expires_in=3600)
-            
+
         return file_data
-        
+
     except HTTPException:
         raise
     except Exception as e:
@@ -373,49 +354,47 @@ async def get_document_url(
     Generate a fresh temporary signed URL for a document.
     """
     try:
-        # Step 0: Get user's company_id
+
         profile_res = supabase.table("profiles").select("company_id").eq("id", user.id).single().execute()
         if not profile_res.data or not profile_res.data.get("company_id"):
             raise HTTPException(status_code=400, detail="User profile or company assignment missing")
-        
+
         company_id = profile_res.data["company_id"]
 
-        # 1. Get File Metadata and verify ownership
         result = supabase.table("files") \
             .select("*") \
             .eq("id", file_id) \
             .eq("company_id", company_id) \
             .execute()
-        
+
         if not result.data:
             raise HTTPException(status_code=404, detail="File not found or access denied")
-            
+
         file_data = result.data[0]
-        
+
         profile_res = supabase.table("profiles") \
             .select("company_id") \
             .eq("id", file_data.get("created_by")) \
             .single() \
             .execute()
-            
+
         s3_key = file_data.get("s3_key")
-        
+
         if not s3_key:
             raise HTTPException(status_code=404, detail="S3 key not found for this file")
-            
-        # 2. Generate Presigned URL
+
         url = s3_storage.generate_presigned_url(s3_key, expires_in=expires_in)
-        
+
         if not url:
             raise HTTPException(status_code=500, detail="Failed to generate presigned URL")
-            
+
         return {
             "fileId": file_id,
             "documentName": file_data.get("name"),
             "presignedUrl": url,
             "expiresIn": expires_in
         }
-        
+
     except HTTPException:
         raise
     except Exception as e:
@@ -435,44 +414,35 @@ async def delete_document(
     """
     try:
         print(f"[INFO] Request to delete file {file_id} by user {user.id}")
-        
-        # Step 0: Get user's company_id
+
         profile_res = supabase.table("profiles").select("company_id").eq("id", user.id).single().execute()
         if not profile_res.data or not profile_res.data.get("company_id"):
             raise HTTPException(status_code=400, detail="User profile or company assignment missing")
-        
+
         company_id = profile_res.data["company_id"]
 
-        # 1. Get File Metadata and verify ownership
         result = supabase.table("files") \
             .select("*") \
             .eq("id", file_id) \
             .eq("company_id", company_id) \
             .execute()
-        
+
         if not result.data:
             raise HTTPException(status_code=404, detail="File not found or access denied")
-            
+
         file_data = result.data[0]
         s3_key = file_data.get("s3_key")
         doc_name = file_data.get("name")
-        
-        # 1. Update Database (files table) to set deleted_at
+
         print(f"[INFO] Step 1: Soft-deleting record from Database: {file_id}")
         from datetime import datetime, timezone
         now = datetime.now(timezone.utc).isoformat()
-        
+
         db_result = supabase_admin.table("files") \
             .update({"deleted_at": now}) \
             .eq("id", file_id) \
             .execute()
-        
-        # NOTE: For "Soft Delete", we keep S3 and Vector Store data 
-        # but filter it out in queries. Hard delete from S3/Vector 
-        # could be moved to a separate cleanup job if desired.
 
-
-        # 2. Delete from Vector Database
         print(f"[INFO] Step 2: Removing document from Vector Store: {doc_name}")
         vector_store.delete_document(company_id, doc_name)
 
