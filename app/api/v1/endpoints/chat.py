@@ -202,8 +202,9 @@ async def save_chat_session(request: ChatSaveRequest, user=Depends(get_current_u
 async def list_chat_history(workspace_id: Optional[UUID] = None, customer_id: Optional[UUID] = None, user=Depends(get_current_user)):
     """List all unique chat sessions for a workspace or customer."""
     try:
-        if not workspace_id and not customer_id:
-            raise HTTPException(status_code=400, detail="Must provide either workspace_id or customer_id")
+        # Optional: remove the strict requirement if we want to support global history
+        # if not workspace_id and not customer_id:
+        #     raise HTTPException(status_code=400, detail="Must provide either workspace_id or customer_id")
 
         query = supabase.table("chat_messages") \
             .select("session_id, session_title, created_at, workspace_id, customer_id, file_names") \
@@ -215,6 +216,14 @@ async def list_chat_history(workspace_id: Optional[UUID] = None, customer_id: Op
             query = query.eq("customer_id", str(customer_id))
         elif workspace_id:
             query = query.eq("workspace_id", str(workspace_id))
+        else:
+            # If no specific context, filter by company_id to show all recent history
+            profile_res = supabase.table("profiles").select("company_id").eq("id", user.id).single().execute()
+            if profile_res.data and profile_res.data.get("company_id"):
+                query = query.eq("company_id", profile_res.data["company_id"])
+            else:
+                # Fallback to created_by if company_id is missing (should not happen)
+                query = query.eq("created_by", user.id)
 
         result = query.execute()
 

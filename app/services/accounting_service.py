@@ -34,9 +34,9 @@ class AccountingService:
         self.model_name = model.lower()
         self.is_free_model = ":free" in self.model_name
 
-        self.n_extractors = 10
-        self.n_classifiers = 10
-        self.worker_delay = 0.2
+        self.n_extractors = 15
+        self.n_classifiers = 15
+        self.worker_delay = 0.1
         print(f"[INFO] AccountingService initialized with {self.n_extractors} extractors, {self.n_classifiers} classifiers.")
 
         print(f"[INFO] AccountingService initialized with model={model}")
@@ -280,6 +280,7 @@ Go line-by-line. Find and include every skipped row. Output full JSON again. ━
 
         dynamic_business_rules = ""
         business_type = None
+        persistent_rules = []
         if customer_id:
             print(f"[RULES] Fetching dynamic rules for customer_id: {customer_id}")
             try:
@@ -292,20 +293,31 @@ Go line-by-line. Find and include every skipped row. Output full JSON again. ━
                     print(f"[RULES] Found Business Type: {business_type} for Customer: {customer_name}")
                     dynamic_business_rules += f"CUSTOMER BUSINESS TYPE: {business_type}\n"
 
-                query = supabase_admin.table("accounting_rules").select("rule_description")
-                query = query.eq("customer_id", customer_id)
+                query = supabase_admin.table("accounting_rules").select("rule_description", "created_at")
+                query = query.eq("customer_id", customer_id).order("created_at", desc=False)
                 rules_res = query.execute()
 
                 if rules_res.data:
                     dynamic_business_rules += "\n━━━ MANDATORY USER-DEFINED RULES (ABSOLUTE PRIORITY) ━━━\n"
-                    dynamic_business_rules += "FOLLOW THESE RULES BEFORE ANY OTHER ACCOUNTING PRINCIPLE:\n"
-                    print(f"[RULES] Successfully fetched {len(rules_res.data)} custom accounting rules.")
-                    for r in rules_res.data:
-                        rule_text = r['rule_description']
+                    
+                    # Filter: Only keep the LATEST profit target if multiple exist
+                    all_raw_rules = [r['rule_description'].replace("USER COMMAND: ", "") for r in rules_res.data]
+                    unique_rules = []
+                    profit_seen = False
+                    for rule in reversed(all_raw_rules):
+                        is_profit_rule = any(k in rule.lower() for k in ["as net profit", "as profit", "as net loss"])
+                        if is_profit_rule:
+                            if not profit_seen:
+                                unique_rules.append(rule)
+                                profit_seen = True
+                        else:
+                            unique_rules.append(rule)
+                    persistent_rules = list(reversed(unique_rules))
 
-                        clean_rule = rule_text.replace("USER COMMAND: ", "")
+                    print(f"[RULES] Successfully fetched and filtered {len(persistent_rules)} custom accounting rules (from {len(rules_res.data)} total).")
+                    for clean_rule in persistent_rules:
                         dynamic_business_rules += f"- {clean_rule}\n"
-                        print(f"[RULES] -> Applied Rule: {clean_rule}")
+                        print(f"[RULES] -> Active Rule: {clean_rule}")
                     dynamic_business_rules += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 else:
                     print(f"[RULES] No custom rules found for this customer.")
@@ -383,28 +395,9 @@ Go line-by-line. Find and include every skipped row. Output full JSON again. ━
                 amt = float(t.get('debit', 0) or t.get('credit', 0) or 0)
                 txn_sample_text += f"{i}. [{t.get('date')}] {t.get('narration')} (\u20b9{amt:,.2f})\n"
 
-            universal_prompt = f"""
+            refinement_sys_prompt = """
 You are a Senior Chartered Accountant AI. A user has given you an accounting instruction.
 Your job is to translate that instruction into a precise list of mutations on the transaction ledger.
-
-\u2501\u2501\u2501 USER COMMAND \u2501\u2501\u2501
-\"{question}\"
-\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501
-
-TODAY'S DATE: {today_str}
-TOTAL TRANSACTIONS IN LEDGER: {len(input_transactions)}
-
-CURRENT FINANCIAL STATE:
- - Total Income: \u20b9{cur_income:,.2f}
- - Total Expense: \u20b9{cur_expense:,.2f}
- - Current Net Profit: \u20b9{cur_profit:,.2f}
-
-SAMPLE TRANSACTIONS (first 100 shown by index):
-{txn_sample_text}
-
-\u2501\u2501\u2501 YOUR TASK \u2501\u2501\u2501
-Analyze the user command and return a JSON object with a list of "mutations".
-Each mutation tells Python exactly what to do. You can return MULTIPLE mutations for complex commands.
 
 MUTATION TYPES AND WHEN TO USE THEM:
 
@@ -460,25 +453,10 @@ MUTATION TYPES AND WHEN TO USE THEM:
      ]
    }}
 
-\u2501\u2501\u2501 IMPORTANT: TARGET PROFIT / TOTALS \u2501\u2501\u2501
-- If user wants "X as Net Profit", calculate the DELTA from Current Net Profit and use ADD_ENTRY to balance it.
-- DELTA = Target Profit - Current Net Profit.
-- If DELTA is Negative (Target < Current): Add an EXPENSE entry of abs(DELTA) to reduce profit.
-- If DELTA is Positive (Target > Current): Add an INCOME entry of DELTA to increase profit.
-- Account naming: Use "Profit Adjustment Entry" or "Ad-hoc Expense" for these balancing entries.
-
-\u2501\u2501\u2501 IMPORTANT RULES \u2501\u2501\u2501
+━━━━ IMPORTANT RULES ━━━━
 - AMOUNT INTEGRITY: In a RECLASSIFY, you MUST NOT change the amount of any transaction. Only change its account/category.
 - AD-HOC ENTRIES: If the user says "I want X as profit" or "add Y amount", ALWAYS use ADD_ENTRY with the Delta or specific amount.
 - CATEGORY MATCHING: Use "Income" for all revenue types and "Expense" for all cost types to ensure they sync with the P&L calculator.
-
-DOUBLE-ENTRY ACCOUNTING RULES (always follow):
-- Money IN (income, loans, capital received): DEBIT Bank/Cash \u2192 CREDIT Income/Liability/Capital
-- Money OUT (expenses, payments): DEBIT Expense/Asset \u2192 CREDIT Bank/Cash
-- Depreciation: DEBIT Depreciation Expense \u2192 CREDIT Accumulated Depreciation
-- Contra (cash to bank): DEBIT Bank Account \u2192 CREDIT Cash Account
-- Opening balance (asset): DEBIT Asset Account \u2192 CREDIT Capital/Opening Balance
-- GST payable: DEBIT Input/Sales Account \u2192 CREDIT GST Payable
 
 CATEGORIES TO USE:
 - "Income" for revenue, sales, fees received
@@ -487,10 +465,50 @@ CATEGORIES TO USE:
 - "Fixed Assets" for machinery, equipment, furniture, vehicles
 - "Liability" for loans, creditors, GST payable, TDS payable
 - "Equity" for capital, reserves, retained earnings, drawings
+"""
+
+            combined_hist = "\n".join([f"- {r}" for r in persistent_rules]) if persistent_rules else "None"
+            
+            universal_prompt = f"""
+{refinement_sys_prompt}
+
+━━━━ HISTORICAL USER COMMANDS (RE-APPLY THESE TOO) ━━━━
+{combined_hist}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+━━━━ NEW USER COMMAND (PRIMARY TARGET) ━━━━
+"{question}"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+TODAY'S DATE: {today_str}
+TOTAL TRANSACTIONS IN LEDGER: {len(input_transactions)}
+
+CURRENT FINANCIAL STATE:
+ - Total Income: ₹{cur_income:,.2f}
+ - Total Expense: ₹{cur_expense:,.2f}
+ - Current Net Profit: ₹{cur_profit:,.2f}
+
+SAMPLE TRANSACTIONS (first 100 shown by index):
+{txn_sample_text}
+
+━━━━ IMPORTANT: TARGET PROFIT / TOTALS ━━━━
+- If user wants "X as Net Profit", calculate the DELTA from Current Net Profit and use ADD_ENTRY to balance it.
+- DELTA = Target Profit - Current Net Profit.
+- If DELTA is Negative (Target < Current): Add an EXPENSE entry of abs(DELTA) to reduce profit.
+- If DELTA is Positive (Target > Current): Add an INCOME entry of DELTA to increase profit.
+- Account naming: Use "Profit Adjustment Entry" or "Ad-hoc Expense" for these balancing entries.
+
+DOUBLE-ENTRY ACCOUNTING RULES (always follow):
+- Money IN (income, loans, capital received): DEBIT Bank/Cash → CREDIT Income/Liability/Capital
+- Money OUT (expenses, payments): DEBIT Expense/Asset → CREDIT Bank/Cash
+- Depreciation: DEBIT Depreciation Expense → CREDIT Accumulated Depreciation
+- Contra (cash to bank): DEBIT Bank Account → CREDIT Cash Account
+- Opening balance (asset): DEBIT Asset Account → CREDIT Capital/Opening Balance
+- GST payable: DEBIT Input/Sales Account → CREDIT GST Payable
 
 OUTPUT FORMAT (JSON only, no explanation outside JSON):
 {{
-  "reasoning": "brief explanation of what you understood and why you chose these mutations",
+  "reasoning": "brief explanation",
   "mutations": [
     {{ ...mutation 1... }},
     {{ ...mutation 2... }}
@@ -545,12 +563,13 @@ OUTPUT FORMAT (JSON only, no explanation outside JSON):
 
                 elif mtype == "RECLASSIFY":
                     mc = mut.get("matching_criteria", {})
-                    new_dr  = str(mut.get("new_debit_account", "")).strip().title()
+                    new_dr  = str(mut.get("new_debit_account", "") or mut.get("new_account", "")).strip().title()
                     new_cr  = str(mut.get("new_credit_account", "Bank Account")).strip().title()
                     new_cat = str(mut.get("new_category", "Expense")).strip()
+                    
+                    yield {"status": f"Searching for transactions matching: {mc}..."}
                     reclassified = 0
                     for t in input_transactions:
-
                         orig_amt = 0.0
                         if t.get('entries'):
                             orig_amt = float(t['entries'][0].get('amount', 0))
@@ -572,6 +591,7 @@ OUTPUT FORMAT (JSON only, no explanation outside JSON):
                         ]
                         reclassified += 1
                     modified_count += reclassified
+                    yield {"status": f"Reclassified {reclassified} transaction(s) to '{new_dr}'."}
                     print(f"[AGENT-7][UNIVERSAL] RECLASSIFY: {reclassified} transactions (amount preserved) → Dr:{new_dr} Cr:{new_cr}")
 
                 elif mtype == "MODIFY":
@@ -586,6 +606,7 @@ OUTPUT FORMAT (JSON only, no explanation outside JSON):
                             elif field in ['date', 'narration']:
                                 t[field] = str(val)
                         modified_count += 1
+                        yield {"status": f"Modified entry at index {idx}."}
                         print(f"[AGENT-7][UNIVERSAL] MODIFY: txn[{idx}] updated fields={list(fields.keys())}")
 
                 elif mtype == "DELETE":
@@ -605,7 +626,9 @@ OUTPUT FORMAT (JSON only, no explanation outside JSON):
                             t['_deleted'] = True
                             deleted += 1
                     modified_count += deleted
+                    yield {"status": f"Deleted {deleted} transaction(s)."}
                     print(f"[AGENT-7][UNIVERSAL] DELETE: {deleted} transactions marked for removal")
+
 
                 elif mtype == "SPLIT":
                     mc     = mut.get("matching_criteria", {})
@@ -708,7 +731,7 @@ OUTPUT FORMAT (JSON only, no explanation outside JSON):
                 """
                 summary_task = asyncio.create_task(self.llm.ainvoke(summary_prompt))
 
-            BATCH_SIZE = 20
+            BATCH_SIZE = 15
             batches = [context_chunks[i:i + BATCH_SIZE] for i in range(0, len(context_chunks), BATCH_SIZE)]
             total_batches = len(batches)
 
@@ -788,41 +811,33 @@ OUTPUT FORMAT (JSON only, no explanation outside JSON):
                 sorted_batches = sorted(batch_results.items(), key=lambda x: len(x[1]))
                 retry_tasks = []
                 for b_idx, b_res in sorted_batches:
-
                     if len(b_res) == 0 or (missing_count > 0 and len(b_res) < 3):
                         f_batch = batches[b_idx]
                         f_metas = context_metadatas[b_idx*BATCH_SIZE:(b_idx+1)*BATCH_SIZE] if context_metadatas else [None] * len(f_batch)
-                        for c_idx, chunk in enumerate(f_batch):
-                            retry_tasks.append((chunk, f_metas[c_idx] if f_metas else None))
-
-                if retry_tasks:
-                    print(f"[RECONCILE] Retrying {len(retry_tasks)} chunks individually...")
-
-                    async def retry_chunk(c_idx_global, chunk_data, meta):
-                        async with sem:
-                            slot = c_idx_global % N_EXTRACTORS
-                            await asyncio.sleep(slot * WORKER_DELAY_SEC)
+                        
+                        async def _retry_chunk(chunk_data, meta):
                             r_txns = await self._extract_transactions_from_batch(
-                                chunk_data,
-                                context_query=question,
-                                company_id=company_id,
-                                feedback_context=feedback_context
+                                chunk_data, context_query=question, company_id=company_id,
+                                feedback_context=feedback_context + "\n**URGENT: This chunk was skipped. Find missing rows.**"
                             )
                             if r_txns and meta:
-                                src_doc = meta.get('document_name') if meta else None
-                                for t in r_txns:
-                                    t['_source_docs'] = [src_doc] if src_doc else []
+                                src_doc = meta.get('document_name')
+                                for t in r_txns: t['_source_docs'] = [src_doc] if src_doc else []
                             return r_txns
+                        
+                        for c_idx, chunk in enumerate(f_batch):
+                            retry_tasks.append(_retry_chunk(chunk, f_metas[c_idx]))
 
-                    reconcile_results = await asyncio.gather(*[retry_chunk(i, c, m) for i, (c, m) in enumerate(retry_tasks)])
-                    new_txns_count = 0
-                    for r_list in reconcile_results:
+                if retry_tasks:
+                    print(f"[RECONCILE] Retrying {len(retry_tasks)} chunks in parallel...")
+                    retry_results = await asyncio.gather(*retry_tasks)
+                    recovered = 0
+                    for r_list in retry_results:
                         if r_list:
                             all_transactions.extend(r_list)
-                            new_txns_count += len(r_list)
-
-                    print(f"[RECONCILE] Recovery done. Recovered {new_txns_count} additional transactions.")
-                    yield {"status": f"Reconciliation: recovered {new_txns_count} transactions (total now: {len(all_transactions)})."}
+                            recovered += len(r_list)
+                    print(f"[RECONCILE] Recovery done. Recovered {recovered} additional transactions.")
+                    yield {"status": f"Reconciliation: recovered {recovered} transactions (total now: {len(all_transactions)})."}
                 else:
                     print(f"[RECONCILE] No obvious retry candidates found. Proceeding with {total_extracted} transactions.")
 
@@ -1071,6 +1086,143 @@ OUTPUT FORMAT (JSON only, no explanation outside JSON):
             classified.extend(classified_results.get(i, []))
 
         print(f"[AGENT-2] Parallel classification complete: {len(classified)} transactions classified")
+
+        # --- PHASE 2: PERSISTENT REFINEMENT (RE-APPLYING SAVED RULES) ---
+        if persistent_rules and not is_refinement:
+            print(f"[AGENT-7] PERSISTENT REFINEMENT: Re-applying {len(persistent_rules)} saved commands to fresh extraction.")
+            yield {"status": f"Agent 7 (Universal): Re-applying {len(persistent_rules)} manual refinements..."}
+            
+            pnl_inc_kws = ["INCOME", "SALES", "REVENUE", "DIRECT INCOME"]
+            pnl_exp_kws = ["EXPENSE", "DIRECT EXPENSE", "CHGS", "FEE", "TAX", "PURCHASE", "COST"]
+            
+            cur_income = sum(float(e.get('amount', 0)) for t in classified for e in t.get('entries', [])
+                            if any(k in str(e.get('category', '')).upper() for k in pnl_inc_kws))
+            cur_expense = sum(float(e.get('amount', 0)) for t in classified for e in t.get('entries', [])
+                             if any(k in str(e.get('category', '')).upper() for k in pnl_exp_kws))
+            cur_profit = cur_income - cur_expense
+            
+            txn_sample_text = ""
+            for i, t in enumerate(classified[:100]):
+                amt = float(t.get('debit', 0) or t.get('credit', 0) or 0)
+                txn_sample_text += f"{i}. [{t.get('date')}] {t.get('narration')} (\u20b9{amt:,.2f})\n"
+
+            from datetime import date as _date_today
+            today_str = _date_today.today().strftime("%d/%m/%Y")
+            combined_commands = "\n".join([f"- {r}" for r in persistent_rules])
+
+            universal_prompt = f"""
+{REFINEMENT_RULES}
+
+━━━━ HISTORICAL USER COMMANDS (RE-APPLY THESE) ━━━━
+{combined_commands}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+TODAY'S DATE: {today_str}
+TOTAL TRANSACTIONS IN LEDGER: {len(classified)}
+
+CURRENT FINANCIAL STATE:
+ - Total Income: ₹{cur_income:,.2f}
+ - Total Expense: ₹{cur_expense:,.2f}
+ - Current Net Profit: ₹{cur_profit:,.2f}
+
+SAMPLE TRANSACTIONS (first 100 shown by index):
+{txn_sample_text}
+
+━━━━ IMPORTANT: TARGET PROFIT / TOTALS ━━━━
+- If user wants "X as Net Profit", calculate the DELTA from Current Net Profit and use ADD_ENTRY to balance it.
+- DELTA = Target Profit - Current Net Profit.
+- If DELTA is Negative (Target < Current): Add an EXPENSE entry of abs(DELTA) to reduce profit.
+- If DELTA is Positive (Target > Current): Add an INCOME entry of DELTA to increase profit.
+- Account naming: Use "Profit Adjustment Entry" or "Ad-hoc Expense" for these balancing entries.
+
+━━━━ IMPORTANT: MULTIPLE MUTATIONS ━━━━
+You MUST return mutations for ALL the commands listed above.
+Check if an entry needs to be added (ADD_ENTRY), reclassified (RECLASSIFY), or modified.
+
+DOUBLE-ENTRY ACCOUNTING RULES (always follow):
+- Money IN (income, loans, capital received): DEBIT Bank/Cash → CREDIT Income/Liability/Capital
+- Money OUT (expenses, payments): DEBIT Expense/Asset → CREDIT Bank/Cash
+- Depreciation: DEBIT Depreciation Expense → CREDIT Accumulated Depreciation
+- Contra (cash to bank): DEBIT Bank Account → CREDIT Cash Account
+- Opening balance (asset): DEBIT Asset Account → CREDIT Capital/Opening Balance
+- GST payable: DEBIT Input/Sales Account → CREDIT GST Payable
+
+OUTPUT FORMAT (JSON only, no explanation outside JSON):
+{{
+  "reasoning": "brief explanation",
+  "mutations": [
+    {{ ...mutation 1... }},
+    {{ ...mutation 2... }}
+  ]
+}}
+"""
+            try:
+                res = await retry_with_backoff(self.llm.ainvoke, universal_prompt)
+                mutation_plan = self.ai_service._extract_json(res.content)
+                mutations = mutation_plan.get("mutations", []) if isinstance(mutation_plan, dict) else []
+                
+                new_entries = []
+                mod_count = 0
+                for mut in mutations:
+                    mtype = mut.get("type", "").upper()
+                    if mtype == "ADD_ENTRY":
+                        amt = float(mut.get("amount", 0))
+                        if amt <= 0: continue
+                        dr_acc = str(mut.get("debit_account", "Bank Account")).strip().title()
+                        cr_acc = str(mut.get("credit_account", "Unclassified Income")).strip().title()
+                        cat    = str(mut.get("category", "Income")).strip()
+                        narr   = str(mut.get("narration", "Manual Entry")).strip()
+                        date   = str(mut.get("date", today_str)).strip()
+                        is_income_side = any(k in cat.upper() for k in ["INCOME", "LIAB", "EQUITY"])
+                        new_txn = {
+                            "date": date, "narration": narr, "balance": 0.0, "_manual": True,
+                            "debit": 0.0 if is_income_side else amt,
+                            "credit": amt if is_income_side else 0.0,
+                            "entries": [
+                                {"account": dr_acc, "type": "DEBIT", "amount": amt,
+                                 "category": "Current Assets" if any(k in dr_acc.upper() for k in ["BANK","CASH"]) else cat},
+                                {"account": cr_acc, "type": "CREDIT", "amount": amt,
+                                 "category": "Current Assets" if any(k in cr_acc.upper() for k in ["BANK","CASH"]) else cat},
+                            ]
+                        }
+                        new_entries.append(new_txn)
+                        mod_count += 1
+                    elif mtype == "RECLASSIFY":
+                        mc = mut.get("matching_criteria", {})
+                        new_dr = str(mut.get("new_debit_account", "") or mut.get("new_account", "")).strip().title()
+                        new_cr = str(mut.get("new_credit_account", "Bank Account")).strip().title()
+                        new_cat = str(mut.get("new_category", "Expense")).strip()
+                        reclass_round = 0
+                        for t in classified:
+                            orig_amt = float(t['entries'][0].get('amount', 0)) if t.get('entries') else float(t.get('debit', 0) or t.get('credit', 0) or 0)
+                            t_type = "DEBIT" if float(t.get('debit', 0)) > 0 else "CREDIT"
+                            if mc.get('type') and mc['type'].upper() != t_type: continue
+                            if mc.get('min_amount') is not None and orig_amt < float(mc['min_amount']): continue
+                            if mc.get('max_amount') is not None and orig_amt > float(mc['max_amount']): continue
+                            narr_kw = str(mc.get('narration_contains', '')).lower()
+                            if narr_kw and narr_kw not in str(t.get('narration', '')).lower(): continue
+                            t['entries'] = [
+                                {"account": new_dr, "type": "DEBIT", "amount": orig_amt, "category": "Current Assets" if "BANK" in new_dr.upper() else new_cat},
+                                {"account": new_cr, "type": "CREDIT", "amount": orig_amt, "category": "Current Assets" if "BANK" in new_cr.upper() else new_cat},
+                            ]
+                            reclass_round += 1
+                        mod_count += reclass_round
+                    elif mtype == "DELETE":
+                        mc = mut.get("matching_criteria", {})
+                        for t in classified:
+                            amt = float(t.get('debit', 0) or t.get('credit', 0) or 0)
+                            narr_kw = str(mc.get('narration_contains', '')).lower()
+                            exact = mc.get('exact_amount')
+                            if narr_kw and narr_kw not in str(t.get('narration', '')).lower(): continue
+                            if exact is not None and abs(amt - float(exact)) > 0.01: continue
+                            t['_deleted'] = True
+                        classified[:] = [t for t in classified if not t.get('_deleted')]
+                
+                classified.extend(new_entries)
+                print(f"[AGENT-7] Persistent refinement complete. {mod_count} modifications applied, {len(new_entries)} new entries.")
+                yield {"status": f"Successfully re-applied {len(persistent_rules)} manual refinements."}
+            except Exception as e:
+                print(f"[AGENT-7][ERROR] Persistent refinement failed: {e}")
 
         ledger_balances: Dict[str, float] = {}
         account_categories: Dict[str, str] = {}

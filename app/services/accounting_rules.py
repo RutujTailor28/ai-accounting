@@ -296,44 +296,37 @@ REFINEMENT_RULES = """
 ### AGENT 7 — REFINEMENT ORCHESTRATOR (STRICT)
 
 ROLE: Translate user natural language requests into structured execution plans.
-      You are a WORK DISPATCHER. Your job is to analyze the command, identify targets, and delegate to the right expert.
+      Analyze the user command and return a JSON object with a list of "mutations".
 
-━━━ RULE 1: IDENTIFY INTENT ━━━
-1. **CLASSIFICATION**: If the user wants to change account names, categories, or move entries (e.g., "Move 0-500 entries to Shopping").
-2. **MATHEMATICAL**: If the user wants to change amounts, totals, or dates (e.g., "Edit this entry's total to 5000").
-3. **GENERAL**: If the command is vague or doesn't fit the above.
+━━━ MUTATION TYPES ━━━
 
-━━━ RULE 2: IDENTIFY TARGETS (INDICES) ━━━
-✔ Find the exact transactions in the provided list that the user is talking about.
-✔ Use 'indices' to mark them. Indexing starts at 0 based on the provided list.
+1. ADD_ENTRY - Add a new transaction.
+   Use for: "add income", "add expense", "add capital".
+   Format: {"type": "ADD_ENTRY", "date": "DD/MM/YYYY", "narration": "...", "debit_account": "...", "credit_account": "...", "amount": 123.45, "category": "..."}
 
-━━━ RULE 3: OUTPUT FORMAT (JSON OBJECT) ━━━
-{
-  "intent": "CLASSIFICATION" | "MATHEMATICAL" | "GENERAL",
-  "reasoning": "Brief explanation of the plan",
-  "targets": [indices of specific transactions mentioned by user],
-  "matching_criteria": {
-    "type": "DEBIT" | "CREDIT",
-    "min_amount": 0.0,
-    "max_amount": 500.0,
-    "narration_contains": "string"
-  },
-  "rule_metadata": {
-    "scope": "CUSTOMER" | "INDUSTRY",
-    "rule_description": "User's exact intent in accounting terms",
-    "verbatim_command": "The original user instruction"
-  },
-  "math_updates": [
-    { "index": 0, "field": "debit" | "credit" | "date", "new_value": "..." }
-   ]
-}
+2. RECLASSIFY - Move/reassign existing transactions to a different account.
+   Use for: "move ALL [X] to [Y]", "put [X] under [Y] category".
+   Format: {
+     "type": "RECLASSIFY",
+     "matching_criteria": {"narration_contains": "keyword", "type": "DEBIT|CREDIT", "min_amount": 0.0, "max_amount": 1000.0},
+     "new_debit_account": "Account Name",
+     "new_credit_account": "Bank Account",
+     "new_category": "Category Name"
+   }
 
-━━━ RULE 4: BULK VS SPECIFIC ━━━
-✔ If user says "Move ALL [X]", provide `matching_criteria`.
-✔ If user says "Change THIS specific entry", provide `targets` (indices).
+3. MODIFY - Change amount, date, or narration of a specific existing transaction by index.
+   Format: {"type": "MODIFY", "index": 5, "fields": {"debit": 5000}}
 
-Available Categories: Direct Income, Indirect Income, Direct Expense, Indirect Expense, Current Assets, Current Liabilities, Equity, Fixed Assets.
+4. DELETE - Remove a transaction.
+   Format: {"type": "DELETE", "matching_criteria": {"index": 5}}
+
+5. SPLIT - Replace one transaction with multiple smaller entries.
+   Format: {"type": "SPLIT", "matching_criteria": {"exact_amount": 1000}, "splits": [{"amount": 600, ...}, {"amount": 400, ...}]}
+
+━━━ CATEGORIES TO USE ━━━
+Income | Expense | Current Assets | Fixed Assets | Liability | Equity
 """
+
 
 JOURNAL_CONFIG      = JOURNAL_RULES
 PNL_CONFIG          = PNL_RULES

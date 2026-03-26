@@ -364,7 +364,8 @@ async def accounting_query(request_body: ChatQueryRequest, request: Request, use
                     "content": request_body.question,
                     "company_id": company_id,
                     "created_by": user.id,
-                    "file_names": doc_names
+                    "file_names": doc_names,
+                    "is_saved": True
                 }
                 if session_title:
                     user_msg_data["session_title"] = session_title
@@ -413,7 +414,8 @@ async def accounting_query(request_body: ChatQueryRequest, request: Request, use
                         "all_tables": final_all_tables,
                         "transactions": final_transactions or cached_transactions
                     },
-                    "file_names": doc_names
+                    "file_names": doc_names,
+                    "is_saved": True
                 }
                 if session_title:
                     msg_data["session_title"] = session_title
