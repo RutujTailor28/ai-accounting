@@ -3,7 +3,7 @@ from fastapi.responses import StreamingResponse
 from app.schemas.document import QueryRequest, QueryResponse
 from app.ai.rag.retriever import vector_store
 from app.services.deps import embedding_service, llm_service
-from app.api.deps import get_current_user
+from app.api.deps import get_current_user, require_role
 import json
 from app.core.supabase import supabase
 
@@ -59,7 +59,11 @@ async def debug_document_chunks(
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/query/stream")
-async def stream_query_documents(request_body: QueryRequest, request: Request, user=Depends(get_current_user)):
+async def stream_query_documents(
+    request_body: QueryRequest, 
+    request: Request, 
+    user=Depends(require_role(["user", "manager", "admin", "superadmin"], required_permission="create_reports"))
+):
     """
     Stream query results for real-time updates (NDJSON format).
     """
@@ -323,7 +327,10 @@ async def stream_query_documents(request_body: QueryRequest, request: Request, u
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/query", response_model=QueryResponse)
-async def query_documents(request: QueryRequest, user=Depends(get_current_user)):
+async def query_documents(
+    request: QueryRequest, 
+    user=Depends(require_role(["user", "manager", "admin", "superadmin"], required_permission="create_reports"))
+):
     """
     Query the RAG system and generate an answer.
     """

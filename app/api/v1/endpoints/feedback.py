@@ -1,5 +1,5 @@
 from fastapi import APIRouter, HTTPException, Depends
-from app.api.deps import get_current_user
+from app.api.deps import get_current_user, require_role
 from app.schemas.feedback import FeedbackCreate, FeedbackResponse
 from app.ai.rag.retriever import vector_store
 from app.services.deps import embedding_service
@@ -13,7 +13,7 @@ from app.core.supabase import supabase
 @router.post("/", response_model=FeedbackResponse)
 async def submit_feedback(
     feedback: FeedbackCreate,
-    user=Depends(get_current_user)
+    user=Depends(require_role(["user", "manager", "admin", "superadmin"]))
 ):
     """
     Submit user feedback/correction to the AI agent.
@@ -86,7 +86,7 @@ async def submit_feedback(
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.delete("/")
-async def clear_feedback(user=Depends(get_current_user)):
+async def clear_feedback(user=Depends(require_role(["admin", "superadmin"]))):
     """
     Clear all feedback/corrections for the user's company.
     This effectively resets the AI's "learning" for this company.

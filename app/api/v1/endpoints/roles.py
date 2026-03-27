@@ -4,9 +4,8 @@ from app.core.supabase import supabase_admin
 from app.api.deps import require_role
 from typing import List
 
-router = APIRouter()
-
-admin_dep = Depends(require_role(["admin", "superadmin"]))
+admin_dep = Depends(require_role(["admin", "superadmin"], required_permission="manage_team"))
+router = APIRouter(dependencies=[admin_dep])
 from app.api.deps import get_user_context
 
 @router.get("", response_model=List[RoleResponse])

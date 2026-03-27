@@ -1,6 +1,6 @@
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends, BackgroundTasks
 from typing import List, Optional
-from app.api.deps import get_current_user
+from app.api.deps import get_current_user, require_role
 from app.core.supabase import supabase, supabase_admin
 from app.api.v1.endpoints.documents import _process_document_background
 from app.integrations.storage.s3_storage import s3_storage
@@ -20,7 +20,7 @@ async def create_customer(
     business_type: str = Form(None),
     aadhar: UploadFile = File(...),
     pan: UploadFile = File(...),
-    user=Depends(get_current_user)
+    user=Depends(require_role(["user", "manager", "admin", "superadmin"], required_permission="manage_customers"))
 ):
     """
     Create a new customer (in customers table), a root folder, and upload mandatory documents.
@@ -274,7 +274,10 @@ async def list_customer_folders(customer_id: UUID, user=Depends(get_current_user
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.delete("/{customer_id}")
-async def delete_customer(customer_id: UUID, user=Depends(get_current_user)):
+async def delete_customer(
+    customer_id: UUID, 
+    user=Depends(require_role(["user", "manager", "admin", "superadmin"], required_permission="manage_customers"))
+):
     """
     Soft delete a customer.
     """

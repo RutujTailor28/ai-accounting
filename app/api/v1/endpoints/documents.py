@@ -2,7 +2,7 @@ from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends, B
 from typing import BinaryIO, Optional
 import io
 from app.schemas.document import UploadResponse
-from app.api.deps import get_current_user
+from app.api.deps import get_current_user, require_role
 from app.integrations.ocr.pdf_parser import DocumentParser
 from app.integrations.storage.s3_storage import s3_storage
 from app.services.text_chunker import TextChunker
@@ -156,7 +156,7 @@ async def upload_document(
     parent_id: Optional[str] = Form(None, alias="parentId"),
     customer_id: Optional[str] = Form(None, alias="customerId"),
     file: UploadFile = File(...),
-    user=Depends(get_current_user)
+    user=Depends(require_role(["user", "manager", "admin", "superadmin"], required_permission="upload_files"))
 ):
     """
     Upload and process a document for RAG system with Folder management.
@@ -292,7 +292,7 @@ async def upload_document(
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @router.delete("/reset", response_model=dict)
-async def reset_vector_db(user=Depends(get_current_user)):
+async def reset_vector_db(user=Depends(require_role(["admin", "superadmin"]))):
     """
     ADMIN: Completely reset the vector database (ChromaDB).
     This removes ALL documents from the AI's memory.
@@ -404,7 +404,7 @@ async def get_document_url(
 @router.delete("/{file_id}", response_model=dict)
 async def delete_document(
     file_id: str,
-    user=Depends(get_current_user)
+    user=Depends(require_role(["user", "manager", "admin", "superadmin"], required_permission="delete_files"))
 ):
     """
     Delete a document from:

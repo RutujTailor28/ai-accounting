@@ -2,14 +2,17 @@ from fastapi import APIRouter, HTTPException, Depends
 from typing import List
 from uuid import UUID
 from app.schemas.folder import FolderCreate, FolderResponse, FileResponse
-from app.api.deps import get_current_user
+from app.api.deps import get_current_user, require_role
 from app.core.supabase import supabase
 from app.integrations.storage.s3_storage import s3_storage
 
 router = APIRouter()
 
 @router.post("/", response_model=FolderResponse)
-async def create_folder(folder_data: FolderCreate, user=Depends(get_current_user)):
+async def create_folder(
+    folder_data: FolderCreate, 
+    user=Depends(require_role(["user", "manager", "admin", "superadmin"]))
+):
     """Create a new folder in the database."""
     try:
 
@@ -127,7 +130,10 @@ async def list_folder_files(folder_id: UUID, user=Depends(get_current_user)):
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.delete("/{folder_id}")
-async def delete_folder(folder_id: UUID, user=Depends(get_current_user)):
+async def delete_folder(
+    folder_id: UUID, 
+    user=Depends(require_role(["user", "manager", "admin", "superadmin"]))
+):
     """Soft delete a folder."""
     try:
         from datetime import datetime, timezone

@@ -4,7 +4,7 @@ from uuid import UUID
 import json
 import uuid
 from app.schemas.chat import ChatQueryRequest, ChatMessageResponse, ChatHistoryItem, ChatFeedbackCreate, ChatSaveRequest, ChatUpdateTitleRequest, ChatMessageUpdateRequest
-from app.api.deps import get_current_user
+from app.api.deps import get_current_user, require_role
 from app.core.supabase import supabase, supabase_admin
 from app.services.embedding_service import EmbeddingService
 from app.ai.rag.retriever import vector_store
@@ -16,7 +16,10 @@ embedding_service = EmbeddingService()
 llm_service = LLMService()
 
 @router.post("/query", response_model=ChatMessageResponse)
-async def chat_query(request: ChatQueryRequest, user=Depends(get_current_user)):
+async def chat_query(
+    request: ChatQueryRequest, 
+    user=Depends(require_role(["user", "manager", "admin", "superadmin"]))
+):
     """
     Chat with the AI using documents from a specific workspace.
     """
@@ -184,7 +187,10 @@ async def chat_query(request: ChatQueryRequest, user=Depends(get_current_user)):
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/save")
-async def save_chat_session(request: ChatSaveRequest, user=Depends(get_current_user)):
+async def save_chat_session(
+    request: ChatSaveRequest, 
+    user=Depends(require_role(["user", "manager", "admin", "superadmin"]))
+):
     """Mark a chat session as saved and store assigned files."""
     try:
         res = supabase.table("chat_messages") \
@@ -280,7 +286,10 @@ async def get_chat_thread(session_id: UUID, user=Depends(get_current_user)):
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.delete("/history/{session_id}")
-async def delete_chat_session(session_id: UUID, user=Depends(get_current_user)):
+async def delete_chat_session(
+    session_id: UUID, 
+    user=Depends(require_role(["user", "manager", "admin", "superadmin"]))
+):
     """Soft delete an entire chat session."""
     try:
         from datetime import datetime, timezone
@@ -297,7 +306,10 @@ async def delete_chat_session(session_id: UUID, user=Depends(get_current_user)):
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/feedback")
-async def submit_feedback(request: ChatFeedbackCreate, user=Depends(get_current_user)):
+async def submit_feedback(
+    request: ChatFeedbackCreate, 
+    user=Depends(require_role(["user", "manager", "admin", "superadmin"]))
+):
     """
     Store user feedback/rating for a specific message.
     """
@@ -315,7 +327,11 @@ async def submit_feedback(request: ChatFeedbackCreate, user=Depends(get_current_
         print(f"[ERROR] Feedback Submission Error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 @router.patch("/history/{session_id}/title")
-async def update_chat_session_title(session_id: UUID, request: ChatUpdateTitleRequest, user=Depends(get_current_user)):
+async def update_chat_session_title(
+    session_id: UUID, 
+    request: ChatUpdateTitleRequest, 
+    user=Depends(require_role(["user", "manager", "admin", "superadmin"]))
+):
     """Update the title of a chat session."""
     try:
 
@@ -333,7 +349,11 @@ async def update_chat_session_title(session_id: UUID, request: ChatUpdateTitleRe
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.patch("/messages/{message_id}")
-async def update_chat_message(message_id: UUID, request: ChatMessageUpdateRequest, user=Depends(get_current_user)):
+async def update_chat_message(
+    message_id: UUID, 
+    request: ChatMessageUpdateRequest, 
+    user=Depends(require_role(["user", "manager", "admin", "superadmin"]))
+):
     """Update a specific chat message's content or data."""
     try:
         update_data = {}

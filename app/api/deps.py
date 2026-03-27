@@ -45,7 +45,7 @@ async def get_user_context(user=Depends(get_current_user)):
     try:
 
         profile_res = supabase_admin.table("profiles") \
-            .select("*, user_roles(roles(name))") \
+            .select("*, user_roles(roles(name, permissions))") \
             .eq("id", user.id) \
             .single() \
             .execute()
@@ -54,12 +54,20 @@ async def get_user_context(user=Depends(get_current_user)):
         if not profile:
             raise HTTPException(status_code=404, detail="User profile not found")
 
-        roles = [ur['roles']['name'] for ur in profile.get('user_roles', []) if ur.get('roles')]
+        roles = []
+        permissions = set()
+        for ur in profile.get('user_roles', []):
+            role_data = ur.get('roles')
+            if role_data:
+                roles.append(role_data['name'])
+                if role_data.get('permissions'):
+                    permissions.update(role_data['permissions'])
 
         return {
             "user": user,
             "profile": profile,
             "roles": roles,
+            "permissions": list(permissions),
             "company_id": profile.get("company_id"),
             "is_superadmin": "superadmin" in roles
         }
@@ -68,39 +76,51 @@ async def get_user_context(user=Depends(get_current_user)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch user context: {str(e)}")
 
-def require_role(allowed_roles: List[str]):
+def require_role(allowed_roles: List[str], required_permission: Optional[str] = None):
     """
-    Dependency factory to check if a user has one of the allowed roles.
+    Dependency factory to check if a user has one of the allowed roles OR a specific permission.
     """
-    async def role_checker(user=Depends(get_current_user)):
-
+    async def checker(user=Depends(get_current_user)):
         try:
-
+            # Fetch user roles and their permissions
             response = supabase_admin.table("user_roles") \
-                .select("roles(name)") \
+                .select("roles(name, permissions)") \
                 .eq("user_id", user.id) \
                 .execute()
 
             user_roles_data = response.data
-            user_role_names = [item['roles']['name'] for item in user_roles_data if item.get('roles')]
+            user_role_names = []
+            user_permissions = set()
 
-            if not any(role in allowed_roles for role in user_role_names):
+            for item in user_roles_data:
+                role_data = item.get('roles')
+                if role_data:
+                    user_role_names.append(role_data['name'])
+                    if role_data.get('permissions'):
+                        user_permissions.update(role_data['permissions'])
 
-                if "superadmin" in user_role_names:
-                    return user
+            # Superadmin bypass
+            if "superadmin" in user_role_names:
+                return user
 
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="Operation not permitted for your role"
-                )
+            # Check if role-based access is allowed
+            if any(role in allowed_roles for role in user_role_names):
+                return user
 
-            return user
+            # Check if permission-based access is allowed
+            if required_permission and required_permission in user_permissions:
+                return user
+
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Operation not permitted for your role or permissions"
+            )
         except HTTPException:
             raise
         except Exception as e:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Role check failed: {str(e)}"
+                detail=f"Access check failed: {str(e)}"
             )
 
-    return role_checker
+    return checker

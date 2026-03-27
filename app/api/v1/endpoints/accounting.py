@@ -7,7 +7,7 @@ import re
 import uuid
 import asyncio
 from app.schemas.chat import ChatQueryRequest, ChatMessageResponse
-from app.api.deps import get_current_user
+from app.api.deps import get_current_user, require_role
 from app.core.supabase import supabase, supabase_admin
 from app.services.deps import embedding_service
 from app.ai.rag.retriever import vector_store
@@ -18,7 +18,11 @@ router = APIRouter()
 accounting_service = AccountingService()
 
 @router.post("/query")
-async def accounting_query(request_body: ChatQueryRequest, request: Request, user=Depends(get_current_user)):
+async def accounting_query(
+    request_body: ChatQueryRequest, 
+    request: Request, 
+    user=Depends(require_role(["user", "manager", "admin", "superadmin"]))
+):
     """
     Generate accounting reports (entries, balance sheets) from workspace documents with streaming.
     """
@@ -439,7 +443,12 @@ async def accounting_query(request_body: ChatQueryRequest, request: Request, use
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.patch("/messages/{message_id}")
-async def update_accounting_message(message_id: UUID, content: str = None, data: Dict[str, Any] = None, user=Depends(get_current_user)):
+async def update_accounting_message(
+    message_id: UUID, 
+    content: str = None, 
+    data: Dict[str, Any] = None, 
+    user=Depends(require_role(["user", "manager", "admin", "superadmin"]))
+):
     """
     Update a chat message's content and structured data.
     Only the creator can edit their messages.

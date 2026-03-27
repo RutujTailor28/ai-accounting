@@ -4,7 +4,7 @@ from app.schemas.user import UserCreate, UserUpdate, UserResponse
 from app.core.supabase import supabase_admin
 from app.api.deps import require_role, get_user_context
 
-admin_dep = Depends(require_role(["admin", "superadmin"]))
+admin_dep = Depends(require_role(["admin", "superadmin"], required_permission="manage_team"))
 
 router = APIRouter(dependencies=[admin_dep])
 

@@ -2,13 +2,16 @@ from fastapi import APIRouter, HTTPException, Depends
 from typing import List
 from uuid import UUID
 from app.schemas.workspace import WorkspaceCreate, WorkspaceResponse
-from app.api.deps import get_current_user
+from app.api.deps import get_current_user, require_role
 from app.core.supabase import supabase
 
 router = APIRouter()
 
 @router.post("/", response_model=WorkspaceResponse)
-async def create_workspace(workspace_data: WorkspaceCreate, user=Depends(get_current_user)):
+async def create_workspace(
+    workspace_data: WorkspaceCreate, 
+    user=Depends(require_role(["user", "manager", "admin", "superadmin"]))
+):
     """Create a new workspace by selecting existing file and folder IDs."""
     try:
 
@@ -82,7 +85,10 @@ async def get_workspace(workspace_id: UUID, user=Depends(get_current_user)):
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.delete("/{workspace_id}")
-async def delete_workspace(workspace_id: UUID, user=Depends(get_current_user)):
+async def delete_workspace(
+    workspace_id: UUID, 
+    user=Depends(require_role(["user", "manager", "admin", "superadmin"]))
+):
     """Delete a workspace."""
     try:
         from datetime import datetime, timezone
