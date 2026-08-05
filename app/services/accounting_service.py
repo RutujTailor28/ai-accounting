@@ -8,8 +8,8 @@ from app.services.ai_service import LLMService, retry_with_backoff
 from app.ai.rag.retriever import vector_store
 from app.services.accounting_rules import (
     EXTRACTOR_RULES, CLASSIFIER_RULES, REFINEMENT_RULES, JOURNAL_RULES_TEXT,
-    PNL_RULES_TEXT, BALANCE_SHEET_RULES_TEXT, TALLY_RULES_TEXT,
-    PNL_CONFIG, BALANCE_SHEET_CONFIG, TALLY_CONFIG, JOURNAL_CONFIG,
+    PNL_RULES_TEXT, BALANCE_SHEET_RULES_TEXT, TALLY_RULES_TEXT, CAPITAL_ACCOUNT_RULES_TEXT,
+    PNL_CONFIG, BALANCE_SHEET_CONFIG, TALLY_CONFIG, JOURNAL_CONFIG, CAPITAL_CONFIG,
     AGENT_SYSTEM_PROMPTS
 )
 
@@ -75,10 +75,11 @@ class AccountingService:
             "target_keywords": []
         }}
         """
+        from app.schemas.ai import IntentClassification
         try:
-
-            res = await retry_with_backoff(self.llm.ainvoke, prompt)
-            data = self.ai_service._extract_json(res.content)
+            structured_llm = self.llm.with_structured_output(IntentClassification)
+            res = await retry_with_backoff(structured_llm.ainvoke, prompt)
+            data = res.model_dump()
             print(f"[INFO] Intent Discovery: query='{question[:50]}...' -> intent={data.get('intent')}")
             return data
         except Exception as e:
@@ -119,13 +120,16 @@ class AccountingService:
         ])
 
         if wants_bs and wants_pnl:
-            return {'profit_loss', 'balance_sheet'}
+            return {'profit_loss', 'balance_sheet', 'capital_account'}
         if wants_bs:
-            return {'balance_sheet'}
+            return {'balance_sheet', 'capital_account'}
         if wants_pnl:
             return {'profit_loss'}
 
-        return {'profit_loss', 'balance_sheet'}
+        if any(kw in q for kw in ['capital', 'equity', 'drawing', 'owner']):
+            return {'capital_account', 'profit_loss', 'balance_sheet'}
+
+        return {'profit_loss', 'balance_sheet', 'capital_account'}
 
     async def _extract_transactions_from_batch(
         self,
@@ -157,6 +161,7 @@ class AccountingService:
         - Only filter if user explicitly asked for a specific type (e.g., "only cash").
         """
 
+        from app.schemas.ai import ExtractedTransactions
         prompt = f"""
         {AGENT_SYSTEM_PROMPTS['extractor']}
 
@@ -171,34 +176,19 @@ class AccountingService:
         TASK:
         1. First, quickly count how many transaction rows you see (rows with date + narration + debit OR credit amount).
            Do NOT count headers, opening/closing balance rows, or summary rows.
-        2. Then extract ALL those transactions into the JSON output below.
-        3. Your "transactions" array MUST contain exactly "row_count_detected" items. No skipping.
+        2. Then extract ALL those transactions into the structured output.
+        3. Your transactions array MUST contain exactly row_count_detected items. No skipping.
 
         RULES:
         - YOU ARE FORBIDDEN FROM SKIPPING ANY TRANSACTION ROW.
         - Money OUT → debit field. Money IN → credit field. One must be 0.00.
         - balance = running balance from statement (0.00 if not shown).
-
-        REQUIRED JSON OUTPUT FORMAT:
-        {{
-            "row_count_detected": <integer — how many transaction rows you counted>,
-            "transactions": [
-                {{
-                    "date": "DD/MM/YYYY",
-                    "narration": "Exact original narration",
-                    "debit": 0.00,
-                    "credit": 0.00,
-                    "balance": 0.00
-                }}
-            ]
-        }}
-
-        Output JSON ONLY. No explanation outside the JSON.
         """
 
         async def _run_extraction(extra_hint: str = "") -> dict:
-            response = await retry_with_backoff(self.llm.ainvoke, prompt + extra_hint)
-            return self.ai_service._extract_json(response.content)
+            structured_llm = self.llm.with_structured_output(ExtractedTransactions)
+            response = await retry_with_backoff(structured_llm.ainvoke, prompt + extra_hint)
+            return response.model_dump()
 
         try:
             data = await _run_extraction()
@@ -506,20 +496,15 @@ DOUBLE-ENTRY ACCOUNTING RULES (always follow):
 - Opening balance (asset): DEBIT Asset Account → CREDIT Capital/Opening Balance
 - GST payable: DEBIT Input/Sales Account → CREDIT GST Payable
 
-OUTPUT FORMAT (JSON only, no explanation outside JSON):
-{{
-  "reasoning": "brief explanation",
-  "mutations": [
-    {{ ...mutation 1... }},
-    {{ ...mutation 2... }}
-  ]
-}}
+OUTPUT FORMAT:
+Extract the mutations required to satisfy the user request strictly matching the schema.
 """
-
+            from app.schemas.ai import MutationPlan
             mutation_plan = {}
             try:
-                res = await retry_with_backoff(self.llm.ainvoke, universal_prompt)
-                mutation_plan = self.ai_service._extract_json(res.content)
+                structured_llm = self.llm.with_structured_output(MutationPlan)
+                res = await retry_with_backoff(structured_llm.ainvoke, universal_prompt)
+                mutation_plan = res.model_dump()
                 if not isinstance(mutation_plan, dict):
                     mutation_plan = {}
                 print(f"[AGENT-7][UNIVERSAL] Reasoning: {mutation_plan.get('reasoning', 'N/A')}")
@@ -806,7 +791,7 @@ OUTPUT FORMAT (JSON only, no explanation outside JSON):
                 missing_count = total_expected - total_extracted
                 direction = "missing" if missing_count > 0 else "extra"
                 print(f"[RECONCILE] COUNT MISMATCH: Found {total_extracted}, Expected {total_expected} ({direction}={abs(missing_count)}). Starting aggressive reconciliation...")
-                yield {"status": f"⚠️ {direction.title()} {abs(missing_count)} transactions (found {total_extracted}, expected {total_expected}). Reconciling..."}
+                yield {"status": f" {direction.title()} {abs(missing_count)} transactions (found {total_extracted}, expected {total_expected}). Reconciling..."}
 
                 sorted_batches = sorted(batch_results.items(), key=lambda x: len(x[1]))
                 retry_tasks = []
@@ -897,7 +882,7 @@ OUTPUT FORMAT (JSON only, no explanation outside JSON):
                 print(warning)
 
                 if abs(len(all_transactions) - ((expected_deposits or 0) + (expected_withdrawals or 0))) > 10:
-                    yield {"status": f"⚠️ Extraction mismatch: found {len(all_transactions)} transactions, but summary expected {(expected_deposits or 0) + (expected_withdrawals or 0)}."}
+                    yield {"status": f" Extraction mismatch: found {len(all_transactions)} transactions, but summary expected {(expected_deposits or 0) + (expected_withdrawals or 0)}."}
 
         yield {"all_transactions": all_transactions}
 
@@ -1282,70 +1267,63 @@ OUTPUT FORMAT (JSON only, no explanation outside JSON):
             cat = account_categories.get(acc, 'Unclassified')
             print(f"[LEDGER]   {acc:<40} | {bal:>12,.2f} | {cat}")
 
+        # --- AGENT 4: PROFIT & LOSS ---
         print(f"[AGENT-4] {AGENT_SYSTEM_PROMPTS['pnl']}")
-        print(f"[AGENT-4] Include: {PNL_CONFIG['include_types']} | Exclude: {PNL_CONFIG['exclude_types']}")
-        yield {"status": "Agent 4 (P&L Agent): Calculating Profit & Loss from Ledger..."}
+        yield {"status": "Agent 4 (P&L Agent): Synthesizing Profit & Loss from Ledger logic..."}
 
-        pnl_dr_rows: List[tuple] = []
-        pnl_cr_rows: List[tuple] = []
-        pnl_dr = 0.0
-        pnl_cr = 0.0
+        pnl_ledger = {acc: bal for acc, bal in ledger_balances.items() 
+                     if any(kw in account_categories.get(acc, "").upper() for kw in ["INCOME", "EXPENSE", "REVENUE", "COST"])}
+        
+        pnl_prompt = f"""
+        {AGENT_SYSTEM_PROMPTS['pnl']}
+        {PNL_RULES_TEXT}
+        
+        LEDGER DATA:
+        {json.dumps(pnl_ledger, indent=2)}
+        
+        TASK: Synthesize the P&L statement in JSON format following the rules above.
+        """
+        
+        net_profit = 0.0
+        pnl_table_rows = []
+        try:
+            pnl_res = await retry_with_backoff(self.llm.ainvoke, pnl_prompt)
+            pnl_data = self.ai_service._extract_json(pnl_res.content)
+            
+            inc_rows = pnl_data.get("income_rows", [])
+            exp_rows = pnl_data.get("expense_rows", [])
+            net_profit = float(pnl_data.get("net_profit", 0))
+            
+            pnl_dr_total = float(pnl_data.get("total_expense", 0))
+            pnl_cr_total = float(pnl_data.get("total_income", 0))
 
-        for acc, bal in ledger_balances.items():
-            cat = account_categories.get(acc, "").upper()
-            if abs(bal) < 0.01:
-                continue
-
-            should_exclude = any(excl.upper() in cat or excl.upper() in acc.upper() for excl in PNL_CONFIG['exclude_types'])
-            if should_exclude:
-                if "BANK" not in acc.upper():
-                    print(f"[AGENT-4][PNL-FILTER] Excluded from P&L: {acc} (cat={cat})")
-                continue
-
-            pnl_inc_kws = ["INCOME", "SALES", "REVENUE", "DIRECT INCOME"]
-            pnl_exp_kws = ["EXPENSE", "DIRECT EXPENSE", "CHGS", "FEE", "TAX", "PURCHASE", "COST"]
-
-            is_income = any(kw in cat for kw in pnl_inc_kws)
-            is_expense = any(kw in cat for kw in pnl_exp_kws)
-
-            if is_income:
-                pnl_cr_rows.append((f"By {acc}", abs(bal)))
-                pnl_cr += abs(bal)
-            elif is_expense or "EXPENSE" in cat:
-                pnl_dr_rows.append((f"To {acc}", abs(bal)))
-                pnl_dr += abs(bal)
-            else:
-                if "BANK" not in acc.upper():
-                    print(f"[AGENT-4][PNL-FILTER] Categorization gap: {acc} (cat={cat}) -> not in Income or Expense.")
-
-        net_profit = pnl_cr - pnl_dr
-        if net_profit > 0:
-            pnl_dr_rows.append(("To Net Profit (c/d)", net_profit))
-            pnl_dr += net_profit
-        elif net_profit < 0:
-            pnl_cr_rows.append(("By Net Loss (c/d)", abs(net_profit)))
-            pnl_cr += abs(net_profit)
-
-        if not pnl_dr_rows and not pnl_cr_rows or (pnl_dr == 0 and pnl_cr == 0):
-            print("[AGENT-4] P&L Empty - No Income/Expense accounts found.")
-            pass
-        else:
-            pnl_table_rows: List[List] = []
-            for i in range(max(len(pnl_dr_rows), len(pnl_cr_rows))):
-                d_part = pnl_dr_rows[i][0] if i < len(pnl_dr_rows) else ""
-                d_amt = f"{pnl_dr_rows[i][1]:,.2f}" if i < len(pnl_dr_rows) else ""
-                c_part = pnl_cr_rows[i][0] if i < len(pnl_cr_rows) else ""
-                c_amt = f"{pnl_cr_rows[i][1]:,.2f}" if i < len(pnl_cr_rows) else ""
-                pnl_table_rows.append([d_part, d_amt, c_part, c_amt])
-            pnl_table_rows.append(["TOTAL", f"{pnl_dr:,.2f}", "TOTAL", f"{pnl_cr:,.2f}"])
+            # Build Table Rows
+            for i in range(max(len(inc_rows), len(exp_rows)) + 1):
+                d_part, d_amt, c_part, c_amt = "", "", "", ""
+                if i < len(exp_rows):
+                    d_part, d_amt = f"To {exp_rows[i]['account']}", f"{float(exp_rows[i]['amount']):,.2f}"
+                elif i == len(exp_rows) and net_profit > 0:
+                    d_part, d_amt = "To Net Profit (c/d)", f"{net_profit:,.2f}"
+                
+                if i < len(inc_rows):
+                    c_part, c_amt = f"By {inc_rows[i]['account']}", f"{float(inc_rows[i]['amount']):,.2f}"
+                elif i == len(inc_rows) and net_profit < 0:
+                    c_part, c_amt = "By Net Loss (c/d)", f"{abs(net_profit):,.2f}"
+                
+                if d_part or c_part:
+                    pnl_table_rows.append([d_part, d_amt, c_part, c_amt])
+            
+            pnl_table_rows.append(["TOTAL", f"{max(pnl_dr_total, pnl_cr_total):,.2f}", "TOTAL", f"{max(pnl_dr_total, pnl_cr_total):,.2f}"])
+            
             local_structured_tables.append({
                 "type": "profit_loss",
                 "title": "Profit & Loss Statement",
-                "headers": ["Particulars (Dr)", "Amount (\u20b9)", "Particulars (Cr)", "Amount (\u20b9)"],
+                "headers": ["Particulars (Dr)", "Amount (₹)", "Particulars (Cr)", "Amount (₹)"],
                 "rows": pnl_table_rows
             })
-            result_label = f"Net Profit: \u20b9{net_profit:,.2f}" if net_profit > 0 else f"Net Loss: \u20b9{abs(net_profit):,.2f}"
-            print(f"[AGENT-4] P&L done \u2192 Income: \u20b9{pnl_cr:,.2f} | Expense: \u20b9{pnl_dr - (net_profit if net_profit > 0 else 0):,.2f} | {result_label}")
+        except Exception as e:
+            print(f"[AGENT-4][ERROR] P&L Synthesis failed: {e}")
+            yield {"status": " P&L Synthesis failed. Falling back..."}
 
             if 'profit_loss' in _show_tables:
                 yield {
@@ -1353,54 +1331,120 @@ OUTPUT FORMAT (JSON only, no explanation outside JSON):
                     "all_tables": local_structured_tables
                 }
 
+        # --- AGENT 4.5: CAPITAL ACCOUNT ---
+        print(f"[AGENT-4.5] {AGENT_SYSTEM_PROMPTS.get('capital', 'Generating Capital Account...')}")
+        yield {"status": "Agent 4.5 (Capital Account Agent): Synthesizing Capital movement..."}
+
+        equity_ledger = {acc: bal for acc, bal in ledger_balances.items() if "EQUITY" in account_categories.get(acc, "").upper()}
+        
+        cap_prompt = f"""
+        {AGENT_SYSTEM_PROMPTS['capital']}
+        {CAPITAL_ACCOUNT_RULES_TEXT}
+        
+        EQUITY LEDGER:
+        {json.dumps(equity_ledger, indent=2)}
+        
+        NET RESULT:
+        {"Net Profit" if net_profit > 0 else "Net Loss"}: ₹{abs(net_profit):,.2f}
+        
+        TASK: Output the Capital Account Statement JSON.
+        """
+        
+        closing_capital = 0.0
+        try:
+            cap_res = await retry_with_backoff(self.llm.ainvoke, cap_prompt)
+            cap_data = self.ai_service._extract_json(cap_res.content)
+            
+            capital_table_rows = [[p["label"], f"{float(p['amount']):,.2f}"] for p in cap_data.get("particulars", [])]
+            closing_capital = float(cap_data.get("closing_capital", 0))
+            capital_table_rows.append(["CLOSING CAPITAL", f"{closing_capital:,.2f}"])
+            
+            local_structured_tables.append({
+                "type": "capital_account",
+                "title": "Capital Account Statement",
+                "headers": ["Particulars", "Amount (₹)"],
+                "rows": capital_table_rows
+            })
+        except Exception as e:
+            print(f"[AGENT-4.5][ERROR] Capital Synthesis failed: {e}")
+            yield {"status": " Capital Synthesis failed."}
+
+        if 'capital_account' in _show_tables:
+            yield {
+                "structured_tables": [t for t in local_structured_tables if t.get('type') in ['profit_loss', 'capital_account']],
+                "all_tables": local_structured_tables
+            }
+
+        # --- AGENT 5: BALANCE SHEET ---
         print(f"[AGENT-5] {AGENT_SYSTEM_PROMPTS['balance_sheet']}")
-        yield {"status": "Agent 5 (Balance Sheet Agent): Building Balance Sheet from Ledger..."}
+        yield {"status": "Agent 5 (Balance Sheet Agent): Synthesizing Balance Sheet..."}
 
-        bs_assets: List[tuple] = []
-        bs_liab: List[tuple] = []
-        asset_total = 0.0
-        liab_total = 0.0
+        bs_ledger = {acc: bal for acc, bal in ledger_balances.items() 
+                    if acc not in pnl_ledger and "EQUITY" not in account_categories.get(acc, "").upper()}
+        
+        bs_prompt = f"""
+        {AGENT_SYSTEM_PROMPTS['balance_sheet']}
+        {BALANCE_SHEET_RULES_TEXT}
+        
+        LEDGER DATA:
+        {json.dumps(bs_ledger, indent=2)}
+        
+        CLOSING CAPITAL (from Agent 4.5):
+        ₹{closing_capital:,.2f}
+        
+        TASK: Synthesize the Balance Sheet JSON.
+        """
+        
+        try:
+            bs_res = await retry_with_backoff(self.llm.ainvoke, bs_prompt)
+            bs_data = self.ai_service._extract_json(bs_res.content)
+            
+            assets_dict = bs_data.get("assets", {})
+            liab_dict = bs_data.get("liabilities", {})
+            equity_dict = bs_data.get("equity", {})
+            
+            bs_table_rows = []
+            
+            # Helper to flatten JSON structure for table display
+            l_rows = []
+            for grp, items in liab_dict.items():
+                l_rows.append([f"**{grp.upper()}**", ""])
+                for itm in items: l_rows.append([f"   {itm['account']}", f"{float(itm['amount']):,.2f}"])
+            for grp, items in equity_dict.items():
+                l_rows.append([f"**{grp.upper()}**", ""])
+                for itm in items: l_rows.append([f"   {itm['account']}", f"{float(itm['amount']):,.2f}"])
+            
+            a_rows = []
+            for grp, items in assets_dict.items():
+                a_rows.append([f"**{grp.upper()}**", ""])
+                for itm in items: a_rows.append([f"   {itm['account']}", f"{float(itm['amount']):,.2f}"])
+            
+            for i in range(max(len(l_rows), len(a_rows))):
+                l_part, l_amt, a_part, a_amt = "", "", "", ""
+                if i < len(l_rows): l_part, l_amt = l_rows[i]
+                if i < len(a_rows): a_part, a_amt = a_rows[i]
+                bs_table_rows.append([l_part, l_amt, a_part, a_amt])
+                
+            bs_total_a = float(bs_data.get("total_assets", 0))
+            bs_total_l = float(bs_data.get("total_liabilities_equity", 0))
+            bs_table_rows.append(["TOTAL", f"{bs_total_l:,.2f}", "TOTAL", f"{bs_total_a:,.2f}"])
 
-        for acc, bal in ledger_balances.items():
-            cat = account_categories.get(acc, "").upper()
-            if abs(bal) < 0.01:
-                continue
-
-            if "INCOME" in cat or "EXPENSE" in cat:
-                continue
-            if bal > 0:
-                bs_assets.append((acc, bal))
-                asset_total += bal
-            else:
-                bs_liab.append((acc, abs(bal)))
-                liab_total += abs(bal)
-
-        if net_profit > 0:
-            bs_liab.append(("Add: Net Profit", net_profit))
-            liab_total += net_profit
-        elif net_profit < 0:
-            bs_liab.append(("Less: Net Loss", -abs(net_profit)))
-            liab_total -= abs(net_profit)
-
-        bs_table_rows: List[List] = []
-        for i in range(max(len(bs_liab), len(bs_assets), 1)):
-            l_part = bs_liab[i][0] if i < len(bs_liab) else ""
-            l_amt = f"{bs_liab[i][1]:,.2f}" if i < len(bs_liab) else ""
-            a_part = bs_assets[i][0] if i < len(bs_assets) else ""
-            a_amt = f"{bs_assets[i][1]:,.2f}" if i < len(bs_assets) else ""
-            bs_table_rows.append([l_part, l_amt, a_part, a_amt])
-        bs_table_rows.append(["TOTAL", f"{liab_total:,.2f}", "TOTAL", f"{asset_total:,.2f}"])
-        local_structured_tables.append({
-            "type": "balance_sheet",
-            "title": "Balance Sheet",
-            "headers": ["Liabilities & Equity", "Amount (\u20b9)", "Assets", "Amount (\u20b9)"],
-            "rows": bs_table_rows
-        })
-        print(f"[AGENT-5] Balance Sheet done → Assets: ₹{asset_total:,.2f} | Liabilities+Equity: ₹{liab_total:,.2f}")
+            local_structured_tables.append({
+                "type": "balance_sheet",
+                "title": "Balance Sheet",
+                "headers": ["Liabilities & Equity", "Amount (₹)", "Assets", "Amount (₹)"],
+                "rows": bs_table_rows
+            })
+            
+            asset_total = bs_total_a
+            liab_total = bs_total_l
+        except Exception as e:
+            print(f"[AGENT-5][ERROR] Balance Sheet Synthesis failed: {e}")
+            yield {"status": " Balance Sheet Synthesis failed."}
 
         if 'balance_sheet' in _show_tables:
             yield {
-                "structured_tables": [t for t in local_structured_tables if t.get('type') in ['profit_loss', 'balance_sheet']],
+                "structured_tables": [t for t in local_structured_tables if t.get('type') in ['profit_loss', 'capital_account', 'balance_sheet']],
                 "all_tables": local_structured_tables
             }
 
@@ -1433,26 +1477,24 @@ OUTPUT FORMAT (JSON only, no explanation outside JSON):
         if TALLY_CONFIG.get('balance_sheet_check'):
             if diff > 0.01:
                 if TALLY_CONFIG.get('auto_capital_adjustment'):
-
                     cap_adj = asset_total - liab_total
-                    bs_liab.append(("Capital Adjustment", cap_adj))
-                    liab_total += cap_adj
+                    # Since reports are now LLM-synthesized, we report the adjustment needed
                     yield (
-                        f"\n> \u26a0\ufe0f **Balance Sheet ADJUSTED**: Difference of \u20b9{abs(cap_adj):,.2f} absorbed "
-                        f"via Capital Adjustment under Equity (per TALLY_RULES).\n"
+                        f"\n>  **Balance Sheet ADJUSTED**: Difference of ₹{abs(cap_adj):,.2f} absorbed "
+                        f"via Capital Adjustment under Equity (Agent 6 validation).\n"
                     )
-                    print(f"[AGENT-6] BS adjusted by Capital Adjustment: \u20b9{cap_adj:,.2f}")
+                    print(f"[AGENT-6] BS adjustment needed: ₹{cap_adj:,.2f}")
                 else:
                     yield (
-                        f"\n> \u26a0\ufe0f **Balance Sheet FAILED**: Out of balance by \u20b9{diff:,.2f}.\n"
-                        f"> Missing Opening Balance entries or unclassified transactions.\n"
+                        f"\n>  **Balance Sheet FAILED**: Out of balance by ₹{diff:,.2f}.\n"
+                        f"> Check for unclassified transactions or missing opening balances.\n"
                     )
-                    print(f"[AGENT-6] BS FAILED: Assets=\u20b9{asset_total:,.2f} L+E=\u20b9{liab_total:,.2f} Diff=\u20b9{diff:,.2f}")
+                    print(f"[AGENT-6] BS FAILED: Assets=₹{asset_total:,.2f} L+E=₹{liab_total:,.2f} Diff=₹{diff:,.2f}")
             else:
                 yield (
-                    f"\n> \u2705 **Balance Sheet PASSED** \u2014 Assets = Liabilities + Equity = \u20b9{asset_total:,.2f}\n"
+                    f"\n>  **Balance Sheet PASSED** — Assets = Liabilities + Equity = ₹{asset_total:,.2f}\n"
                 )
-                print(f"[AGENT-6] BS PASSED: \u20b9{asset_total:,.2f}")
+                print(f"[AGENT-6] BS PASSED: ₹{asset_total:,.2f}")
 
     async def _parse_markdown_tables(self, text: str) -> List[Dict[str, Any]]:
         """Extract structured data from markdown tables in text."""

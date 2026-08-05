@@ -54,7 +54,8 @@ async def update_role(role_id: int, data: RoleUpdate, ctx: dict = Depends(get_us
         if not target_res.data:
             raise HTTPException(status_code=404, detail="Role not found")
 
-        if not ctx["is_superadmin"] and target_res.data.get("company_id") != ctx["company_id"]:
+        role_company_id = target_res.data.get("company_id")
+        if not ctx["is_superadmin"] and role_company_id is not None and role_company_id != ctx["company_id"]:
             raise HTTPException(status_code=403, detail="Access denied")
 
         update_data = {}

@@ -98,29 +98,38 @@ Choose EXACTLY ONE from:
   Direct Income | Indirect Income | Direct Expense | Indirect Expense |
   Current Assets | Current Liabilities | Equity | Fixed Assets
 
-━━━ RULE 5: DYNAMIC BUSINESS RULES (OVERRIDES DEFAULTS) ━━━
+━━━ RULE 5: CAPITAL ACCOUNT & EQUITY (CRITICAL) ━━━
+Follow these rules for owner-related transactions:
+1. CAPITAL INTRODUCED: Money brought into the business by the owner.
+   - Account: "Capital Account" (Equity)
+2. DRAWINGS: Money or assets withdrawn by the owner for personal use (e.g., "Cash Withdrawal", "Self", "Personal", "LIC", "Income Tax").
+   - Account: "Drawings A/c" (Equity)
+3. PROFIT/LOSS TRANSFER: Transfer of net results to capital.
+   - Account: "Profit & Loss A/c" (Equity)
+4. INTEREST ON CAPITAL: Interest allowed on owner's capital.
+   - Account: "Interest on Capital A/c" (Equity)
+5. ADDITIONAL CAPITAL: Any later injection of funds.
+   - Account: "Capital Account" (Equity)
+
+━━━ RULE 6: DYNAMIC BUSINESS RULES (OVERRIDES DEFAULTS) ━━━
 Apply ANY specific business rules or overrides provided in your context. If a rule says to classify specific keywords a certain way, YOU MUST OBEY IT above the generic rules.
 
 ━━━ RULE 7: FEW-SHOT EXAMPLES (FOR ACCURACY) ━━━
-Example 1 (Salary):
-Narration: "SALARY FOR FEB 2024" [DEBIT ₹50,000]
-Result: {"debit_account": "Salary Expense", "credit_account": "Bank Account", "category": "Indirect Expense"}
+Example 1 (Capital Introduced):
+Narration: "CASH DEPOSITED BY OWNER" [CREDIT ₹1,00,000]
+Result: {"debit_account": "Bank Account", "credit_account": "Capital Account", "category": "Equity"}
 
-Example 2 (UPI Receipt):
-Narration: "UPI/RCV/9876543210/FASTPAY" [CREDIT ₹1,500]
-Result: {"debit_account": "Bank Account", "credit_account": "Direct Income", "category": "Direct Income"}
+Example 2 (Drawings):
+Narration: "CASH WITHDRAWAL / SELF" [DEBIT ₹9,000]
+Result: {"debit_account": "Drawings A/c", "credit_account": "Bank Account", "category": "Equity"}
 
-Example 3 (Bank Charges):
-Narration: "CONSOLIDATED CHGS FOR JAN" [DEBIT ₹118]
-Result: {"debit_account": "Bank Charges", "credit_account": "Bank Account", "category": "Indirect Expense"}
+Example 3 (Interest on Capital):
+Narration: "INTEREST ON CAPITAL @ 10%" [CREDIT ₹15,000]
+Result: {"debit_account": "Interest on Capital A/c", "credit_account": "Capital Account", "category": "Equity"}
 
-Example 4 (Loan Repayment):
-Narration: "EMI / HDFC LOAN / 12345" [DEBIT ₹25,000]
-Result: {"debit_account": "Loan A/c", "credit_account": "Bank Account", "category": "Current Liabilities"}
-
-Example 5 (CASH Withdrawal):
-Narration: "CASH WITHDRAWAL / ATM" [DEBIT ₹5,000]
-Result: {"debit_account": "Cash in Hand", "credit_account": "Bank Account", "category": "Current Assets"}
+Example 4 (Net Profit Transfer):
+Narration: "NET PROFIT FOR 2024" [CREDIT ₹5,00,000]
+Result: {"debit_account": "Profit & Loss A/c", "credit_account": "Capital Account", "category": "Equity"}
 """
 
 JOURNAL_RULES = {
@@ -164,39 +173,42 @@ PNL_RULES = {
     "include_types": ["Direct Income", "Indirect Income", "Direct Expense", "Indirect Expense"],
     "exclude_types": [
         "Current Assets", "Current Liabilities", "Equity",
-
         "Opening Balance", "Capital", "Drawings", "Loan", "GST",
         "Suspense", "BANK", "CASH",
     ],
     "formula": "Net Profit = Total Income - Total Expense",
     "if_negative": "Net Loss",
-    "use_llm": False,
+    "use_llm": True,
 }
 
 PNL_RULES_TEXT = """
-### AGENT 4 — P&L RULES (PURE MATH — NO LLM)
+### AGENT 4 — P&L SYNTHESIS RULES (LLM-DRIVEN)
 
-ROLE: Calculate Net Profit / Loss from the Ledger Store.
+ROLE: You are a Senior Accountant. Your job is to take a Ledger Store (summarized account balances) and synthesize a professional Profit & Loss Statement.
 
-INCLUDE in P&L:
-  ✔ Direct Income     (e.g. Sales, Service Income)
-  ✔ Indirect Income   (e.g. Interest Received, Discount Received)
-  ✔ Direct Expense    (e.g. Purchase, COGS)
-  ✔ Indirect Expense  (e.g. Rent, Salary, Utilities)
+━━━ CLASSIFICATION RULES ━━━
+1. INCOME (Credit Balances):
+   - Direct Income: Sales, Professional Fees, Service Income.
+   - Indirect Income: Interest Received, Rent Received, Discount Received.
+2. EXPENSES (Debit Balances):
+   - Direct Expenses: Purchases, Carriage Inward, Wages, COGS.
+   - Indirect Expenses: Rent, Salary, Utilities, Bank Charges, Depreciation, Taxes.
 
-EXCLUDE from P&L:
-  ✖ Assets (Bank, Receivables, Advances)
-  ✖ Loans / Liabilities
-  ✖ Capital / Equity / Drawings
-  ✖ GST amounts
-  ✖ Opening Balance entries
-  ✖ Suspense Accounts
+━━━ CALCULATION LOGIC ━━━
+- Total Income = Sum of all Income accounts.
+- Total Expense = Sum of all Expense accounts.
+- Net Profit = Total Income - Total Expense.
+- If negative, label as 'Net Loss'.
 
-FORMULA:
-  Net Profit = Total Income − Total Expense
-  (if result < 0 → Net Loss)
-
-RULE: NEVER use an LLM for this calculation. Pure arithmetic only.
+━━━ OUTPUT FORMAT (STRICT JSON) ━━━
+{
+  "income_rows": [{"account": "Sales", "amount": 100000.00}, ...],
+  "expense_rows": [{"account": "Rent", "amount": 10000.00}, ...],
+  "total_income": 100000.00,
+  "total_expense": 10000.00,
+  "net_profit": 90000.00,
+  "is_loss": false
+}
 """
 
 BALANCE_SHEET_RULES = {
@@ -208,41 +220,81 @@ BALANCE_SHEET_RULES = {
         "Loan", "Creditors", "GST Payable", "Overdraft",
     ],
     "equity": [
-        "Opening Capital", "Capital Introduced", "Net Profit",
-        "Less: Net Loss", "Less: Drawings",
+        "Closing Capital",
     ],
     "equation": "Assets = Liabilities + Equity",
     "net_profit_injection": True,
-    "use_llm": False,
+    "use_llm": True,
 }
 
+CAPITAL_ACCOUNT_RULES = {
+    "include_types": ["Equity"],
+    "formula": "Closing Capital = Opening Capital + Capital Introduced + Net Profit - Drawings",
+}
+
+CAPITAL_ACCOUNT_RULES_TEXT = """
+### AGENT 4.5 — CAPITAL ACCOUNT RULES (LLM-DRIVEN)
+
+ROLE: Synthesize the movement of Capital during the period.
+
+━━━ INPUTS ━━━
+1. Equity accounts from Ledger Store (Balances).
+2. Net Profit/Loss (from Agent 4).
+
+━━━ CATEGORIZATION RULES ━━━
+- OPENING CAPITAL: Existing balance in Capital A/c or Opening Balance entries.
+- CAPITAL INTRODUCED: Fresh funds brought in (marked for Capital/Equity).
+- DRAWINGS: Personal withdrawals (Self, Personal, LIC, Income Tax, etc.).
+- INTEREST ON CAPITAL: Specific entries for interest allowed to owner.
+
+━━━ FORMULA ━━━
+Closing Capital = (Opening + Introduced + Net Profit + Interest) - (Net Loss + Drawings)
+
+━━━ OUTPUT FORMAT (STRICT JSON) ━━━
+{
+  "particulars": [
+    {"label": "Opening Balance", "amount": 1000.00},
+    {"label": "Add: Capital Introduced", "amount": 500.00},
+    {"label": "Add: Net Profit", "amount": 200.00},
+    {"label": "Less: Drawings", "amount": 100.00}
+  ],
+  "closing_capital": 1600.00
+}
+"""
+
 BALANCE_SHEET_RULES_TEXT = """
-### AGENT 5 — BALANCE SHEET RULES (PURE MATH — NO LLM)
+### AGENT 5 — BALANCE SHEET RULES (LLM-DRIVEN)
 
-ROLE: Build Balance Sheet from Ledger + P&L Net Profit.
+ROLE: Synthesize a professional Balance Sheet.
 
-ASSETS SIDE (Debit balances):
-  ✔ Bank Account (Closing Balance)
-  ✔ Purchased Assets (Machinery, Equipment)
-  ✔ Receivables / Debtors
-  ✔ GST Input Credit
-  ✔ Advances Paid
+━━━ CLASSIFICATION ━━━
+1. ASSETS (Debit Balances):
+   - Current Assets: Bank, Cash, Debtors, Stock, GST Input, Advances.
+   - Fixed Assets: Machinery, Land, Furniture, Computers.
+2. LIABILITIES (Credit Balances):
+   - Current Liabilities: Creditors, GST Payable, TDS Payable, Short-term Loans.
+   - Long-term Liabilities: Secured Loans, Debentures.
+3. EQUITY:
+   - Closing Capital (from Agent 4.5).
 
-LIABILITIES + EQUITY SIDE (Credit balances):
-  ✔ Loans Taken
-  ✔ Creditors / Payables
-  ✔ GST Payable
-  — Equity Section:
-      Opening Capital
-    + Capital Introduced
-    + Net Profit  (from Agent 4)
-    − Net Loss    (if loss)
-    − Drawings
+━━━ EQUATION ━━━
+Assets = Liabilities + Equity
 
-MUST SATISFY:
-  Assets = Liabilities + Equity
-
-RULE: NEVER use an LLM for this calculation. Pure arithmetic only.
+━━━ OUTPUT FORMAT (STRICT JSON) ━━━
+{
+  "assets": {
+    "Fixed Assets": [{"account": "Machinery", "amount": 50000.00}],
+    "Current Assets": [{"account": "Bank Account", "amount": 25000.00}]
+  },
+  "liabilities": {
+    "Current Liabilities": [{"account": "GST Payable", "amount": 5000.00}]
+  },
+  "equity": {
+    "Capital": [{"account": "Closing Capital", "amount": 70000.00}]
+  },
+  "total_assets": 75000.00,
+  "total_liabilities_equity": 75000.00
+}
 """
 
 TALLY_RULES = {
@@ -288,6 +340,7 @@ ALL_AGENT_RULES = {
     "agent_2_classifier":   CLASSIFIER_RULES,
     "agent_3_journal":      JOURNAL_RULES_TEXT,
     "agent_4_pnl":          PNL_RULES_TEXT,
+    "agent_4_5_capital":    CAPITAL_ACCOUNT_RULES_TEXT,
     "agent_5_balance_sheet": BALANCE_SHEET_RULES_TEXT,
     "agent_6_tally":        TALLY_RULES_TEXT,
 }
@@ -330,6 +383,7 @@ Income | Expense | Current Assets | Fixed Assets | Liability | Equity
 
 JOURNAL_CONFIG      = JOURNAL_RULES
 PNL_CONFIG          = PNL_RULES
+CAPITAL_CONFIG      = CAPITAL_ACCOUNT_RULES
 BALANCE_SHEET_CONFIG = BALANCE_SHEET_RULES
 TALLY_CONFIG        = TALLY_RULES
 
@@ -359,19 +413,21 @@ Constraints: Dr must equal Cr per transaction or it is SKIPPED. Never modifies a
 """,
 
     "pnl": """\
-Agent 4 — PROFIT & LOSS AGENT (Pure Math, no LLM).
-Calculates Net Profit or Loss from the Ledger Store populated by Agent 3.
-Input  : Ledger Store (account → net balance) with account categories from Agent 2.
-Output : P&L Statement (markdown table) — Expense (Dr) side | Income (Cr) side | Net Profit/Loss.
-Constraints: Only Income/Expense categories included. Assets, Liabilities, Equity, Suspense excluded.\
+You are Agent 4 — the P&L AGENT.
+Your job is to synthesize a professional P&L Statement from the provided Ledger data.
+Follow the rules provided to categorize accounts into Direct/Indirect Income and Expenses.\
 """,
 
     "balance_sheet": """\
-Agent 5 — BALANCE SHEET AGENT (Pure Math, no LLM).
-Builds the Balance Sheet from the Ledger Store plus Net Profit injected from Agent 4.
-Input  : Ledger Store (non-P&L accounts) + net_profit value from Agent 4.
-Output : Balance Sheet (markdown table) — Liabilities & Equity side | Assets side.
-Constraints: Assets = Liabilities + Equity must hold. Net Profit/Loss added to Equity side.\
+You are Agent 5 — the BALANCE SHEET AGENT.
+Your job is to synthesize a professional Balance Sheet.
+Classify accounts into Assets (Fixed/Current) and Liabilities/Equity based on the provided rules.
+Ensure Assets = Liabilities + Equity.\
+""",
+
+    "capital": """\
+You are Agent 4.5 — the CAPITAL ACCOUNT AGENT.
+Calculate the movement of Capital by categorizing Equity accounts and incorporating Net Profit/Loss.\
 """,
 
     "tally": """\

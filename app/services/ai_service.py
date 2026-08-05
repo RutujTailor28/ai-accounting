@@ -48,13 +48,8 @@ class LLMService:
     async def classify_query_intent(self, question: str) -> Dict[str, Any]:
         """
         Use the LLM to categorize the user's query intent.
-        Returns: {
-            "intent": "SUMMARY" | "EXTRACTION" | "GENERAL",
-            "explicit_limit": int | None,
-            "report_types": List[str] | None,
-            "target_keywords": List[str] | None
-        }
         """
+        from app.schemas.ai import IntentClassification
         prompt = f"""You are an intent discovery agent for a financial RAG system.
         Categorize the user's question into one of three intents:
 
@@ -68,123 +63,52 @@ class LLMService:
            Examples: "how do I upload?", "what is a balance sheet?".
 
         USER QUESTION: "{question}"
-
-        Return ONLY a JSON object:
-        {{
-            "intent": "SUMMARY" | "EXTRACTION" | "GENERAL",
-            "explicit_limit": int_or_null,
-            "report_types": ["balance_sheet", "p_and_l", "computation", "statement", "general_summary"],
-            "target_keywords": ["keyword1", "keyword2"]
-        }}
         """
         try:
-            response = await self.llm.ainvoke(prompt)
-            intent_data = self._extract_json(response.content)
-            print(f"[INFO] Intent Discovery: query='{question}' -> intent={intent_data.get('intent')}")
-            return intent_data
+            # Create a model instance bound to the schema
+            structured_llm = self.llm.with_structured_output(IntentClassification)
+            intent_data = await structured_llm.ainvoke(prompt)
+            data_dict = intent_data.model_dump()
+            print(f"[INFO] Intent Discovery: query='{question}' -> intent={data_dict.get('intent')}")
+            return data_dict
         except Exception as e:
             print(f"[ERROR] Intent Discovery failed: {e}")
-
             return {"intent": "EXTRACTION", "explicit_limit": None, "report_types": [], "target_keywords": []}
 
-    def _extract_json(self, text: str) -> Dict[str, Any]:
+    def _extract_json(self, text: str) -> dict:
         """
-        Robustly extract and parse JSON from LLM output.
-        Attempts to find the largest valid JSON object or array in the text.
+        Legacy fallback: Robustly extract and parse JSON from LLM output.
         """
-
+        import re, json
         def clean_json_string(s):
-
             s = re.sub(r'```json\s*', '', s)
             s = re.sub(r'```\s*', '', s)
             return s.strip()
 
         text = clean_json_string(text)
-
         try:
             parsed = json.loads(text)
-            print(f"[DEBUG] JSON parsed successfully. Type: {type(parsed)}")
-
-            if isinstance(parsed, list):
-                print(f"[DEBUG] Parsed as list with {len(parsed)} items")
-                return {"transactions": parsed}
-            elif isinstance(parsed, dict):
-
-                transaction_indicators = ['date', 'amount', 'description', 'transaction_id', 'type']
-                if any(key in parsed for key in transaction_indicators) and 'transactions' not in parsed:
-                    print(f"[DEBUG] Detected single transaction object, wrapping in array")
-                    return {"transactions": [parsed]}
-                print(f"[DEBUG] Parsed as dict with keys: {list(parsed.keys())}")
-                return parsed
-        except json.JSONDecodeError as e:
-            print(f"[DEBUG] Direct JSON parse failed: {e}")
+            if isinstance(parsed, list): return {"data": parsed}
+            return parsed
+        except json.JSONDecodeError:
+            pass
 
         all_found = []
         decoder = json.JSONDecoder()
-
         for i in range(len(text)):
             if text[i] in '{[':
                 try:
-                    obj, end = decoder.raw_decode(text[i:])
+                    obj, _ = decoder.raw_decode(text[i:])
                     all_found.append(obj)
-                except (json.JSONDecodeError, ValueError):
-                    pass
-
-        print(f"[DEBUG] Iterative search found {len(all_found)} JSON objects")
-
-        if not all_found:
-
-            temp_text = text
-            for _ in range(3):
-                temp_text += "}"
-                try:
-                    match = re.search(r'(\{.*\})', temp_text, re.DOTALL)
-                    if match:
-                        all_found.append(json.loads(match.group(0)))
-                        break
-                except: pass
-
-                temp_text_sq = text + "]"
-                try:
-                    match = re.search(r'(\[.*\])', temp_text_sq, re.DOTALL)
-                    if match:
-                        all_found.append(json.loads(match.group(0)))
-                        break
                 except: pass
 
         if all_found:
-            print(f"[DEBUG] Processing {len(all_found)} found objects")
-
             for item in all_found:
-                if isinstance(item, dict):
-                    if "transactions" in item or "data" in item:
-                        print(f"[DEBUG] Found dict with transactions/data key")
-                        return item
-
-            transaction_objects = []
-            for item in all_found:
-                if isinstance(item, dict):
-                    transaction_indicators = ['date', 'amount', 'description', 'transaction_id', 'type']
-                    if any(key in item for key in transaction_indicators):
-                        transaction_objects.append(item)
-
-            if transaction_objects:
-                print(f"[DEBUG] Found {len(transaction_objects)} transaction objects, wrapping in array")
-                return {"transactions": transaction_objects}
-
-            for item in all_found:
-                if isinstance(item, list):
-                    print(f"[DEBUG] Found standalone list with {len(item)} items")
-                    return {"transactions": item}
-
-            print(f"[DEBUG] Using fallback: returning first found object")
+                if isinstance(item, dict) and ("transactions" in item or "mutations" in item or "data" in item or "deposits_count" in item or "report_name" in item):
+                    return item
             return all_found[0] if isinstance(all_found[0], dict) else {"data": all_found[0]}
-
-        print(f"[WARNING] No valid JSON found in response, returning empty")
-        return {
-            "message": text.strip()[:200],
-            "transactions": []
-        }
+        
+        return {}
 
     async def _extract_document_metadata(self, context_chunks: List[str], source_documents: List[str], company_id: str = None) -> Dict[str, Dict[str, str]]:
         """
@@ -257,14 +181,14 @@ class LLMService:
                 {full_peek_content[:15000]}
                 ---
 
-                Return ONLY a JSON object: {{"bank_name": "IDENTIFIED BANK NAME", "account_holder": "IDENTIFIED NAME", "document_type": "TYPE"}}
-
                 **RULES FOR BANK NAME**:
                 - Extract the **Full Official Name** (e.g. "State Bank of India", "HDFC Bank").
                 - Do not abbreviate.
                 """
-                response = await self.llm.ainvoke(prompt)
-                meta = self._extract_json(response.content)
+                from app.schemas.ai import DocumentMetadataExtraction
+                structured_llm = self.llm.with_structured_output(DocumentMetadataExtraction)
+                meta_data = await structured_llm.ainvoke(prompt)
+                meta = meta_data.model_dump()
 
                 bank_name = str(meta.get("bank_name", "Unknown")).strip()
                 account_holder = meta.get("account_holder", "Unknown")
@@ -341,9 +265,10 @@ class LLMService:
             print(f"[WARNING] Failed to retrieve feedback: {e}")
             feedback_context = ""
 
-        prompt = f"""You are an expert financial assistant designed to analyze and extract information from uploaded bank documents such as statements, ledgers, journals, Balance Sheets, and Profit & Loss statements. Your task is to help users find specific transactions or understand financial summaries by interpreting their queries.
+        from app.schemas.ai import ExtractedTransactions
 
-**CURRENT SYSTEM DATE:** {current_date_str} (Use this to resolve "this year", "previous year", "last month", etc. Previous year = {current_year - 1})
+        extraction_prompt = f"""You are an expert financial assistant.
+**CURRENT SYSTEM DATE:** {current_date_str}
 
 **USER QUERY:** "{question}"
 
@@ -353,334 +278,44 @@ class LLMService:
 {context}
 
 **CRITICAL INSTRUCTIONS:**
-1. **CATEGORIZATION ACCURACY (HIGHEST PRIORITY)**:
-   - **EQUITY AND LIABILITIES**: Capital, Loans, Sundry Creditors, Provisions, Outstanding Expenses.
-   - **ASSETS**: Fixed Assets (Cars, Land, Furniture), Sundry Debtors, Bank Balance, Cash in Hand, Deposits, Prepaid Expenses.
-   - **SUNDRY DEBTORS ARE ALWAYS ASSETS**. Do NOT place them in Liabilities.
-   - **SUNDRY CREDITORS ARE ALWAYS LIABILITIES**.
+Extract ALL transactions from the provided context that match the user's query.
+- For summary reports (Balance Sheet/P&L), extract the structural tables as transactions where 'narration' is the row particular and 'amount' is the value.
+- If looking for specific transactions (e.g. "Cash"), strictly filter out non-matching rows.
+- **CREDITS ARE MONEY COMING IN. DEBITS ARE MONEY OUT.**
+- **MANDATORY DIRECTION CHECK:** Compare the running balance with the previous line's balance. If balance increased, it is a CREDIT. If balance decreased, it is a DEBIT.
 
-2. **Understand the Query:** Identify if the user is looking for SPECIFIC TRANSACTIONS or a GENERAL SUMMARY (like a Balance Sheet or P&L).
-
-3. **Document Analysis & Identification:**
-   - Scan the context to identify the DOCUMENT TYPE (e.g., Bank Statement, Balance Sheet, P&L).
-   - Identify the FINANCIAL PERIOD or YEAR mentioned in the document headers.
-   - If the user asks for "previous year", look for documents dated {current_year - 1}.
-
-4. **HANDLING SUMMARY REPORTS (Balance Sheet / P&L / Computation):**
-   - If the user asks for a high-level summary (e.g., "give me balance sheet", "show p&l", "financial report"), your PRIMARY goal is to find and extract that report's structural tables.
-   - **MANDATORY**: Look for keywords like "Balance Sheet", "Assets", "Liabilities", "Equity", "Profit & Loss", "p & l", "Capital Account", "Income", "Expenditure", "Statement of Affairs", "Financial Position" in the text.
-   - **DO NOT** extract individual bank statement transactions if a summary report is requested.
-   - **TABLE INTEGRITY**: You MUST produce a single continuous markdown table for each section. **DO NOT** break a table with empty lines or interleaved text. Output EVERY row for a section in one block.
-   - **MANDATORY**: Cleanly format the summary data into a Markdown Table.
-   - **CATEGORIZATION ACCURACY (CRITICAL)**:
-     - **EQUITY AND LIABILITIES**: Capital, Loans, Sundry Creditors, Provisions, Outstanding Expenses.
-     - **ASSETS**: Fixed Assets (Cars, Land, Furniture), Sundry Debtors, Bank Balance, Cash in Hand, Deposits, Prepaid Expenses.
-     - **SUNDRY DEBTORS ARE ALWAYS ASSETS**. Do NOT place them in Liabilities.
-   - **VERTICALIZATION RULE (CRITICAL)**: Many documents show Liabilities and Assets side-by-side in a 4-column layout. You MUST VERTICALIZE this.
-     - NEVER produce a table with 4 columns (Liabilities, Amount, Assets, Amount).
-     - Process the entire "LIABILITIES" column/side first.
-     - Then process the entire "ASSETS" column/side first.
-     - Output them as TWO SEPARATE TABLES, one after the other.
-   - **BALANCE SHEET COMPLETENESS**: For a Balance Sheet, you MUST provide BOTH an "ASSETS" table AND an "EQUITY AND LIABILITIES" table. DO NOT stop after the first table.
-   - **STRICT FORMATTING**:
-     - **START DIRECTLY** with the first markdown table.
-     - **DO NOT** include any report titles, headers, or introductory text (e.g. NO "BALANCE SHEET").
-     - **DO NOT** use markdown headers (#) or bolding (**).
-     - **DO NOT** wrap the entire response in markdown code blocks (```markdown or ```).
-   - **REPORT FORMAT**:
-      | Particulars | Amount |
-      | :--- | :--- |
-      | [Row Data] | [Amount] |
-
-      {{"transactions": []}}
-   - If the request is for a report and you found NO such report in the context, return:
-     "{{"transactions": [], "message": "I could not find a structured [Report Type] table in the provided documents."}}"
-
-4. **STRICT PRE-FILTERING (HIGHEST PRIORITY):**
-   - Identify the SPECIFIC INTENT: Is the user asking for "Cash", "UPI", "ATM", "NEFT", etc.?
-   - **CASH FILTER**: If the user asks for "Cash", you MUST EXCLUDE any transaction that contains UPI identifiers, VPA IDs, or NEFT/IMPS markers. ONLY include "CASH", "ATM", "WITHDRAWAL", "SELF", or "WDL".
-   - **UPI FILTER**: If the user asks for "UPI", you MUST EXCLUDE any transaction that contains "CASH" or "ATM" identifiers.
-   - **STRICT EXCLUSION**: Your goal is NOT to find "similar" things, but to find EXACT matches for the requested type.
-   - If a transaction is ambiguous or does not explicitly match the requested type, **SKIP IT**.
-
-5. **HANDLING TRANSACTION QUERIES:**
-   - Transaction dates
-   - Amounts (debit/credit)
-   - Description/narration
-   - UPI IDs, reference numbers, or payee names
-   - Transaction types (UPI, NEFT, cash, etc.)
-   - **BALANCE VALUES** - These are CRITICAL for determining transaction direction
-
-   **DATE PARSING & FILTERING (CRITICAL):**
-   - **User Input Format:** The user provides dates in **YYYY-MM-DD** format (e.g., 2024-03-01).
-   - **Document Format:** Bank statements often use **DD/MM/YYYY** or **DD-MM-YYYY** (e.g., 01/03/2024).
-   - **YOUR JOB:** You MUST map the user's YYYY-MM-DD request to the document's DD/MM/YYYY dates.
-   - **Example:** If user asks for "2024-03-01 to 2024-03-31":
-     - INCLUDE: "01/03/2024", "15/03/2024", "31/03/2024"
-     - EXCLUDE: "01/01/2024" (January), "03/01/2024" (January 3rd)
-   - **Ambiguity:** If a date is ambiguous (e.g., 01/02/2024 could be Jan 2nd or Feb 1st), use the context of other dates in the document to decide. Indian/UK banks use DD/MM/YYYY. US banks use MM/DD/YYYY.
-   - **STRICT FILTER ADHERENCE:** Only extract transactions that fall WITHIN the requested date range.
-
-**PROCESSING WORKFLOW (FOLLOW THIS EXACT ORDER):**
-1. **IDENTIFY FILTER**: Determine the specific transaction type or keyword the user is looking for (e.g., "Cash").
-2. **SCAN LINE-BY-LINE**: Read through the context.
-3. **APPLY FILTER**: For each line, check: "Does this line match the IDENTIFIED FILTER?"
-4. **DECIDE**:
-   - If NO: **STOP immediately** for this line. Do NOT extract anything. Move to the next line.
-   - If YES: Proceed to step 5.
-5. **EXTRACT (MATCHING ONLY)**:
-   a. Extract: Date, Description, Amount(s), Balance
-   b. **FIND THE PREVIOUS LINE'S BALANCE**
-   c. **COMPARE**: Current Balance vs Previous Balance
-   d. **DETERMINE DIRECTION** (Credit if balance increased, Debit if decreased)
-   e. Extract all other fields
-6. **VERIFY COMPLETENESS**: Ensure EVERY record that matches the filter is extracted.
-7. **VERIFY PURITY**: Ensure NO record that fails the filter (e.g. no UPI in a Cash search) is extracted.
-
-3. **COMPLETE EXTRACTION REQUIREMENT:**
-   - Extract **EVERY SINGLE RECORD** that matches the user's query from the provided context
-   - Include **BOTH CREDIT AND DEBIT** transactions - do NOT filter by direction
-   - **CREDITS ARE EQUALLY IMPORTANT AS DEBITS** - Do NOT favor debits over credits
-   - Do NOT summarize, truncate, or limit the number of records
-   - Do NOT skip any matching transactions
-   - If there are 100 matching records, return all 100
-   - If there are 1000 matching records, return all 1000
-   - COMPLETENESS is more important than brevity
-
-   **🚨 CRITICAL: CREDIT TRANSACTION IDENTIFICATION (HIGHEST PRIORITY) 🚨**
-
-   **CREDITS ARE MONEY COMING IN - THEY MUST BE EXTRACTED AND VISIBLE:**
-   - **CREDIT = Money INCOMING** (Deposits, Receipts, Salary, Interest, Refunds, Dividends, Transfers Received, etc.)
-   - **DEBIT = Money OUTGOING** (Withdrawals, Payments, Expenses, Transfers Sent, etc.)
-
-   **BANK STATEMENT COLUMN STRUCTURE:**
-   - Bank statements typically have THREE numeric columns: **[Withdrawal/Debit] [Deposit/Credit] [Balance]**
-   - In plain text, these appear as three consecutive numbers separated by spaces
-   - **THE SECOND NUMBER IS ALMOST ALWAYS THE CREDIT COLUMN**
-
-   **CREDIT IDENTIFICATION RULES (MANDATORY - FOLLOW THIS EXACT ORDER):**
-
-   **STEP 1: BALANCE COMPARISON (PRIMARY & MANDATORY METHOD - USE THIS FIRST):**
-   - **FOR EVERY TRANSACTION, YOU MUST:**
-     1. Identify the balance value on the current line
-     2. Find the balance from the PREVIOUS transaction line
-     3. Compare: Current Balance vs Previous Balance
-     4. If Current Balance > Previous Balance → **CREDIT** (balance increased = money came in)
-     5. If Current Balance < Previous Balance → **DEBIT** (balance decreased = money went out)
-
-   - **Examples:**
-     - Previous line balance: 19,773.73
-     - Current line: "22/11/24 TXN-NARRATION-DATA 350.00 20,123.73"
-     - Current balance: 20,123.73
-     - Comparison: 20,123.73 > 19,773.73 → Balance INCREASED → **CREDIT**
-
-     - Previous line balance: 20,123.73
-     - Current line: "22/11/24 PAYMENT-DETAIL 500.00 19,623.73"
-     - Current balance: 19,623.73
-     - Comparison: 19,623.73 < 20,123.73 → Balance DECREASED → **DEBIT**
-
-   - **CRITICAL**: This method works for ALL bank statement formats, even when columns are unclear
-   - **CRITICAL**: If you cannot find a previous balance, look for the opening balance or use the first transaction's balance as reference
-
-   **STEP 2: COLUMN POSITION CHECK (SECONDARY METHOD - USE IF BALANCE COMPARISON IS UNCLEAR):**
-      - If you see: "Date Description 0.00 500.00 Balance" → The 500.00 is in the 2nd column = **CREDIT**
-      - If you see: "Date Description 500.00 0.00 Balance" → The 500.00 is in the 1st column = **DEBIT**
-      - **ALWAYS check BOTH columns - never assume the first number is the only transaction**
-
-   **STEP 3: KEYWORD DETECTION (TERTIARY METHOD - USE AS CONFIRMATION):**
-      - **CREDIT keywords**: "Deposit", "CR", "Credit", "Interest", "Received", "Refund", "Salary", "Inward", "Credit to", "Received from", "NEFT-CREDIT", "IMPS-CREDIT", "RTGS-CREDIT", "Dividend", "Bonus", "Reversal", "Reversal of", "Refund of"
-      - **DEBIT keywords**: "Withdrawal", "DR", "Debit", "Payment", "Paid", "Outward", "Payment to", "Transfer to", "NEFT-DEBIT", "IMPS-DEBIT", "RTGS-DEBIT"
-      - If description contains CREDIT keywords → **direction = "CREDIT"**
-      - If description contains DEBIT keywords → **direction = "DEBIT"**
-
-   **STEP 4: ZERO VALUE MARKERS**:
-      - **DO NOT IGNORE 0.00 VALUES** - They indicate which column has the actual transaction
-      - Pattern: "0.00 500.00" → 500.00 is a **CREDIT** (first column is 0, second has value)
-      - Pattern: "500.00 0.00" → 500.00 is a **DEBIT** (first column has value, second is 0)
-
-   **STEP 5: SINGLE AMOUNT DETECTION**:
-      - If only ONE amount appears on a line (format: "Date Description Amount Balance"):
-        - **FIRST**: Compare balance with previous line → If increased = **CREDIT**, if decreased = **DEBIT**
-        - **THEN**: Check for CREDIT keywords in description → "Received", "Credit", "Interest", "CR" → **CREDIT**
-        - **THEN**: Check for DEBIT keywords → "Paid", "Payment", "Debit", "DR" → **DEBIT**
-        - **DEFAULT**: If balance increased, it's a **CREDIT** (this is the most reliable indicator)
-
-   **STEP 6: SMOOSHED NUMBERS**:
-      - If numbers appear together like "100.005000.00", split them
-      - First number = Transaction amount
-      - Second number = Balance
-      - Compare with previous balance to determine direction
-
-   **CREDIT EXTRACTION EXAMPLES (REAL BANK STATEMENT FORMATS):**
-
-   **Example 1 - Two Number Format (Amount + Balance):**
-   - Previous balance: 19,773.73
-   - Line: "22/11/24 TXN-NARRATION-DATA SINGH-PAYTMQR1LJPTAZGXV@PAYTM 350.00 20,123.73"
-   - Current balance: 20,123.73
-   - Comparison: 20,123.73 > 19,773.73 → Balance INCREASED → **CREDIT**
-
-   **Example 2 - Three Number Format (Debit + Credit + Balance):**
-   - Line: "22/11/24 Salary Credit 0.00 50000.00 60000.00"
-   - Previous balance: 10,000.00
-   - Current balance: 60,000.00
-   - Comparison: 60,000.00 > 10,000.00 → Balance INCREASED → **CREDIT**
-   - Also: 50,000.00 is in 2nd column (Credit column) → Confirms **CREDIT**
-
-   **Example 3 - Single Amount with Balance:**
-   - Previous balance: 10,000.00
-   - Line: "22/11/24 RECEIVED-DATA from John 1000.00 11000.00"
-   - Current balance: 11,000.00
-   - Comparison: 11,000.00 > 10,000.00 → Balance INCREASED → **CREDIT**
-   - Also: Keyword "RECEIVED" → Confirms **CREDIT**
-
-   **Example 4 - Interest Payment:**
-   - Previous balance: 10,000.00
-   - Line: "22/11/24 Interest 500.00 10500.00"
-   - Current balance: 10,500.00
-   - Comparison: 10,500.00 > 10,000.00 → Balance INCREASED → **CREDIT**
-
-   **Example 5 - Refund:**
-   - Previous balance: 10,000.00
-   - Line: "22/11/24 Refund 0.00 2000.00 12000.00"
-   - Current balance: 12,000.00
-   - Comparison: 12,000.00 > 10,000.00 → Balance INCREASED → **CREDIT**
-   - Also: 2,000.00 is in 2nd column (Credit column) → Confirms **CREDIT**
-
-   **MANDATORY VALIDATION FOR EVERY TRANSACTION:**
-   - **BEFORE marking direction, you MUST:**
-     1.  Find the balance on the current line
-     2.  Find the balance from the previous transaction line (or opening balance)
-     3.  Compare: Current Balance vs Previous Balance
-     4.  If Current > Previous → Mark as **CREDIT**
-     5.  If Current < Previous → Mark as **DEBIT**
-     6.  If Current = Previous → Check for other indicators (rare case)
-
-   - **AFTER extracting each transaction, verify:**
-     1. Did I compare the balance with the previous line? (REQUIRED)
-     2. Did I check BOTH amount columns if present?
-     3. Did I look for CREDIT/DEBIT keywords as confirmation?
-     4. If balance increased, did I mark it as "CREDIT"? (DO NOT mark as DEBIT if balance increased!)
-
-   - **CRITICAL RULES:**
-     - **DO NOT SKIP CREDITS** - They are just as important as debits
-   - **BALANCE INCREASE = CREDIT** - This is the most reliable indicator
-   - **If balance increased, it CANNOT be a DEBIT** - Always mark as CREDIT
-   - **If you're unsure, default to balance comparison - if balance increased, it's a CREDIT**
-   - **Track balance sequentially** - Process transactions line by line, maintaining balance state
-
-4. **Output Format:**     {{
-      "transactions": [
-        {{
-          "date": "transaction date",
-          "description": "transaction description/narration (include the full text for accuracy)",
-          "amount": "transaction amount (ABSORLUTELY REQUIRED: Use the non-zero numeric value. NEVER use 0.00)",
-          "direction": "CREDIT or DEBIT",
-          "balance": "MANDATORY: The running balance value shown on the same line as the transaction",
-          "transaction_id": "UPI ID/reference number/Chq No/Instrument No if available",
-          "type": "UPI/NEFT/CASH/CHQ/IMPS/RTGS etc if identifiable",
-          "bank_name": "MANDATORY: Use the 'STATEMENT_BANK' name from the block header exactly. DO NOT guess based on narrations.",
-          "source_document": "name of the document this transaction was found in"
-        }}
-      ]
-    }}
-
-   **DIRECTION DETERMINATION (MANDATORY FOR EVERY TRANSACTION):**
-   - Before setting "direction", you MUST:
-     1. Identify the balance on the current transaction line
-     2. Identify the balance from the previous transaction line
-     3. Compare them:
-        - If current balance > previous balance → "direction": "CREDIT"
-        - If current balance < previous balance → "direction": "DEBIT"
-     4. If you cannot find previous balance, look for opening balance or use column position/keywords
-
-   - **CRITICAL**: If you found NO records in this specific context block, return an empty list: {{"transactions": []}}.
-   - **CRITICAL**: Do NOT list "0.00" as the transaction amount. Use the actual numeric value from the other column.
-   - **CRITICAL**: Do NOT default all transactions to "DEBIT". Many transactions are CREDITS - use balance comparison to determine.
-
-**GOAL**: Be helpful, comprehensive, and professional. Provide a **detailed and thorough analysis** of the found information. Do not give short or one-line answers. Explain the context, any trends you see, and all relevant details found in the documents.
-
-**MANDATORY FORMATTING**:
-- Your response **MUST** be structured with multiple bullet points.
-- Every key fact, insight, transaction detail, or summary point **MUST start with a dash and space** (e.g., `- Detailed insight here`).
-- Use standard markdown bolding (**text**) for important numbers, dates, or names.
-- Use **simple, easy-to-understand English**. Avoid technical financial jargon (like "liabilities" or "assets") where possible—instead, use plain words (like "money you owe" or "things you own").
-- If the user asks a question, provide a deep explanation based on the context.
-
-**DO NOT** just return JSON; always include a **rich, detailed human-readable explanation** before the JSON. The human-readable part should feel like a complete mini-report, not just a snippet.
-
-**RESPONSE**:
+Extract the data strictly adhering to the schema.
 """
-
         try:
             print(f"[INFO] Generating answer for question: {question[:100]}...")
-            print(f"[DEBUG] Context chunks count: {len(context_chunks)}")
-            print(f"[DEBUG] [Sending to AI] Input context preview: {context_chunks[0][:200] if context_chunks else 'NO CONTEXT'}...")
+            
+            structured_llm = self.llm.with_structured_output(ExtractedTransactions)
+            extracted_data = await structured_llm.ainvoke(extraction_prompt)
+            parsed_json = extracted_data.model_dump()
+            
+            analysis_prompt = f"""
+You are an expert financial analyst. 
+The user asked: "{question}"
+Here is the extracted data from the bank documents:
+{json.dumps(parsed_json, indent=2)}
 
-            response = await self.llm.ainvoke(prompt)
-            print(f"[DEBUG] [Received from AI] Response length: {len(response.content)} chars")
+Please provide a detailed, human-readable analysis of this data.
+- Use multiple bullet points.
+- Start every key fact with a dash.
+- Use plain English instead of technical jargon.
+- DO NOT return JSON. Just return the analysis.
+"""
+            analysis_response = await self.llm.ainvoke(analysis_prompt)
+            human_answer = analysis_response.content.strip()
 
-            if not response.content or not response.content.strip():
-                print(f"[WARNING] Received empty response from LLM (0 chars). Triggering retry...")
-                raise ValueError("Empty response from LLM")
-
-            answer = response.content.strip()
-
-            parsed_json = self._extract_json(answer)
-
-            if "message" in parsed_json and not parsed_json.get("transactions"):
-                print(f"[WARNING] JSON extraction failed (Fallback triggered). Raw response preview: {answer[:100]}...")
-                raise ValueError("Failed to extract valid JSON from LLM response")
-
-            if "data" in parsed_json and "transactions" not in parsed_json:
-                parsed_json["transactions"] = parsed_json.pop("data")
-
-            if "transactions" in parsed_json:
-                initial_count = len(parsed_json["transactions"])
-                parsed_json["transactions"] = [tx for tx in parsed_json["transactions"] if not self._should_filter_transaction(tx, question)]
-                if initial_count > len(parsed_json["transactions"]):
-                    print(f"[FILTER] Standard answer: Filtered out {initial_count - len(parsed_json['transactions'])} non-matching transactions.")
-
-            sources = list(set(source_documents))
-
-            intent_data = await self.classify_query_intent(question)
-            is_summary = (intent_data.get("intent") == "SUMMARY")
-
-            human_answer = answer
-
-            human_answer = re.sub(r'```(?:json)?\s*[\{\[][\s\S]*?[\}\]]\s*```', '', human_answer, flags=re.DOTALL)
-
-            human_answer = re.sub(r'(?m)^[\{\[]\s*".*?"\s*:[\s\S]*?[\}\]]\s*$', '', human_answer, flags=re.DOTALL)
-
-            human_lines = []
-            for line in human_answer.split('\n'):
-                line_strip = line.strip()
-
-                if not line_strip:
-                    human_lines.append(line)
-                    continue
-
-                if line_strip in ['{', '}', '[', ']', '},', '],']:
-                    continue
-
-                if re.match(r'^\s*"\w+"\s*:\s*.*?,?\s*$', line_strip):
-                    continue
-
-                if (line_strip.startswith('{') and line_strip.endswith('}')) or \
-                   (line_strip.startswith('[') and line_strip.endswith(']')):
-                    try:
-                        json.loads(line_strip)
-                        continue
-                    except:
-                        pass
-                human_lines.append(line)
-            human_answer = "\n".join(human_lines).strip()
-
-            if not human_answer and "message" in parsed_json:
+            if not human_answer and "message" in parsed_json and parsed_json["message"]:
                 human_answer = parsed_json["message"]
             elif not human_answer and "transactions" in parsed_json and parsed_json["transactions"]:
                 human_answer = f"I found {len(parsed_json['transactions'])} matching records."
             elif not human_answer:
                 human_answer = "I could not find the information you requested in the uploaded documents."
+
+            sources = list(set(source_documents))
 
             return {
                 "answer": json.dumps(parsed_json),

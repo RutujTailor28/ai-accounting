@@ -15,12 +15,13 @@ class TextChunker:
         )
         print(f"[INFO] TextChunker initialized with chunk_size={settings.chunk_size}, chunk_overlap={settings.chunk_overlap}")
 
-    def chunk_text(self, text: str) -> List[str]:
+    def chunk_text(self, text: str, header_text: str = None) -> List[str]:
         """
-        Split text into chunks.
+        Split text into chunks and optionally prepend document header.
 
         Args:
             text: Input text to chunk
+            header_text: Optional header to prepend to every chunk
 
         Returns:
             List of text chunks
@@ -30,6 +31,11 @@ class TextChunker:
             return []
 
         chunks = self.splitter.split_text(text)
+        
+        if header_text:
+            header_prefix = f"--- DOCUMENT HEADER ---\n{header_text.strip()}\n-----------------------\n"
+            chunks = [f"{header_prefix}{chunk}" for chunk in chunks]
+            
         print(f"[INFO] Created {len(chunks)} chunks from {len(text)} characters")
 
         return chunks
