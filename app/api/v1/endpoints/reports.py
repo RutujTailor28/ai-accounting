@@ -5,7 +5,7 @@ from app.ai.rag.retriever import vector_store
 from app.services.deps import embedding_service, llm_service
 from app.api.deps import get_current_user, require_role
 import json
-from app.core.supabase import supabase
+from app.core.supabase import supabase_admin
 
 router = APIRouter()
 
@@ -69,7 +69,7 @@ async def stream_query_documents(
     """
     try:
 
-        profile_res = supabase.table("profiles").select("company_id").eq("id", user.id).single().execute()
+        profile_res = supabase_admin.table("profiles").select("company_id").eq("id", user.id).single().execute()
         company_id = profile_res.data["company_id"]
 
         request_body.company_id = company_id
@@ -88,7 +88,7 @@ async def stream_query_documents(
             print(f"[INFO] Injected date range into question: {effective_question}")
 
         if request_body.customer_id:
-            customer_folders = supabase.table("folders") \
+            customer_folders = supabase_admin.table("folders") \
                 .select("id") \
                 .eq("customer_id", request_body.customer_id) \
                 .is_("deleted_at", "null") \
@@ -104,7 +104,7 @@ async def stream_query_documents(
                     effective_folder_ids = customer_folder_ids
 
                 if effective_folder_ids:
-                    customer_files = supabase.table("files") \
+                    customer_files = supabase_admin.table("files") \
                         .select("name") \
                         .in_("folder_id", effective_folder_ids) \
                         .is_("deleted_at", "null") \
@@ -336,7 +336,7 @@ async def query_documents(
     """
     try:
 
-        profile_res = supabase.table("profiles").select("company_id").eq("id", user.id).single().execute()
+        profile_res = supabase_admin.table("profiles").select("company_id").eq("id", user.id).single().execute()
         company_id = profile_res.data["company_id"]
 
         request.company_id = company_id
@@ -356,7 +356,7 @@ async def query_documents(
             print(f"[INFO] Injected date range into question: {effective_question}")
 
         if request.customer_id:
-            customer_folders = supabase.table("folders") \
+            customer_folders = supabase_admin.table("folders") \
                 .select("id") \
                 .eq("customer_id", request.customer_id) \
                 .is_("deleted_at", "null") \
@@ -372,7 +372,7 @@ async def query_documents(
                     effective_folder_ids = customer_folder_ids
 
                 if effective_folder_ids:
-                    customer_files = supabase.table("files") \
+                    customer_files = supabase_admin.table("files") \
                         .select("name") \
                         .in_("folder_id", effective_folder_ids) \
                         .is_("deleted_at", "null") \

@@ -14,6 +14,23 @@ AGENTS:
   6. TALLY_RULES             — final audit / validation (deterministic)
 """
 
+import os
+from pathlib import Path
+
+BASE_DIR = Path(__file__).parent.parent.parent
+
+def _load_md(filename: str) -> str:
+    p = BASE_DIR / filename
+    if p.exists():
+        with open(p, "r", encoding="utf-8") as f:
+            return f"\n\n━━━ DYNAMIC USER RULES ({filename}) ━━━\n{f.read()}\n"
+    return ""
+
+SKILLS_TEXT = _load_md("skills.md")
+CLASSIFICATION_RULES_MD = _load_md("reference/classification_rules.md")
+ENTITY_FORMAT_MD = _load_md("reference/entity_format.md")
+LIMITATIONS_MD = _load_md("reference/limitations.md")
+
 EXTRACTOR_RULES = """
 ### AGENT 1 — EXTRACTION RULES (MANDATORY)
 
@@ -130,7 +147,7 @@ Result: {"debit_account": "Interest on Capital A/c", "credit_account": "Capital 
 Example 4 (Net Profit Transfer):
 Narration: "NET PROFIT FOR 2024" [CREDIT ₹5,00,000]
 Result: {"debit_account": "Profit & Loss A/c", "credit_account": "Capital Account", "category": "Equity"}
-"""
+""" + CLASSIFICATION_RULES_MD
 
 JOURNAL_RULES = {
     "must_balance": True,
@@ -232,7 +249,7 @@ CAPITAL_ACCOUNT_RULES = {
     "formula": "Closing Capital = Opening Capital + Capital Introduced + Net Profit - Drawings",
 }
 
-CAPITAL_ACCOUNT_RULES_TEXT = """
+CAPITAL_ACCOUNT_RULES_TEXT = f"""
 ### AGENT 4.5 — CAPITAL ACCOUNT RULES (LLM-DRIVEN)
 
 ROLE: Synthesize the movement of Capital during the period.
@@ -250,19 +267,21 @@ ROLE: Synthesize the movement of Capital during the period.
 ━━━ FORMULA ━━━
 Closing Capital = (Opening + Introduced + Net Profit + Interest) - (Net Loss + Drawings)
 
+{ENTITY_FORMAT_MD}
+
 ━━━ OUTPUT FORMAT (STRICT JSON) ━━━
-{
+{{
   "particulars": [
-    {"label": "Opening Balance", "amount": 1000.00},
-    {"label": "Add: Capital Introduced", "amount": 500.00},
-    {"label": "Add: Net Profit", "amount": 200.00},
-    {"label": "Less: Drawings", "amount": 100.00}
+    {{"label": "Opening Balance", "amount": 1000.00}},
+    {{"label": "Add: Capital Introduced", "amount": 500.00}},
+    {{"label": "Add: Net Profit", "amount": 200.00}},
+    {{"label": "Less: Drawings", "amount": 100.00}}
   ],
   "closing_capital": 1600.00
-}
+}}
 """
 
-BALANCE_SHEET_RULES_TEXT = """
+BALANCE_SHEET_RULES_TEXT = f"""
 ### AGENT 5 — BALANCE SHEET RULES (LLM-DRIVEN)
 
 ROLE: Synthesize a professional Balance Sheet.
@@ -280,21 +299,24 @@ ROLE: Synthesize a professional Balance Sheet.
 ━━━ EQUATION ━━━
 Assets = Liabilities + Equity
 
+{ENTITY_FORMAT_MD}
+{LIMITATIONS_MD}
+
 ━━━ OUTPUT FORMAT (STRICT JSON) ━━━
-{
-  "assets": {
-    "Fixed Assets": [{"account": "Machinery", "amount": 50000.00}],
-    "Current Assets": [{"account": "Bank Account", "amount": 25000.00}]
-  },
-  "liabilities": {
-    "Current Liabilities": [{"account": "GST Payable", "amount": 5000.00}]
-  },
-  "equity": {
-    "Capital": [{"account": "Closing Capital", "amount": 70000.00}]
-  },
+{{
+  "assets": {{
+    "Fixed Assets": [{{"account": "Machinery", "amount": 50000.00}}],
+    "Current Assets": [{{"account": "Bank Account", "amount": 25000.00}}]
+  }},
+  "liabilities": {{
+    "Current Liabilities": [{{"account": "GST Payable", "amount": 5000.00}}]
+  }},
+  "equity": {{
+    "Capital": [{{"account": "Closing Capital", "amount": 70000.00}}]
+  }},
   "total_assets": 75000.00,
   "total_liabilities_equity": 75000.00
-}
+}}
 """
 
 TALLY_RULES = {

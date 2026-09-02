@@ -3,7 +3,7 @@ from typing import List
 from uuid import UUID
 from app.schemas.folder import FolderCreate, FolderResponse, FileResponse
 from app.api.deps import get_current_user, require_role
-from app.core.supabase import supabase
+from app.core.supabase import supabase_admin
 from app.integrations.storage.s3_storage import s3_storage
 
 router = APIRouter()
@@ -16,7 +16,7 @@ async def create_folder(
     """Create a new folder in the database."""
     try:
 
-        profile_res = supabase.table("profiles").select("company_id").eq("id", user.id).single().execute()
+        profile_res = supabase_admin.table("profiles").select("company_id").eq("id", user.id).single().execute()
         if not profile_res.data or not profile_res.data.get("company_id"):
             raise HTTPException(status_code=400, detail="User profile or company assignment missing")
 
@@ -30,7 +30,7 @@ async def create_folder(
             "created_by": user.id
         }
 
-        existing = supabase.table("folders") \
+        existing = supabase_admin.table("folders") \
             .select("*") \
             .eq("name", folder_data.name) \
             .eq("company_id", company_id) \
@@ -47,7 +47,7 @@ async def create_folder(
             print(f"[INFO] Folder already exists: {folder_data.name}. Returning existing record.")
             return existing_res.data[0]
 
-        result = supabase.table("folders").insert(data).execute()
+        result = supabase_admin.table("folders").insert(data).execute()
 
         if not result.data:
             raise HTTPException(status_code=400, detail="Failed to create folder")
@@ -66,13 +66,13 @@ async def list_folders(user=Depends(get_current_user)):
     """List all folders for the authenticated user's company."""
     try:
 
-        profile_res = supabase.table("profiles").select("company_id").eq("id", user.id).single().execute()
+        profile_res = supabase_admin.table("profiles").select("company_id").eq("id", user.id).single().execute()
         if not profile_res.data or not profile_res.data.get("company_id"):
             raise HTTPException(status_code=400, detail="User profile or company assignment missing")
 
         company_id = profile_res.data["company_id"]
 
-        folders_res = supabase.table("folders") \
+        folders_res = supabase_admin.table("folders") \
             .select("*") \
             .eq("company_id", company_id) \
             .is_("deleted_at", "null") \
@@ -81,7 +81,7 @@ async def list_folders(user=Depends(get_current_user)):
 
         folders = folders_res.data or []
 
-        files_res = supabase.table("files") \
+        files_res = supabase_admin.table("files") \
             .select("folder_id, size") \
             .eq("company_id", company_id) \
             .is_("deleted_at", "null") \
@@ -112,7 +112,7 @@ async def list_folders(user=Depends(get_current_user)):
 async def list_folder_files(folder_id: UUID, user=Depends(get_current_user)):
     """List all files within a specific folder."""
     try:
-        result = supabase.table("files") \
+        result = supabase_admin.table("files") \
             .select("*") \
             .eq("folder_id", str(folder_id)) \
             .is_("deleted_at", "null") \
@@ -139,7 +139,7 @@ async def delete_folder(
         from datetime import datetime, timezone
         now = datetime.now(timezone.utc).isoformat()
 
-        result = supabase.table("folders") \
+        result = supabase_admin.table("folders") \
             .update({"deleted_at": now}) \
             .eq("id", str(folder_id)) \
             .execute()

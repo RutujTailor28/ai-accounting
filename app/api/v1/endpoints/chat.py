@@ -25,13 +25,13 @@ async def chat_query(
     """
     try:
 
-        profile_res = supabase.table("profiles").select("company_id").eq("id", user.id).single().execute()
+        profile_res = supabase_admin.table("profiles").select("company_id").eq("id", user.id).single().execute()
         company_id = profile_res.data["company_id"]
 
         doc_names = []
         if request.customer_id:
 
-            folders_res = supabase.table("folders") \
+            folders_res = supabase_admin.table("folders") \
                 .select("id") \
                 .eq("customer_id", str(request.customer_id)) \
                 .is_("deleted_at", "null") \
@@ -42,7 +42,7 @@ async def chat_query(
             if not customer_folder_ids:
                 raise HTTPException(status_code=400, detail="No folders found for this customer.")
 
-            query = supabase.table("files") \
+            query = supabase_admin.table("files") \
                 .select("name") \
                 .in_("folder_id", customer_folder_ids) \
                 .is_("deleted_at", "null")
@@ -84,7 +84,7 @@ async def chat_query(
             if not request.workspace_id:
                 raise HTTPException(status_code=400, detail="Either workspace_id or customer_id must be provided")
 
-            ws_res = supabase.table("workspaces").select("*").eq("id", str(request.workspace_id)).is_("deleted_at", "null").single().execute()
+            ws_res = supabase_admin.table("workspaces").select("*").eq("id", str(request.workspace_id)).is_("deleted_at", "null").single().execute()
             if not ws_res.data:
                 raise HTTPException(status_code=404, detail="Workspace not found")
 
@@ -93,7 +93,7 @@ async def chat_query(
             folder_ids = ws_data.get("folder_ids", [])
 
             if file_ids:
-                files_res = supabase.table("files") \
+                files_res = supabase_admin.table("files") \
                     .select("name") \
                     .in_("id", file_ids) \
                     .is_("deleted_at", "null") \
@@ -101,7 +101,7 @@ async def chat_query(
                 doc_names.extend([f["name"] for f in files_res.data])
 
             if folder_ids:
-                folder_files_res = supabase.table("files") \
+                folder_files_res = supabase_admin.table("files") \
                     .select("name") \
                     .in_("folder_id", folder_ids) \
                     .is_("deleted_at", "null") \
@@ -137,7 +137,7 @@ async def chat_query(
 
         parsed_answer = json.loads(llm_result["answer"])
 
-        history_check = supabase.table("chat_messages").select("id").eq("session_id", str(request.session_id)).limit(1).execute()
+        history_check = supabase_admin.table("chat_messages").select("id").eq("session_id", str(request.session_id)).limit(1).execute()
         session_title = None
         if not history_check.data:
             session_title = request.question[:100]
@@ -158,7 +158,7 @@ async def chat_query(
         if session_title:
             user_msg["session_title"] = session_title
 
-        supabase.table("chat_messages").insert(user_msg).execute()
+        supabase_admin.table("chat_messages").insert(user_msg).execute()
 
         assistant_msg = {
             "session_id": str(request.session_id),
@@ -178,7 +178,7 @@ async def chat_query(
         if session_title:
             assistant_msg["session_title"] = session_title
 
-        save_res = supabase.table("chat_messages").insert(assistant_msg).execute()
+        save_res = supabase_admin.table("chat_messages").insert(assistant_msg).execute()
 
         return save_res.data[0]
 
@@ -193,7 +193,7 @@ async def save_chat_session(
 ):
     """Mark a chat session as saved and store assigned files."""
     try:
-        res = supabase.table("chat_messages") \
+        res = supabase_admin.table("chat_messages") \
             .update({
                 "is_saved": True,
                 "file_names": request.file_names
@@ -212,7 +212,7 @@ async def list_chat_history(workspace_id: Optional[UUID] = None, customer_id: Op
         # if not workspace_id and not customer_id:
         #     raise HTTPException(status_code=400, detail="Must provide either workspace_id or customer_id")
 
-        query = supabase.table("chat_messages") \
+        query = supabase_admin.table("chat_messages") \
             .select("session_id, session_title, created_at, workspace_id, customer_id, file_names") \
             .is_("deleted_at", "null") \
             .eq("is_saved", True) \
@@ -224,7 +224,7 @@ async def list_chat_history(workspace_id: Optional[UUID] = None, customer_id: Op
             query = query.eq("workspace_id", str(workspace_id))
         else:
             # If no specific context, filter by company_id to show all recent history
-            profile_res = supabase.table("profiles").select("company_id").eq("id", user.id).single().execute()
+            profile_res = supabase_admin.table("profiles").select("company_id").eq("id", user.id).single().execute()
             if profile_res.data and profile_res.data.get("company_id"):
                 query = query.eq("company_id", profile_res.data["company_id"])
             else:
@@ -268,7 +268,7 @@ async def list_chat_history(workspace_id: Optional[UUID] = None, customer_id: Op
 async def get_chat_thread(session_id: UUID, user=Depends(get_current_user)):
     """Fetch the full thread of messages for a session."""
     try:
-        result = supabase.table("chat_messages") \
+        result = supabase_admin.table("chat_messages") \
             .select("*, message_feedback(rating)") \
             .eq("session_id", str(session_id)) \
             .is_("deleted_at", "null") \
@@ -295,7 +295,7 @@ async def delete_chat_session(
         from datetime import datetime, timezone
         now = datetime.now(timezone.utc).isoformat()
 
-        result = supabase.table("chat_messages") \
+        result = supabase_admin.table("chat_messages") \
             .update({"deleted_at": now}) \
             .eq("session_id", str(session_id)) \
             .execute()
@@ -335,7 +335,7 @@ async def update_chat_session_title(
     """Update the title of a chat session."""
     try:
 
-        result = supabase.table("chat_messages") \
+        result = supabase_admin.table("chat_messages") \
             .update({"session_title": request.session_title}) \
             .eq("session_id", str(session_id)) \
             .execute()
@@ -365,7 +365,7 @@ async def update_chat_message(
         if not update_data:
             return {"status": "success", "message": "No fields to update"}
 
-        result = supabase.table("chat_messages") \
+        result = supabase_admin.table("chat_messages") \
             .update(update_data) \
             .eq("id", str(message_id)) \
             .execute()

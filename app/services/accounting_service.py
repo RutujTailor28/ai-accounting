@@ -18,11 +18,11 @@ class AccountingService:
 
     def __init__(self, model_name: str = None):
         """Initialize with a more capable model for financial synthesis."""
-        model = model_name or settings.openrouter_model_accounting
+        model = model_name or settings.active_model_accounting
         self.llm = ChatOpenAI(
             model=model,
-            openai_api_key=settings.openrouter_api_key,
-            openai_api_base=settings.openrouter_base_url,
+            openai_api_key=settings.active_api_key or "not-needed",
+            openai_api_base=settings.active_base_url,
             temperature=0,
             streaming=True
         )
@@ -188,12 +188,18 @@ class AccountingService:
         async def _run_extraction(extra_hint: str = "") -> dict:
             structured_llm = self.llm.with_structured_output(ExtractedTransactions)
             response = await retry_with_backoff(structured_llm.ainvoke, prompt + extra_hint)
-            return response.model_dump()
+            if response is None:
+                return {"row_count_detected": 0, "transactions": []}
+            elif hasattr(response, 'model_dump'):
+                return response.model_dump()
+            elif isinstance(response, dict):
+                return response
+            return {"row_count_detected": 0, "transactions": []}
 
         try:
             data = await _run_extraction()
 
-            if data.get("extraction_error") or "message" in data:
+            if data.get("extraction_error"):
                 print(f"[AGENT-1][WARNING] Extraction fallback in batch.")
                 return data.get("transactions", [])
 

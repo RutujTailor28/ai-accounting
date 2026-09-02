@@ -8,7 +8,7 @@ import uuid
 
 router = APIRouter()
 
-from app.core.supabase import supabase
+from app.core.supabase import supabase_admin
 
 @router.post("/", response_model=FeedbackResponse)
 async def submit_feedback(
@@ -21,7 +21,7 @@ async def submit_feedback(
     """
     try:
 
-        profile_res = supabase.table("profiles").select("company_id").eq("id", user.id).single().execute()
+        profile_res = supabase_admin.table("profiles").select("company_id").eq("id", user.id).single().execute()
         company_id = profile_res.data["company_id"]
 
         print(f"[INFO] Receiving feedback from user {user.id} for company {company_id} (requested: {feedback.company_id})")
@@ -49,7 +49,7 @@ async def submit_feedback(
         if feedback.customer_id:
             try:
 
-                cust_res = supabase.table("customers").select("business_type").eq("id", feedback.customer_id).single().execute()
+                cust_res = supabase_admin.table("customers").select("business_type").eq("id", feedback.customer_id).single().execute()
                 business_type = cust_res.data.get("business_type") if cust_res.data else None
 
                 rule_record = {
@@ -65,7 +65,7 @@ async def submit_feedback(
 
                     pass
 
-                supabase.table("accounting_rules").insert(rule_record).execute()
+                supabase_admin.table("accounting_rules").insert(rule_record).execute()
                 print(f"[INFO] Saved custom rule to database for customer {feedback.customer_id}")
             except Exception as e:
                 print(f"[WARNING] Failed to save rule to accounting_rules table: {e}")
@@ -93,7 +93,7 @@ async def clear_feedback(user=Depends(require_role(["admin", "superadmin"]))):
     """
     try:
 
-        profile_res = supabase.table("profiles").select("company_id").eq("id", user.id).single().execute()
+        profile_res = supabase_admin.table("profiles").select("company_id").eq("id", user.id).single().execute()
         company_id = profile_res.data["company_id"]
 
         success = vector_store.clear_company_feedback(company_id)

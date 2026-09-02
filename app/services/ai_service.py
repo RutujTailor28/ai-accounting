@@ -25,25 +25,26 @@ async def retry_with_backoff(func, *args, **kwargs):
                 raise e
 
 class LLMService:
-    """Service for generating answers using OpenRouter LLM."""
+    """Service for generating answers using active LLM provider."""
 
     def __init__(self):
-        """Initialize LLM service with OpenRouter model."""
-        if not settings.openrouter_api_key:
-            print("[WARNING] OpenRouter API key not configured. AI features may fail.")
+        provider = settings.active_provider
+        model = settings.active_model
+        api_key = settings.active_api_key or "not-needed"
+        base_url = settings.active_base_url
 
         self.llm = ChatOpenAI(
-            model=settings.openrouter_model,
-            openai_api_key=settings.openrouter_api_key,
-            openai_api_base=settings.openrouter_base_url,
+            model=model,
+            openai_api_key=api_key,
+            openai_api_base=base_url,
             temperature=0.0,
             max_tokens=50000,
             default_headers={
                 "HTTP-Referer": "https://localhost:8000",
-                "X-Title": "Accounting RAG System",
+                "X-Title": "Fineyukt AI Accounting System",
             }
         )
-        print(f"[INFO] LLMService initialized with OpenRouter model={settings.openrouter_model}")
+        print(f"[INFO] LLMService initialized with Provider='{provider}' Model='{model}' at {base_url}")
 
     async def classify_query_intent(self, question: str) -> Dict[str, Any]:
         """
@@ -214,7 +215,8 @@ class LLMService:
         context_chunks: List[str],
         source_documents: List[str],
         doc_metadata: Dict[str, Dict[str, str]] = None,
-        company_id: str = None
+        company_id: str = None,
+        skip_conversational_analysis: bool = False
     ) -> Dict[str, Any]:
         """
         Generate an answer based on the question and retrieved context using a DYNAMIC schema.
@@ -291,9 +293,43 @@ Extract the data strictly adhering to the schema.
             
             structured_llm = self.llm.with_structured_output(ExtractedTransactions)
             extracted_data = await structured_llm.ainvoke(extraction_prompt)
-            parsed_json = extracted_data.model_dump()
+            if extracted_data is None:
+                parsed_json = {"row_count_detected": 0, "transactions": [], "message": "No transactions found."}
+            elif hasattr(extracted_data, 'model_dump'):
+                parsed_json = extracted_data.model_dump()
+            elif isinstance(extracted_data, dict):
+                parsed_json = extracted_data
+            else:
+                parsed_json = {"row_count_detected": 0, "transactions": [], "message": "Failed to parse transactions."}
+
+            for tx in parsed_json.get("transactions", []):
+                narr = str(tx.get('narration') or '').strip()
+                desc = str(tx.get('description') or '').strip()
+                if narr and (not desc or desc.upper() in ['DR', 'CR', 'DEBIT', 'CREDIT', 'N/A', 'NONE'] or len(desc) < len(narr)):
+                    tx['description'] = narr
+                elif desc and not narr:
+                    tx['narration'] = desc
+
+                debit = float(tx.get('debit') or 0.0)
+                credit = float(tx.get('credit') or 0.0)
+                amt = float(tx.get('amount') or 0.0)
+
+                if credit > 0:
+                    tx['direction'] = 'CREDIT'
+                    tx['amount'] = credit
+                elif debit > 0:
+                    tx['direction'] = 'DEBIT'
+                    tx['amount'] = debit
+                elif amt > 0:
+                    tx['amount'] = amt
+                    if not tx.get('direction'):
+                        tx['direction'] = 'DEBIT'
             
-            analysis_prompt = f"""
+            if skip_conversational_analysis:
+                tx_count = len(parsed_json.get("transactions", []))
+                human_answer = f"Extracted {tx_count} records." if tx_count else ""
+            else:
+                analysis_prompt = f"""
 You are an expert financial analyst. 
 The user asked: "{question}"
 Here is the extracted data from the bank documents:
@@ -305,8 +341,8 @@ Please provide a detailed, human-readable analysis of this data.
 - Use plain English instead of technical jargon.
 - DO NOT return JSON. Just return the analysis.
 """
-            analysis_response = await self.llm.ainvoke(analysis_prompt)
-            human_answer = analysis_response.content.strip()
+                analysis_response = await self.llm.ainvoke(analysis_prompt)
+                human_answer = analysis_response.content.strip()
 
             if not human_answer and "message" in parsed_json and parsed_json["message"]:
                 human_answer = parsed_json["message"]
@@ -724,14 +760,14 @@ Please provide a detailed, human-readable analysis of this data.
         print(f"[INFO] Splitting {len(context_chunks)} chunks into ~{total_batches} batches with overlap (step={step}, batch_size={batch_size})")
 
         tasks = []
-        sem = asyncio.Semaphore(6)
+        sem = asyncio.Semaphore(4)
 
         async def process_batch_with_sem(batch, batch_source_docs):
             async with sem:
 
                 for attempt in range(3):
                     try:
-                        return await retry_with_backoff(self.generate_answer, question, batch, batch_source_docs, doc_metadata, company_id)
+                        return await retry_with_backoff(self.generate_answer, question, batch, batch_source_docs, doc_metadata, company_id, skip_conversational_analysis=True)
                     except Exception as e:
                         if attempt == 2:
                             print(f"[ERROR] Batch failed after 3 attempts. Last error: {e}")
@@ -806,6 +842,29 @@ Please provide a detailed, human-readable analysis of this data.
                         if txs:
                             unique_txs = []
                             for t in txs:
+                                # Ensure description and narration are synced
+                                narr = str(t.get('narration') or '').strip()
+                                desc_raw = str(t.get('description') or '').strip()
+                                if narr and (not desc_raw or desc_raw.upper() in ['DR', 'CR', 'DEBIT', 'CREDIT', 'N/A', 'NONE'] or len(desc_raw) < len(narr)):
+                                    t['description'] = narr
+                                elif desc_raw and not narr:
+                                    t['narration'] = desc_raw
+
+                                # Ensure debit, credit, amount, direction are synced
+                                debit = float(t.get('debit') or 0.0)
+                                credit = float(t.get('credit') or 0.0)
+                                raw_amt = float(t.get('amount') or 0.0)
+
+                                if credit > 0:
+                                    t['direction'] = 'CREDIT'
+                                    t['amount'] = credit
+                                elif debit > 0:
+                                    t['direction'] = 'DEBIT'
+                                    t['amount'] = debit
+                                elif raw_amt > 0:
+                                    t['amount'] = raw_amt
+                                    if not t.get('direction'):
+                                        t['direction'] = 'DEBIT'
 
                                 desc = str(t.get('description', '')).strip().lower()
                                 def _norm(val: str) -> str:

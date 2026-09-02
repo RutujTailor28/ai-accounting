@@ -125,13 +125,13 @@ async def list_all_files(user=Depends(get_current_user)):
     """List all files for the authenticated user's company."""
     try:
 
-        profile_res = supabase.table("profiles").select("company_id").eq("id", user.id).single().execute()
+        profile_res = supabase_admin.table("profiles").select("company_id").eq("id", user.id).single().execute()
         if not profile_res.data or not profile_res.data.get("company_id"):
             raise HTTPException(status_code=400, detail="User profile or company assignment missing")
 
         company_id = profile_res.data["company_id"]
 
-        result = supabase.table("files") \
+        result = supabase_admin.table("files") \
             .select("*") \
             .eq("company_id", company_id) \
             .is_("deleted_at", "null") \
@@ -163,7 +163,7 @@ async def upload_document(
     """
     try:
 
-        profile_res = supabase.table("profiles").select("company_id").eq("id", user.id).single().execute()
+        profile_res = supabase_admin.table("profiles").select("company_id").eq("id", user.id).single().execute()
         if not profile_res.data or not profile_res.data.get("company_id"):
             raise HTTPException(status_code=400, detail="User profile or company assignment missing")
 
@@ -196,14 +196,14 @@ async def upload_document(
         target_folder_id = None
 
         if parent_id:
-            parent_res = supabase.table("folders").select("name").eq("id", parent_id).single().execute()
+            parent_res = supabase_admin.table("folders").select("name").eq("id", parent_id).single().execute()
             if parent_res.data and parent_res.data.get("name") == folder_name:
                 print(f"[INFO] Parent folder name matches target. Using parent folder directly: {parent_id}")
                 target_folder_id = parent_id
 
         if not target_folder_id:
 
-            query = supabase.table("folders").select("id").eq("name", folder_name).eq("company_id", company_id)
+            query = supabase_admin.table("folders").select("id").eq("name", folder_name).eq("company_id", company_id)
             if parent_id:
                 query = query.eq("parent_id", parent_id)
             else:
@@ -315,13 +315,13 @@ async def get_document(
     """
     try:
 
-        profile_res = supabase.table("profiles").select("company_id").eq("id", user.id).single().execute()
+        profile_res = supabase_admin.table("profiles").select("company_id").eq("id", user.id).single().execute()
         if not profile_res.data or not profile_res.data.get("company_id"):
             raise HTTPException(status_code=400, detail="User profile or company assignment missing")
 
         company_id = profile_res.data["company_id"]
 
-        result = supabase.table("files") \
+        result = supabase_admin.table("files") \
             .select("*") \
             .eq("id", file_id) \
             .eq("company_id", company_id) \
@@ -355,13 +355,13 @@ async def get_document_url(
     """
     try:
 
-        profile_res = supabase.table("profiles").select("company_id").eq("id", user.id).single().execute()
+        profile_res = supabase_admin.table("profiles").select("company_id").eq("id", user.id).single().execute()
         if not profile_res.data or not profile_res.data.get("company_id"):
             raise HTTPException(status_code=400, detail="User profile or company assignment missing")
 
         company_id = profile_res.data["company_id"]
 
-        result = supabase.table("files") \
+        result = supabase_admin.table("files") \
             .select("*") \
             .eq("id", file_id) \
             .eq("company_id", company_id) \
@@ -372,7 +372,7 @@ async def get_document_url(
 
         file_data = result.data[0]
 
-        profile_res = supabase.table("profiles") \
+        profile_res = supabase_admin.table("profiles") \
             .select("company_id") \
             .eq("id", file_data.get("created_by")) \
             .single() \
@@ -415,13 +415,13 @@ async def delete_document(
     try:
         print(f"[INFO] Request to delete file {file_id} by user {user.id}")
 
-        profile_res = supabase.table("profiles").select("company_id").eq("id", user.id).single().execute()
+        profile_res = supabase_admin.table("profiles").select("company_id").eq("id", user.id).single().execute()
         if not profile_res.data or not profile_res.data.get("company_id"):
             raise HTTPException(status_code=400, detail="User profile or company assignment missing")
 
         company_id = profile_res.data["company_id"]
 
-        result = supabase.table("files") \
+        result = supabase_admin.table("files") \
             .select("*") \
             .eq("id", file_id) \
             .eq("company_id", company_id) \

@@ -34,13 +34,13 @@ async def create_customer(
 
     try:
 
-        profile_res = supabase.table("profiles").select("company_id").eq("id", user.id).single().execute()
+        profile_res = supabase_admin.table("profiles").select("company_id").eq("id", user.id).single().execute()
         if not profile_res.data or not profile_res.data.get("company_id"):
             raise HTTPException(status_code=400, detail="User profile or company assignment missing")
 
         company_id = profile_res.data["company_id"]
 
-        existing_cust_name = supabase.table("customers") \
+        existing_cust_name = supabase_admin.table("customers") \
             .select("id") \
             .eq("name", name) \
             .eq("company_id", company_id) \
@@ -50,7 +50,7 @@ async def create_customer(
         if existing_cust_name.data:
             raise HTTPException(status_code=400, detail=f"Customer with name '{name}' already exists")
 
-        existing_cust_docs = supabase.table("customers") \
+        existing_cust_docs = supabase_admin.table("customers") \
             .select("id, name") \
             .eq("company_id", company_id) \
             .is_("deleted_at", "null") \
@@ -147,13 +147,13 @@ async def list_customers(user=Depends(get_current_user)):
     List all customers for the user's company from the dedicated table.
     """
     try:
-        profile_res = supabase.table("profiles").select("company_id").eq("id", user.id).single().execute()
+        profile_res = supabase_admin.table("profiles").select("company_id").eq("id", user.id).single().execute()
         if not profile_res.data or not profile_res.data.get("company_id"):
             raise HTTPException(status_code=400, detail="User profile or company assignment missing")
 
         company_id = profile_res.data["company_id"]
 
-        result = supabase.table("customers") \
+        result = supabase_admin.table("customers") \
             .select("*") \
             .eq("company_id", company_id) \
             .is_("deleted_at", "null") \
@@ -172,10 +172,10 @@ async def get_customer_docs(customer_id: UUID, user=Depends(get_current_user)):
     """
     try:
 
-        profile_res = supabase.table("profiles").select("company_id").eq("id", user.id).single().execute()
+        profile_res = supabase_admin.table("profiles").select("company_id").eq("id", user.id).single().execute()
         company_id = profile_res.data["company_id"]
 
-        cust_check = supabase.table("customers") \
+        cust_check = supabase_admin.table("customers") \
             .select("id") \
             .eq("id", str(customer_id)) \
             .eq("company_id", company_id) \
@@ -184,7 +184,7 @@ async def get_customer_docs(customer_id: UUID, user=Depends(get_current_user)):
         if not cust_check.data:
             raise HTTPException(status_code=404, detail="Customer not found")
 
-        result = supabase.table("customer_docs") \
+        result = supabase_admin.table("customer_docs") \
             .select("*") \
             .eq("customer_id", str(customer_id)) \
             .order("created_at", desc=True) \
@@ -201,10 +201,10 @@ async def get_customer(customer_id: UUID, user=Depends(get_current_user)):
     Get details of a single customer.
     """
     try:
-        profile_res = supabase.table("profiles").select("company_id").eq("id", user.id).single().execute()
+        profile_res = supabase_admin.table("profiles").select("company_id").eq("id", user.id).single().execute()
         company_id = profile_res.data["company_id"]
 
-        result = supabase.table("customers") \
+        result = supabase_admin.table("customers") \
             .select("*") \
             .eq("id", str(customer_id)) \
             .eq("company_id", company_id) \
@@ -226,13 +226,13 @@ async def list_customer_folders(customer_id: UUID, user=Depends(get_current_user
     List all root-level folders belonging to a specific customer.
     """
     try:
-        profile_res = supabase.table("profiles").select("company_id").eq("id", user.id).single().execute()
+        profile_res = supabase_admin.table("profiles").select("company_id").eq("id", user.id).single().execute()
         if not profile_res.data or not profile_res.data.get("company_id"):
             raise HTTPException(status_code=400, detail="User profile or company assignment missing")
 
         company_id = profile_res.data["company_id"]
 
-        folders_res = supabase.table("folders") \
+        folders_res = supabase_admin.table("folders") \
             .select("*") \
             .eq("customer_id", str(customer_id)) \
             .eq("company_id", company_id) \
@@ -246,7 +246,7 @@ async def list_customer_folders(customer_id: UUID, user=Depends(get_current_user
         if not folders:
             return []
 
-        files_res = supabase.table("files") \
+        files_res = supabase_admin.table("files") \
             .select("folder_id, size") \
             .eq("company_id", company_id) \
             .is_("deleted_at", "null") \
@@ -285,10 +285,10 @@ async def delete_customer(
         from datetime import datetime, timezone
         now = datetime.now(timezone.utc).isoformat()
 
-        profile_res = supabase.table("profiles").select("company_id").eq("id", user.id).single().execute()
+        profile_res = supabase_admin.table("profiles").select("company_id").eq("id", user.id).single().execute()
         company_id = profile_res.data["company_id"]
 
-        result = supabase.table("customers") \
+        result = supabase_admin.table("customers") \
             .update({"deleted_at": now}) \
             .eq("id", str(customer_id)) \
             .eq("company_id", company_id) \

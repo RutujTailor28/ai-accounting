@@ -48,7 +48,7 @@ async def accounting_query(
                 yield f"data: {json.dumps({'token': msg})}\n\n"
             return StreamingResponse(meaningless_stream(), media_type="text/event-stream")
 
-        profile_res = supabase.table("profiles").select("company_id").eq("id", user.id).single().execute()
+        profile_res = supabase_admin.table("profiles").select("company_id").eq("id", user.id).single().execute()
         company_id = profile_res.data["company_id"]
 
         previous_context = None
@@ -115,7 +115,7 @@ async def accounting_query(
 
         if effective_customer_id:
 
-            folders_res = supabase.table("folders") \
+            folders_res = supabase_admin.table("folders") \
                 .select("id") \
                 .eq("customer_id", effective_customer_id) \
                 .is_("deleted_at", "null") \
@@ -126,7 +126,7 @@ async def accounting_query(
             if not customer_folder_ids:
                 raise HTTPException(status_code=400, detail="No folders found for this customer.")
 
-            query = supabase.table("files") \
+            query = supabase_admin.table("files") \
                 .select("name") \
                 .in_("folder_id", customer_folder_ids) \
                 .is_("deleted_at", "null")
@@ -165,7 +165,7 @@ async def accounting_query(
             if not effective_workspace_id:
                 raise HTTPException(status_code=400, detail="Either workspace_id or customer_id must be provided")
 
-            ws_res = supabase.table("workspaces").select("*").eq("id", effective_workspace_id).single().execute()
+            ws_res = supabase_admin.table("workspaces").select("*").eq("id", effective_workspace_id).single().execute()
             if not ws_res.data:
                 raise HTTPException(status_code=404, detail="Workspace not found")
 
@@ -173,10 +173,10 @@ async def accounting_query(
             folder_ids = ws_res.data.get("folder_ids", [])
 
             if file_ids:
-                files_res = supabase.table("files").select("name").in_("id", file_ids).execute()
+                files_res = supabase_admin.table("files").select("name").in_("id", file_ids).execute()
                 doc_names.extend([f["name"] for f in files_res.data])
             if folder_ids:
-                folder_files_res = supabase.table("files").select("name").in_("folder_id", folder_ids).execute()
+                folder_files_res = supabase_admin.table("files").select("name").in_("folder_id", folder_ids).execute()
                 doc_names.extend([f["name"] for f in folder_files_res.data])
 
             doc_names = list(set(doc_names))
@@ -355,7 +355,7 @@ async def accounting_query(
 
             try:
 
-                history_check = supabase.table("chat_messages").select("id").eq("session_id", str(request_body.session_id)).limit(1).execute()
+                history_check = supabase_admin.table("chat_messages").select("id").eq("session_id", str(request_body.session_id)).limit(1).execute()
                 session_title = None
                 if not history_check.data:
                     session_title = request_body.question[:100]
@@ -455,7 +455,7 @@ async def update_accounting_message(
     """
     try:
 
-        msg_check = supabase.table("chat_messages").select("created_by").eq("id", str(message_id)).single().execute()
+        msg_check = supabase_admin.table("chat_messages").select("created_by").eq("id", str(message_id)).single().execute()
         if not msg_check.data or msg_check.data["created_by"] != user.id:
             raise HTTPException(status_code=403, detail="Forbidden")
 
@@ -468,7 +468,7 @@ async def update_accounting_message(
         if not update_fields:
             return {"message": "No fields to update"}
 
-        res = supabase.table("chat_messages").update(update_fields).eq("id", str(message_id)).execute()
+        res = supabase_admin.table("chat_messages").update(update_fields).eq("id", str(message_id)).execute()
         return res.data[0]
     except Exception as e:
         print(f"[ERROR] Update Message Error: {str(e)}")

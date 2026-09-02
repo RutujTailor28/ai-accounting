@@ -3,7 +3,7 @@ from typing import List
 from uuid import UUID
 from app.schemas.workspace import WorkspaceCreate, WorkspaceResponse
 from app.api.deps import get_current_user, require_role
-from app.core.supabase import supabase
+from app.core.supabase import supabase_admin
 
 router = APIRouter()
 
@@ -15,7 +15,7 @@ async def create_workspace(
     """Create a new workspace by selecting existing file and folder IDs."""
     try:
 
-        profile_res = supabase.table("profiles").select("company_id").eq("id", user.id).single().execute()
+        profile_res = supabase_admin.table("profiles").select("company_id").eq("id", user.id).single().execute()
         if not profile_res.data or not profile_res.data.get("company_id"):
             raise HTTPException(status_code=400, detail="User profile or company assignment missing")
 
@@ -30,7 +30,7 @@ async def create_workspace(
             "created_by": user.id
         }
 
-        result = supabase.table("workspaces").insert(data).execute()
+        result = supabase_admin.table("workspaces").insert(data).execute()
 
         if not result.data:
             raise HTTPException(status_code=400, detail="Failed to create workspace")
@@ -47,13 +47,13 @@ async def list_workspaces(user=Depends(get_current_user)):
     """List all workspaces for the authenticated user's company."""
     try:
 
-        profile_res = supabase.table("profiles").select("company_id").eq("id", user.id).single().execute()
+        profile_res = supabase_admin.table("profiles").select("company_id").eq("id", user.id).single().execute()
         if not profile_res.data or not profile_res.data.get("company_id"):
             raise HTTPException(status_code=400, detail="User profile or company assignment missing")
 
         company_id = profile_res.data["company_id"]
 
-        result = supabase.table("workspaces") \
+        result = supabase_admin.table("workspaces") \
             .select("*") \
             .eq("company_id", company_id) \
             .is_("deleted_at", "null") \
@@ -69,7 +69,7 @@ async def list_workspaces(user=Depends(get_current_user)):
 async def get_workspace(workspace_id: UUID, user=Depends(get_current_user)):
     """Get details of a specific workspace."""
     try:
-        result = supabase.table("workspaces") \
+        result = supabase_admin.table("workspaces") \
             .select("*") \
             .eq("id", str(workspace_id)) \
             .is_("deleted_at", "null") \
@@ -94,7 +94,7 @@ async def delete_workspace(
         from datetime import datetime, timezone
         now = datetime.now(timezone.utc).isoformat()
 
-        result = supabase.table("workspaces") \
+        result = supabase_admin.table("workspaces") \
             .update({"deleted_at": now}) \
             .eq("id", str(workspace_id)) \
             .execute()

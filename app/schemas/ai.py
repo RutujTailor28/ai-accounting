@@ -23,13 +23,16 @@ class DocumentMetadataExtraction(BaseModel):
 class TransactionData(BaseModel):
     date: str = Field(description="Transaction date in DD/MM/YYYY format")
     narration: str = Field(description="Transaction description or narration")
+    description: Optional[str] = Field(None, description="Alias for narration / description")
     debit: float = Field(default=0.0, description="Amount debited/withdrawn")
     credit: float = Field(default=0.0, description="Amount credited/deposited")
+    amount: Optional[float] = Field(default=0.0, description="Transaction amount")
+    direction: Optional[str] = Field(default=None, description="Transaction direction: CREDIT or DEBIT")
     balance: float = Field(default=0.0, description="Running balance. 0.0 if not available")
     transaction_id: Optional[str] = Field(None, description="Reference number or UPI ID")
     type: Optional[str] = Field(None, description="Transaction type (UPI, NEFT, CASH, etc)")
-    bank_name: str = Field(description="Issuing bank name")
-    source_document: str = Field(description="Source document name")
+    bank_name: str = Field(default="Unknown", description="Issuing bank name")
+    source_document: str = Field(default="Unknown", description="Source document name")
 
 class ExtractedTransactions(BaseModel):
     row_count_detected: int = Field(description="Number of transaction rows counted in the text")
