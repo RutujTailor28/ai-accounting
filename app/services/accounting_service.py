@@ -5,6 +5,12 @@ import hashlib
 from langchain_openai import ChatOpenAI
 from app.core.config import settings
 from app.services.ai_service import LLMService, retry_with_backoff
+from app.core.llm_telemetry import (
+    telemetry_callbacks,
+    llm_stage,
+    instrument_stream,
+    STREAM_USAGE,
+)
 from app.ai.rag.retriever import vector_store
 from app.services.accounting_rules import (
     EXTRACTOR_RULES, CLASSIFIER_RULES, REFINEMENT_RULES, JOURNAL_RULES_TEXT,
@@ -24,7 +30,13 @@ class AccountingService:
             openai_api_key=settings.active_api_key or "not-needed",
             openai_api_base=settings.active_base_url,
             temperature=0,
-            streaming=True
+            streaming=True,
+            # streaming=True suppresses the usage block unless we opt in.
+            # Without this every token count below would be an estimate.
+            stream_usage=STREAM_USAGE,
+            callbacks=telemetry_callbacks(
+                provider=settings.active_provider, model=model
+            ),
         )
         self.ai_service = LLMService()
         self.shared_accounts = set()
@@ -78,7 +90,8 @@ class AccountingService:
         from app.schemas.ai import IntentClassification
         try:
             structured_llm = self.llm.with_structured_output(IntentClassification)
-            res = await retry_with_backoff(structured_llm.ainvoke, prompt)
+            with llm_stage("AGENT-0 Intent"):
+                res = await retry_with_backoff(structured_llm.ainvoke, prompt)
             data = res.model_dump()
             print(f"[INFO] Intent Discovery: query='{question[:50]}...' -> intent={data.get('intent')}")
             return data
@@ -187,7 +200,8 @@ class AccountingService:
 
         async def _run_extraction(extra_hint: str = "") -> dict:
             structured_llm = self.llm.with_structured_output(ExtractedTransactions)
-            response = await retry_with_backoff(structured_llm.ainvoke, prompt + extra_hint)
+            with llm_stage("AGENT-1 Extractor"):
+                response = await retry_with_backoff(structured_llm.ainvoke, prompt + extra_hint)
             if response is None:
                 return {"row_count_detected": 0, "transactions": []}
             elif hasattr(response, 'model_dump'):
@@ -255,6 +269,7 @@ Go line-by-line. Find and include every skipped row. Output full JSON again. ━
         if balance > 0: return "ASSET_OR_EXP"
         return "LIAB_OR_INC"
 
+    @instrument_stream("accounting_synthesis", client_id_kwarg="customer_id")
     async def stream_accounting_synthesis(
         self,
         question: str,
@@ -509,7 +524,8 @@ Extract the mutations required to satisfy the user request strictly matching the
             mutation_plan = {}
             try:
                 structured_llm = self.llm.with_structured_output(MutationPlan)
-                res = await retry_with_backoff(structured_llm.ainvoke, universal_prompt)
+                with llm_stage("AGENT-7 Mutation Plan"):
+                    res = await retry_with_backoff(structured_llm.ainvoke, universal_prompt)
                 mutation_plan = res.model_dump()
                 if not isinstance(mutation_plan, dict):
                     mutation_plan = {}
@@ -720,7 +736,8 @@ Extract the mutations required to satisfy the user request strictly matching the
                     "withdrawals_count": 0
                 }}
                 """
-                summary_task = asyncio.create_task(self.llm.ainvoke(summary_prompt))
+                with llm_stage("AGENT-1 Doc Summary"):
+                    summary_task = asyncio.create_task(self.llm.ainvoke(summary_prompt))
 
             BATCH_SIZE = 15
             batches = [context_chunks[i:i + BATCH_SIZE] for i in range(0, len(context_chunks), BATCH_SIZE)]
@@ -972,7 +989,8 @@ Extract the mutations required to satisfy the user request strictly matching the
                     else:
                         async def _run_classify(hint: str = "") -> list:
                             """Run one classify LLM call and parse results."""
-                            resp = await retry_with_backoff(self.llm.ainvoke, classify_prompt + hint)
+                            with llm_stage("AGENT-2 Classifier"):
+                                resp = await retry_with_backoff(self.llm.ainvoke, classify_prompt + hint)
                             raw = self.ai_service._extract_json(resp.content)
                             if isinstance(raw, dict):
 
@@ -1148,7 +1166,8 @@ OUTPUT FORMAT (JSON only, no explanation outside JSON):
 }}
 """
             try:
-                res = await retry_with_backoff(self.llm.ainvoke, universal_prompt)
+                with llm_stage("AGENT-7 Refinement"):
+                    res = await retry_with_backoff(self.llm.ainvoke, universal_prompt)
                 mutation_plan = self.ai_service._extract_json(res.content)
                 mutations = mutation_plan.get("mutations", []) if isinstance(mutation_plan, dict) else []
                 
@@ -1293,7 +1312,8 @@ OUTPUT FORMAT (JSON only, no explanation outside JSON):
         net_profit = 0.0
         pnl_table_rows = []
         try:
-            pnl_res = await retry_with_backoff(self.llm.ainvoke, pnl_prompt)
+            with llm_stage("AGENT-4 P&L"):
+                pnl_res = await retry_with_backoff(self.llm.ainvoke, pnl_prompt)
             pnl_data = self.ai_service._extract_json(pnl_res.content)
             
             inc_rows = pnl_data.get("income_rows", [])
@@ -1358,7 +1378,8 @@ OUTPUT FORMAT (JSON only, no explanation outside JSON):
         
         closing_capital = 0.0
         try:
-            cap_res = await retry_with_backoff(self.llm.ainvoke, cap_prompt)
+            with llm_stage("AGENT-4.5 Capital"):
+                cap_res = await retry_with_backoff(self.llm.ainvoke, cap_prompt)
             cap_data = self.ai_service._extract_json(cap_res.content)
             
             capital_table_rows = [[p["label"], f"{float(p['amount']):,.2f}"] for p in cap_data.get("particulars", [])]
@@ -1402,7 +1423,8 @@ OUTPUT FORMAT (JSON only, no explanation outside JSON):
         """
         
         try:
-            bs_res = await retry_with_backoff(self.llm.ainvoke, bs_prompt)
+            with llm_stage("AGENT-5 Balance Sheet"):
+                bs_res = await retry_with_backoff(self.llm.ainvoke, bs_prompt)
             bs_data = self.ai_service._extract_json(bs_res.content)
             
             assets_dict = bs_data.get("assets", {})

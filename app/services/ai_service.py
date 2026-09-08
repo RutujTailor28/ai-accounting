@@ -3,6 +3,7 @@ import json
 import asyncio
 from langchain_openai import ChatOpenAI
 from app.core.config import settings
+from app.core.llm_telemetry import telemetry_callbacks
 import random
 from datetime import date
 import re
@@ -42,7 +43,8 @@ class LLMService:
             default_headers={
                 "HTTP-Referer": "https://localhost:8000",
                 "X-Title": "Fineyukt AI Accounting System",
-            }
+            },
+            callbacks=telemetry_callbacks(provider=provider, model=model),
         )
         print(f"[INFO] LLMService initialized with Provider='{provider}' Model='{model}' at {base_url}")
 

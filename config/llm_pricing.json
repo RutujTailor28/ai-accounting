@@ -1,0 +1,21 @@
+{
+  "_comment": [
+    "USD per 1,000,000 tokens, per model id exactly as the provider reports it.",
+    "Leave a model out (or set null) if you do not know its price - the",
+    "telemetry will then report TOKENS ONLY for it and mark cost as 'n/a',",
+    "rather than inventing a number.",
+    "Fill these in from your provider's pricing page before trusting the",
+    "dollar column. Models ending in ':free' are treated as zero automatically.",
+    "cached_input_per_mtok is optional; it defaults to input_per_mtok."
+  ],
+  "models": {
+    "meta-llama/llama-3.3-70b-instruct:free": {
+      "input_per_mtok": 0.0,
+      "output_per_mtok": 0.0
+    },
+    "meta/llama-3.1-8b-instruct": {
+      "input_per_mtok": null,
+      "output_per_mtok": null
+    }
+  }
+}
