@@ -1,5 +1,5 @@
 from fastapi import APIRouter
-from app.api.v1.endpoints import auth, users, roles, documents, reports, folders, workspaces, chat, accounting, customers, feedback, demo
+from app.api.v1.endpoints import auth, users, roles, documents, reports, folders, workspaces, chat, accounting, customers, feedback, demo, trial
 
 api_router = APIRouter()
 
@@ -15,3 +15,5 @@ api_router.include_router(accounting.router, prefix="/accounting", tags=["Accoun
 api_router.include_router(customers.router, prefix="/customers", tags=["Customers"])
 api_router.include_router(feedback.router, prefix="/feedback", tags=["Feedback"])
 api_router.include_router(demo.router, prefix="/demo", tags=["Demo Booking"])
+# Public, unauthenticated. Phase 1 deterministic pipeline only - no LLM.
+api_router.include_router(trial.router, prefix="/trial", tags=["Public Trial"])

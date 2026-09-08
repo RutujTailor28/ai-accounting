@@ -27,6 +27,8 @@ fastembed>=0.3.4
 # Utilities
 pydantic>=2.9.0
 pydantic-settings>=2.5.0
+# Required by EmailStr in app/schemas/demo.py - the app will not boot without it
+email-validator>=2.2.0
 python-dotenv>=1.0.1
 supabase>=2.9.0
 
