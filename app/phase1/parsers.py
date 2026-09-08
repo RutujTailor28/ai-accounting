@@ -287,11 +287,160 @@ def parse_tabular(content: bytes, filename: str) -> ParseResult:
     return best or ParseResult(source_document=filename)
 
 
-def parse_pdf(content: bytes, filename: str) -> ParseResult:
-    """PDF via pdfplumber table extraction.
+def _parse_pdf_borderless(pdf: Any, filename: str) -> ParseResult:
+    """Fallback extractor for bank statements without grid lines (e.g. UCO Bank, BoB, PNB).
 
-    Note this is `extract_table`, not `extract_text` - the whole point of
-    Phase 1 is to recover structure rather than hand prose to a model.
+    Locates the table header text horizontally on each page, calculates column cut
+    boundaries dynamically from the header word positions, and groups transaction text
+    into corresponding columns.
+    """
+    from collections import defaultdict
+
+    all_rows: List[List[Any]] = []
+    current_cuts: Optional[dict[str, float]] = None
+    header_emitted = False
+
+    for page in pdf.pages:
+        words = page.extract_words()
+        if not words:
+            continue
+
+        lines = defaultdict(list)
+        for w in words:
+            lines[round(w["top"] / 3) * 3].append(w)
+
+        page_header_seen = False
+        for y, lw in sorted(lines.items()):
+            lw.sort(key=lambda w: w["x0"])
+            date_w = [w for w in lw if _match_column(w["text"], _DATE_HEADERS)]
+            dr_w = [w for w in lw if _match_column(w["text"], _DEBIT_HEADERS)]
+            cr_w = [w for w in lw if _match_column(w["text"], _CREDIT_HEADERS)]
+            bal_w = [w for w in lw if _match_column(w["text"], _BALANCE_HEADERS)]
+
+            if date_w and (dr_w or cr_w):
+                date_x1 = max(w["x1"] for w in date_w)
+                first_amt_w = min(dr_w or cr_w, key=lambda w: w["x0"])
+                first_amt_x0 = first_amt_w["x0"]
+                pre_amt_words = [w for w in lw if w["x1"] < first_amt_x0]
+                desc_words = [w for w in pre_amt_words if w["x0"] >= date_x1]
+                if desc_words:
+                    desc_x0 = min(w["x0"] for w in desc_words)
+                    desc_x1 = max(w["x1"] for w in desc_words)
+                    cut_date = (date_x1 + desc_x0) / 2
+                    cut_narr = (desc_x1 + first_amt_x0) / 2
+                else:
+                    cut_date = date_x1 + 10
+                    cut_narr = first_amt_x0 - 10
+
+                cut_dr = None
+                if dr_w and cr_w:
+                    dr_x1 = max(w["x1"] for w in dr_w)
+                    cr_x0 = min(w["x0"] for w in cr_w)
+                    cut_dr = (dr_x1 + cr_x0) / 2
+
+                cut_cr = None
+                if bal_w:
+                    last_amt_x1 = max(w["x1"] for w in (cr_w or dr_w))
+                    bal_x0 = min(w["x0"] for w in bal_w)
+                    cut_cr = (last_amt_x1 + bal_x0) / 2
+
+                current_cuts = {
+                    "cut_date": cut_date,
+                    "cut_narr": cut_narr,
+                    "cut_dr": cut_dr,
+                    "cut_cr": cut_cr,
+                }
+                page_header_seen = True
+                if not header_emitted:
+                    all_rows.append(["Date", "Particulars", "Chq No", "Withdrawals", "Deposits", "Balance"])
+                    header_emitted = True
+                continue
+
+            if not current_cuts or not page_header_seen:
+                continue
+
+            cd = current_cuts["cut_date"]
+            cn = current_cuts["cut_narr"]
+            cdr = current_cuts["cut_dr"] or (cn + 80)
+            ccr = current_cuts["cut_cr"] or (cdr + 80)
+
+            c_date = " ".join(w["text"] for w in lw if w["x0"] < cd).strip()
+            c_part = " ".join(w["text"] for w in lw if cd <= w["x0"] < cn).strip()
+            c_dr = " ".join(w["text"] for w in lw if cn <= w["x0"] < cdr).strip()
+            c_cr = " ".join(w["text"] for w in lw if cdr <= w["x0"] < ccr).strip()
+            c_bal = " ".join(w["text"] for w in lw if w["x0"] >= ccr).strip()
+
+            if c_date or c_dr or c_cr:
+                all_rows.append([c_date, c_part, "", c_dr, c_cr, c_bal])
+
+    if not all_rows:
+        res = ParseResult(source_document=filename)
+        res.add_error(
+            "no_tables",
+            "No tables found in this PDF. It is probably a scanned image - "
+            "please upload the Excel or CSV export from net banking instead.",
+        )
+        return res
+
+    return _rows_to_result(all_rows, filename)
+
+
+_IFSC_BANKS = {
+    "UCBA": "UCO Bank",
+    "HDFC": "HDFC Bank",
+    "SBIN": "State Bank of India",
+    "ICIC": "ICICI Bank",
+    "UTIB": "Axis Bank",
+    "KKBK": "Kotak Mahindra Bank",
+    "BARB": "Bank of Baroda",
+    "PUNB": "Punjab National Bank",
+    "CNRB": "Canara Bank",
+    "UBIN": "Union Bank of India",
+    "YESB": "YES Bank",
+    "IBKL": "IDBI Bank",
+    "IDFB": "IDFC FIRST Bank",
+    "BKID": "Bank of India",
+    "MAHB": "Bank of Maharashtra",
+}
+
+
+def _extract_pdf_metadata(pdf: Any) -> dict[str, str]:
+    meta: dict[str, str] = {}
+    if not pdf.pages:
+        return meta
+    text = pdf.pages[0].extract_text() or ""
+    m = re.search(r"\bName\s+([A-Z\s]{4,40})(?:\s+Branch|\s+Address|\s+A/c|\s+Phone|$)", text, re.I)
+    if m:
+        meta["client_name"] = re.sub(r"\s+", " ", m.group(1)).strip()
+    m = re.search(r"\b(?:Account\s*(?:No|Number)?\.?|A/c(?:\s*No)?\.?)\s*[:\-]?\s*(\d{9,18})\b", text, re.I)
+    if m:
+        meta["account_no"] = m.group(1).strip()
+    m = re.search(r"\b(?:IFSC(?:\s*Code)?)\s*[:\-]?\s*([A-Z]{4}0[A-Z0-9]{6})\b", text, re.I)
+    if m:
+        ifsc = m.group(1).strip().upper()
+        meta["ifsc"] = ifsc
+        prefix = ifsc[:4]
+        if prefix in _IFSC_BANKS:
+            meta["bank_name"] = _IFSC_BANKS[prefix]
+    m = re.search(r"\b(?:Branch\s*Name)\s+([A-Z\s]{3,30})", text, re.I)
+    if m:
+        branch = m.group(1).strip().split("\n")[0]
+        meta["branch"] = branch
+        bname = meta.get("bank_name", "Bank Branch")
+        meta["bank_name"] = f"{bname} ({branch})"
+    m = re.search(r"\b(?:Statement\s*of\s*Account\s*from|Period\s*[:\-]?)\s*(\d{1,2}[-/]\d{1,2}[-/]\d{2,4})\s*(?:to|-)\s*(\d{1,2}[-/]\d{1,2}[-/]\d{2,4})", text, re.I)
+    if m:
+        meta["period_from"] = m.group(1).strip()
+        meta["period_to"] = m.group(2).strip()
+    return meta
+
+
+def parse_pdf(content: bytes, filename: str) -> ParseResult:
+    """PDF via pdfplumber table extraction with borderless anchor fallback.
+
+    Note this is structured extraction, not raw text dumped into an LLM -
+    recovering structure deterministically in code keeps arithmetic exact and
+    tokens free.
     """
     import pdfplumber
 
@@ -300,28 +449,36 @@ def parse_pdf(content: bytes, filename: str) -> ParseResult:
 
     try:
         with pdfplumber.open(io.BytesIO(content)) as pdf:
+            meta = _extract_pdf_metadata(pdf)
             for page in pdf.pages:
                 tables = page.extract_tables()
                 for table in tables or []:
                     for row in table:
                         all_rows.append([("" if c is None else str(c).replace("\n", " ")) for c in row])
+
+            parsed = _rows_to_result(all_rows, filename) if all_rows else None
+            # If standard grid table extraction didn't yield any transactions,
+            # fall back to dynamic coordinate anchor extraction for borderless PDFs.
+            if parsed is None or not parsed.transactions:
+                borderless_result = _parse_pdf_borderless(pdf, filename)
+                if borderless_result.transactions:
+                    borderless_result.statement_meta = meta
+                    return borderless_result
+
+            if parsed is not None:
+                parsed.statement_meta = meta
+                return parsed
+
     except Exception as exc:
         result.add_error("pdf_failed", f"Could not read the PDF: {exc}")
         return result
 
-    if not all_rows:
-        result.add_error(
-            "no_tables",
-            "No tables found in this PDF. It is probably a scanned image - "
-            "please upload the Excel or CSV export from net banking instead.",
-        )
-        return result
-
-    parsed = _rows_to_result(all_rows, filename)
-    # A repeated header on every page means the map is re-detected per page;
-    # keeping all rows and detecting once is correct because rows above the
-    # first header are skipped and later headers fail the row filters.
-    return parsed
+    result.add_error(
+        "no_tables",
+        "No tables found in this PDF. It is probably a scanned image - "
+        "please upload the Excel or CSV export from net banking instead.",
+    )
+    return result
 
 
 def parse(content: bytes, filename: str) -> ParseResult:

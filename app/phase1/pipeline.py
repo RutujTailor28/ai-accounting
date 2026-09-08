@@ -82,6 +82,21 @@ class PipelineResult:
                 }
                 for l in (s.balance_sheet_lines if s else [])
             ],
+            "capital_account": [
+                {
+                    "label": l.label,
+                    "amount": str(l.amount),
+                    "code": l.code,
+                    "is_total": l.is_total,
+                    "indent": l.indent,
+                }
+                for l in (s.capital_account_lines if s else [])
+            ],
+            "client_info": (
+                self.parse_result.statement_meta
+                if self.parse_result and self.parse_result.statement_meta
+                else (s.statement_meta if s and s.statement_meta else {})
+            ),
             "transactions": [
                 {
                     "row": t.row_index,
@@ -110,11 +125,17 @@ def _assemble(
     parsed: Optional[ParseResult],
     started: float,
     extra_warnings: Optional[List[str]] = None,
+    custom_opening_capital: Optional[Decimal] = None,
 ) -> PipelineResult:
     """Journal -> ledgers -> statements. Shared by `run` and `rebuild`."""
     entries, journal_warnings = build_journal(transactions)
     ledgers = build_ledgers(entries, opening_bank=money(opening_balance))
-    statements = build_statements(ledgers, opening_balance=money(opening_balance))
+    statements = build_statements(
+        ledgers,
+        opening_balance=money(opening_balance),
+        custom_opening_capital=money(custom_opening_capital) if custom_opening_capital is not None else None,
+        statement_meta=parsed.statement_meta if parsed else None,
+    )
 
     warnings = list(extra_warnings or [])
     warnings.extend(journal_warnings)
@@ -156,6 +177,7 @@ def _apply_overrides(
 def rebuild(
     transaction_dicts: List[Dict[str, Any]],
     opening_balance: Decimal = ZERO,
+    custom_opening_capital: Optional[Decimal] = None,
     overrides: Optional[Dict[int, str]] = None,
 ) -> PipelineResult:
     """Re-run the arithmetic from stored transactions, without re-parsing.
@@ -166,13 +188,20 @@ def rebuild(
     started = time.perf_counter()
     transactions = [Transaction.from_dict(d) for d in transaction_dicts]
     _apply_overrides(transactions, overrides)
-    return _assemble(transactions, money(opening_balance), None, started)
+    return _assemble(
+        transactions,
+        money(opening_balance),
+        None,
+        started,
+        custom_opening_capital=custom_opening_capital,
+    )
 
 
 def run(
     content: bytes,
     filename: str,
     opening_balance: Optional[Decimal] = None,
+    custom_opening_capital: Optional[Decimal] = None,
     overrides: Optional[Dict[int, str]] = None,
     scope: str = "",
 ) -> PipelineResult:
@@ -220,4 +249,6 @@ def run(
         parsed,
         started,
         extra_warnings=[i.message for i in parsed.warnings],
+        custom_opening_capital=custom_opening_capital,
     )
+
