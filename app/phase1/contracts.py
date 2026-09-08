@@ -260,6 +260,7 @@ class ParseResult:
     balance_failures: int = 0
     opening_balance: Optional[Decimal] = None
     closing_balance: Optional[Decimal] = None
+    statement_meta: Dict[str, str] = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
@@ -342,6 +343,8 @@ class GeneratedStatements:
     total_credits: Decimal = ZERO
     pnl_lines: List[StatementLine] = field(default_factory=list)
     balance_sheet_lines: List[StatementLine] = field(default_factory=list)
+    capital_account_lines: List[StatementLine] = field(default_factory=list)
+    statement_meta: Dict[str, str] = field(default_factory=dict)
     net_profit: Decimal = ZERO
     opening_balance: Decimal = ZERO
     closing_balance: Decimal = ZERO

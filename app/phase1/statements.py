@@ -100,7 +100,7 @@ def build_balance_sheet(
         elif head.nature == Nature.EQUITY:
             # Drawings reduce capital, so carry it negative.
             if code == "3040":
-                equity.append((code, head.name, -amount))
+                equity.append((code, "Less: Drawings", -abs(amount)))
             else:
                 equity.append((code, head.name, amount))
 
@@ -139,14 +139,63 @@ def build_balance_sheet(
     return lines
 
 
+def build_capital_account(
+    ledgers: Dict[str, LedgerAccount],
+    net_profit: Decimal,
+    opening_balance: Decimal = ZERO,
+    custom_opening_capital: Decimal | None = None,
+) -> List[StatementLine]:
+    """Capital Account schedule (as presented in Indian accounting / CAP statement):
+    Opening Capital Balance
+    + Fresh Capital Introduced (if any)
+    + Net Profit / (- Net Loss)
+    - Drawings (3040)
+    = Closing Capital Balance
+    """
+    totals = account_totals(ledgers)
+    lines: List[StatementLine] = []
+
+    opening_cap = custom_opening_capital if custom_opening_capital is not None else opening_balance
+    lines.append(StatementLine("Opening Capital Balance", money(opening_cap)))
+
+    # Capital Introduced (Head 3030)
+    cap_introduced = money(totals.get("3030", ZERO))
+    if cap_introduced > ZERO:
+        lines.append(StatementLine("Add: Capital Introduced", cap_introduced, indent=1))
+
+    if net_profit >= ZERO:
+        lines.append(StatementLine("Add: Net Profit for the Year", net_profit, indent=1))
+    else:
+        lines.append(StatementLine("Less: Net Loss for the Year", -abs(net_profit), indent=1))
+
+    drawings = abs(money(totals.get("3040", ZERO)))
+    if drawings > ZERO:
+        lines.append(StatementLine("Less: Drawings / Personal Withdrawals", -drawings, indent=1))
+
+    closing_capital = money(
+        opening_cap + cap_introduced + net_profit - drawings
+    )
+    lines.append(StatementLine("Closing Capital Balance (to Balance Sheet)", closing_capital, is_total=True))
+
+    return lines
+
+
 def build_statements(
     ledgers: Dict[str, LedgerAccount],
     opening_balance: Decimal = ZERO,
+    custom_opening_capital: Decimal | None = None,
+    statement_meta: Dict[str, str] | None = None,
 ) -> GeneratedStatements:
     """Run the full deterministic statement build and self-check it."""
     tb_rows, total_debits, total_credits = trial_balance(ledgers)
     pnl_lines, net_profit = build_pnl(ledgers)
     bs_lines = build_balance_sheet(ledgers, net_profit)
+    cap_lines = build_capital_account(
+        ledgers,
+        net_profit,
+        opening_balance=money(opening_balance),
+        custom_opening_capital=money(custom_opening_capital) if custom_opening_capital is not None else None,
+    )
 
     totals = account_totals(ledgers)
     closing = money(totals.get(coa.BANK, ZERO))
@@ -165,12 +214,13 @@ def build_statements(
         total_credits=total_credits,
         pnl_lines=pnl_lines,
         balance_sheet_lines=bs_lines,
+        capital_account_lines=cap_lines,
+        statement_meta=statement_meta or {},
         net_profit=net_profit,
         opening_balance=money(opening_balance),
         closing_balance=closing,
     )
 
-    result.warnings.append(CASH_BASIS_NOTE)
     if not result.ties:
         # Should be unreachable; if it fires, the engine has a bug.
         result.warnings.append(
@@ -186,3 +236,4 @@ def build_statements(
         )
 
     return result
+

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import List, Optional
 
 from app.phase1 import coa
@@ -28,6 +29,7 @@ class Rule:
     `direction` restricts the rule to money-in ("credit"), money-out
     ("debit"), or "any". Getting this right matters: "INTEREST" credited is
     income, "INTEREST" debited is an expense.
+    `min_amount` and `max_amount` allow tiering by transaction size.
     """
 
     id: str
@@ -36,11 +38,18 @@ class Rule:
     pattern: Optional[str] = None
     channel: Optional[Channel] = None
     direction: str = "any"
+    min_amount: Optional[Decimal] = None
+    max_amount: Optional[Decimal] = None
 
     def matches(self, txn: Transaction) -> bool:
         if self.direction != "any" and txn.direction != self.direction:
             return False
         if self.channel is not None and txn.channel != self.channel:
+            return False
+        amt = txn.debit if txn.direction == "debit" else txn.credit
+        if self.min_amount is not None and amt < self.min_amount:
+            return False
+        if self.max_amount is not None and amt > self.max_amount:
             return False
         if self.pattern:
             haystack = f"{txn.narration_raw} {txn.counterparty_key}".lower()
@@ -84,12 +93,12 @@ SEED_RULES: List[Rule] = [
          direction="debit"),
     Rule("telecom", "5050", 41,
          pattern=r"\b(airtel|jio|vodafone|vi\s*postpaid|bsnl|idea|broadband|internet|"
-                 r"act\s*fibernet|hathway)\b",
+                 r"act\s*fibernet|hathway|recharge|dth|tatasky|dishtv)\b",
          direction="debit"),
 
     # -- Common vendor categories -----------------------------------------
     Rule("fuel", "5090", 50,
-         pattern=r"\b(petrol|diesel|fuel|hpcl|bpcl|iocl|indian\s*oil|hp\s*petrol|shell)\b",
+         pattern=r"\b(petrol|diesel|fuel|hpcl|bpcl|iocl|indian\s*oil|hp\s*petrol|shell|petroleu|petroleum|cng)\b",
          direction="debit"),
     Rule("travel", "5080", 51,
          pattern=r"\b(irctc|makemytrip|goibibo|yatra|uber|ola\b|rapido|indigo|spicejet|"
@@ -120,12 +129,15 @@ SEED_RULES: List[Rule] = [
          direction="debit"),
     Rule("office", "5160", 58,
          pattern=r"\b(stationery|printing|xerox|office\s*supp|pantry|housekeep|"
-                 r"amazon\b|flipkart|blinkit|zepto|swiggy\s*instamart|bigbasket)\b",
+                 r"amazon\b|flipkart|blinkit|zepto|swiggy|bigbasket|"
+                 r"tea|chai|coffee|cafe|canteen|snacks|bakery|\bpan\b|paan|sweet|mithai|"
+                 r"restaurant|hotel|bhojanalay|dhaba|refreshment|dairy|kirana|supermarket|mart|aamla|"
+                 r"vyapar|paytmqr|bharatpe|phonepeqr)\b",
          direction="debit"),
 
     # -- Loans & cards -----------------------------------------------------
     Rule("loan-emi", "2010", 60,
-         pattern=r"\b(emi|loan|lien|hypothec|term\s*loan|od\s*account|cc\s*limit)\b",
+         pattern=r"\b(emi|loan|lien|hypothec|term\s*loan|od\s*account|cc\s*limit|bajaj\s*fin|tvs\s*credit|hdb\s*fin|chola|shriram|muthoot|manappuram)\b",
          direction="debit"),
     Rule("credit-card", "2020", 61,
          pattern=r"\b(credit\s*card|cc\s*payment|card\s*pmt|autopay\s*card)\b",
@@ -147,6 +159,12 @@ SEED_RULES: List[Rule] = [
          pattern=r"\b(refund|reversal|cashback|chargeback|returned)\b", direction="credit"),
     Rule("dividend-interest", "4020", 91,
          pattern=r"\b(dividend|maturity|fd\s*int|rd\s*int)\b", direction="credit"),
+
+    # -- Amount-tiered UPI transfers to individuals (evaluated after keyword rules) --
+    Rule("upi-small-expense", "5160", 95, channel=Channel.UPI, direction="debit",
+         max_amount=Decimal("2000.00")),
+    Rule("upi-drawings-transfer", "3040", 96, channel=Channel.UPI, direction="debit",
+         min_amount=Decimal("2000.01"), max_amount=Decimal("50000.00")),
 ]
 
 
