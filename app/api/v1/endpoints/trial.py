@@ -50,6 +50,7 @@ class ReclassifyRequest(BaseModel):
     # row_index -> ledger code
     overrides: Dict[int, str] = Field(default_factory=dict)
     opening_balance: Optional[str] = None
+    opening_capital: Optional[str] = None
 
 
 class FeedbackRequest(BaseModel):
@@ -123,6 +124,7 @@ async def analyze(
     file: UploadFile = File(...),
     session_id: str = Form(...),
     opening_balance: Optional[str] = Form(None),
+    opening_capital: Optional[str] = Form(None),
 ) -> Dict[str, Any]:
     """Upload a bank statement and get statements back immediately."""
     _require_session(session_id)
@@ -150,9 +152,16 @@ async def analyze(
         )
 
     opening = money(opening_balance) if opening_balance else None
+    capital = money(opening_capital) if opening_capital else None
 
     try:
-        result = run(content, filename, opening_balance=opening, scope=session_id)
+        result = run(
+            content,
+            filename,
+            opening_balance=opening,
+            custom_opening_capital=capital,
+            scope=session_id,
+        )
     except Exception as exc:  # never leak a stack trace to a public caller
         print(f"[TRIAL][ERROR] pipeline crashed on {filename}: {exc}")
         raise HTTPException(
@@ -206,15 +215,25 @@ async def reclassify(body: ReclassifyRequest) -> Dict[str, Any]:
     opening = money(body.opening_balance) if body.opening_balance else money(
         doc.get("opening_balance") or "0.00"
     )
+    capital = money(body.opening_capital) if body.opening_capital else None
 
     try:
-        result = rebuild(doc["transactions"], opening_balance=opening, overrides=body.overrides)
+        result = rebuild(
+            doc["transactions"],
+            opening_balance=opening,
+            custom_opening_capital=capital,
+            overrides=body.overrides,
+        )
     except Exception as exc:
         print(f"[TRIAL][ERROR] reclassify failed: {exc}")
         raise HTTPException(status_code=500, detail="Could not rebuild the statements.")
 
     payload = result.as_dict()
     payload["document_id"] = body.document_id
+    if "result" in doc and isinstance(doc["result"], dict):
+        orig_client_info = doc["result"].get("client_info")
+        if orig_client_info and not payload.get("client_info"):
+            payload["client_info"] = orig_client_info
     trial_store.update_document_result(
         body.session_id,
         body.document_id,
@@ -222,6 +241,15 @@ async def reclassify(body: ReclassifyRequest) -> Dict[str, Any]:
         payload,
     )
     return payload
+
+
+class StatutoryRequest(BaseModel):
+    session_id: str
+    document_id: str
+    prior_assets: List[Dict[str, Any]] = Field(default_factory=list)
+    prior_liabilities: List[Dict[str, Any]] = Field(default_factory=list)
+    adjustments: List[Dict[str, Any]] = Field(default_factory=list)
+    opening_capital: Optional[str] = None
 
 
 @router.post("/feedback")
@@ -240,3 +268,44 @@ async def feedback(body: FeedbackRequest) -> Dict[str, str]:
         },
     )
     return {"status": "recorded", "message": "Thank you - this is exactly what we need."}
+
+
+@router.post("/parse-prior-bs")
+async def parse_prior_bs(
+    file: UploadFile = File(...),
+    session_id: str = Form(...),
+) -> Dict[str, Any]:
+    """Dynamically extract items and sections from any uploaded Balance Sheet."""
+    _require_session(session_id)
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="That file is empty.")
+    filename = file.filename or "balance_sheet.pdf"
+    from app.phase1.prior_year_bs import parse_prior_balance_sheet
+
+    res = parse_prior_balance_sheet(content, filename)
+    return res
+
+
+@router.post("/statutory")
+async def get_statutory_statements(body: StatutoryRequest) -> Dict[str, Any]:
+    """Build unified statutory statements combining bank movements + prior balance sheet + adjustments."""
+    _require_session(body.session_id)
+    doc = trial_store.get_document(body.session_id, body.document_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found.")
+
+    opening = money(doc.get("opening_balance") or "0.00")
+    pipe_res = rebuild(doc["transactions"], opening_balance=opening)
+
+    from app.phase1.statutory import build_statutory_statements
+
+    cap = money(body.opening_capital) if body.opening_capital else None
+    stat_res = build_statutory_statements(
+        bank_statements=pipe_res.statements,
+        prior_assets=body.prior_assets,
+        prior_liabilities=body.prior_liabilities,
+        adjustments=body.adjustments,
+        custom_opening_capital=cap,
+    )
+    return stat_res

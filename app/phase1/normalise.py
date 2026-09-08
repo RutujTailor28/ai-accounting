@@ -20,12 +20,12 @@ from app.phase1.contracts import Channel
 # Channel detection. Order matters - first hit wins, so put the specific
 # markers ahead of the generic ones.
 _CHANNEL_PATTERNS: list[tuple[Channel, re.Pattern]] = [
-    (Channel.UPI, re.compile(r"\b(upi|vpa|bhim|gpay|phonepe|paytm[\s-]?upi)\b", re.I)),
+    (Channel.ATM, re.compile(r"\b(atm|cash\s*wdl|cash\s*withdrawal|nwd|cwdr|c-?wdr)\b", re.I)),
+    (Channel.UPI, re.compile(r"\b(upi|vpa|bhim|gpay|phonepe|paytm[\s-]?upi|mpay)\b", re.I)),
     (Channel.NEFT, re.compile(r"\bneft\b", re.I)),
     (Channel.RTGS, re.compile(r"\brtgs\b", re.I)),
     (Channel.IMPS, re.compile(r"\bimps\b", re.I)),
     (Channel.CHEQUE, re.compile(r"\b(chq|cheque|clg|clearing|micr)\b", re.I)),
-    (Channel.ATM, re.compile(r"\b(atm|cash\s*wdl|cash\s*withdrawal|nwd)\b", re.I)),
     (Channel.POS, re.compile(r"\b(pos|ecom|e-?com|card\s*payment|debit\s*card)\b", re.I)),
     (Channel.INTEREST, re.compile(r"\b(int\.?\s*(pd|cr|coll)|interest|intt)\b", re.I)),
     (Channel.CHARGES, re.compile(
@@ -53,11 +53,12 @@ _STOPWORDS = {
     "ib", "mob", "net", "banking", "online", "self", "sent", "received", "rcvd",
     "credit", "debit", "deposit", "withdrawal", "charges", "charge", "fee",
     "india", "collect", "request", "success", "successful", "money",
+    "mpay", "trtr", "npc", "eft", "ipos", "xx", "p2a", "p2m",
 }
 
 # Bank-specific prefixes worth removing wholesale.
 _PREFIX_RE = re.compile(
-    r"^(upi|neft|imps|rtgs|chq|clg|pos|atm|ecom|mmt|ift|inb|ib|mob|ach|nach)[\s/:-]+",
+    r"^(?:(?:mpay|upi|neft|imps|rtgs|chq|clg|pos|atm|cwdr|ecom|mmt|ift|inb|ib|mob|ach|nach|trtr|p2a|p2m|dr|cr)[\s/:-]+)+",
     re.I,
 )
 

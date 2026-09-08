@@ -17,6 +17,8 @@ from app.phase1.contracts import LedgerHead, Nature
 
 # The bank account itself - one side of every posting in a bank-only pipeline.
 BANK = "1010"
+CASH = "1020"
+CLOSING_STOCK = "1030"
 # Where anything we cannot confidently classify goes. Never silently guessed.
 SUSPENSE = "5999"
 # Opening bank balance is carried as equity so the sheet is coherent.
