@@ -19,10 +19,8 @@ logs/
 *.log
 
 # Environment
-.env
 
 # IDE
-.vscode/
 .idea/
 *.swp
 *.swo
@@ -31,3 +29,5 @@ logs/
 # OS
 .DS_Store
 Thumbs.db
+config.bat
+node_modules
