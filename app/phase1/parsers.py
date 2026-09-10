@@ -470,7 +470,16 @@ def parse_pdf(content: bytes, filename: str) -> ParseResult:
                 return parsed
 
     except Exception as exc:
-        result.add_error("pdf_failed", f"Could not read the PDF: {exc}")
+        exc_repr = repr(exc)
+        exc_str = str(exc)
+        if "Password" in exc_repr or "password" in exc_str.lower():
+            result.add_error(
+                "pdf_password_protected",
+                "This bank statement PDF is password-protected (encrypted). "
+                "Please upload an unlocked PDF, or export as Excel/CSV from Net Banking.",
+            )
+            return result
+        result.add_error("pdf_failed", f"Could not read the PDF: {exc_str or type(exc).__name__}")
         return result
 
     result.add_error(
